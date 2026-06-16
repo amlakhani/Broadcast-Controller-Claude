@@ -1,0 +1,11 @@
+# Dependencies
+node_modules/
+
+# Packaged installers / build output (regenerable via npm run build:*)
+application packages/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log

@@ -1,0 +1,92 @@
+{
+  "name": "broadcast-controller",
+  "productName": "Broadcast Controller",
+  "version": "1.0.0",
+  "description": "Professional Lower Thirds, Lyrics & Broadcast Graphics Controller with Gujarati support",
+  "main": "main.js",
+  "author": "Anuj",
+  "type": "module",
+  "scripts": {
+    "start": "node scripts/ensure-electron-path.js && node node_modules/electron/cli.js .",
+    "test": "node --test tests/*.test.js",
+    "build:frontend": "npm --prefix frontend run build",
+    "check:ndi:mac": "node scripts/check-ndi-mac-build-env.js",
+    "rebuild:ndi:mac": "node scripts/rebuild-ndi-mac.js",
+    "verify:ndi:mac": "node scripts/verify-ndi-mac.js",
+    "check:ndi:win": "node scripts/check-ndi-win-build-env.js",
+    "rebuild:ndi:win": "node scripts/rebuild-ndi-win.js",
+    "verify:ndi:win": "node scripts/verify-ndi-win.js",
+    "prebuild:mac": "npm run build:frontend && npm run check:ndi:mac && npm run rebuild:ndi:mac && npm run verify:ndi:mac",
+    "build:mac": "node scripts/build-mac.js",
+    "prebuild:win": "npm run build:frontend && npm run check:ndi:win && npm run rebuild:ndi:win && npm run verify:ndi:win",
+    "build:win": "electron-builder --win",
+    "prebuild:all": "npm run build:frontend",
+    "build:all": "electron-builder --mac --x64 --arm64 --win --x64",
+    "package": "npm run build:all"
+  },
+  "build": {
+    "npmRebuild": false,
+    "appId": "com.anuj.broadcastcontroller",
+    "productName": "Broadcast Controller",
+    "copyright": "Copyright © 2024 Anuj",
+    "directories": {
+      "output": "application packages"
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.video",
+      "icon": "public/logo.png"
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Broadcast Controller"
+    },
+    "portable": {
+      "artifactName": "Broadcast Controller ${version} Portable.${ext}"
+    },
+    "files": [
+      "**/*",
+      "!frontend{,/**}",
+      "!application package{,/**}",
+      "!application packages{,/**}",
+      "!build{,/**}",
+      "!tests{,/**}",
+      "!.vscode{,/**}",
+      "!**/.DS_Store",
+      "!package-lock.json",
+      "!node_modules/.cache{,/**}",
+      "!node_modules/.vite{,/**}",
+      "!node_modules/electron",
+      "!node_modules/electron-builder",
+      "!node_modules/@electron/**"
+    ],
+    "asar": true,
+    "asarUnpack": [
+      "**/node_modules/@stagetimerio/grandiose/dist/**"
+    ]
+  },
+  "dependencies": {
+    "@stagetimerio/grandiose": "^0.2.0",
+    "express": "^4.19.0",
+    "microsoft-cognitiveservices-speech-sdk": "^1.50.0",
+    "socket.io": "^4.7.0",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "electron": "^41.3.0",
+    "electron-builder": "^26.8.1"
+  }
+}
