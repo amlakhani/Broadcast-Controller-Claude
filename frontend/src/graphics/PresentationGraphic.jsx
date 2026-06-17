@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { LAYER_Z } from './layerZ';
 
 export default function PresentationGraphic({ socket, windowMode, isStageDisplaySlot = false, stagePresActive: propStagePresActive, presentationState }) {
     const [presState, setPresState] = useState(null);
@@ -52,8 +53,9 @@ export default function PresentationGraphic({ socket, windowMode, isStageDisplay
 
     return (
         <div 
-            id="pres-overlay" 
-            className={`bg-black z-[5200] ${isStageDisplaySlot ? 'absolute inset-0 w-full h-full' : 'absolute inset-0'}`}
+            id="pres-overlay"
+            className={`bg-black ${isStageDisplaySlot ? 'absolute inset-0 w-full h-full' : 'absolute inset-0'}`}
+            style={{ zIndex: LAYER_Z.slides }}
         >
             {effectivePresState.mode === 'url' && (
                 <div id="pres-ifr-pool" className="absolute inset-0">

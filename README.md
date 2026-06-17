@@ -79,6 +79,12 @@ The graphics output renders over a green / black / transparent background (for c
 |---|---|
 | ![Lower third output](docs/screenshots/11-graphics-output-lower-third.png) | ![Particle overlay output](docs/screenshots/12-graphics-output-particles.png) |
 
+**Layer order (bottom → top).** Every layer is composited in one predictable, centrally‑defined stack ([`frontend/src/graphics/layerZ.js`](frontend/src/graphics/layerZ.js)) so overlays never fight each other:
+
+`Media → Slides → Particles → Media message → Lyrics → Lower thirds → Translation → Pre‑show countdown`
+
+Lower thirds, lyrics and translation always paint above the media/slides background, so names and captions stay readable over any video, photo or deck; the pre‑show countdown sits on top of everything as a full‑screen takeover.
+
 ---
 
 ## 📖 How to Use

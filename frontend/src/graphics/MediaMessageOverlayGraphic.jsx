@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { LAYER_Z } from './layerZ';
 
 const DEFAULT_OVERLAY = {
     enabled: false,
@@ -48,7 +49,7 @@ export default function MediaMessageOverlayGraphic({ socket, windowMode }) {
     if (windowMode === 'stage' || !overlay.enabled || !overlay.text?.trim()) return null;
 
     return (
-        <div className={`fixed inset-0 z-[10020] flex justify-center px-16 pointer-events-none ${positionClass[overlay.position] || positionClass.center}`}>
+        <div className={`fixed inset-0 flex justify-center px-16 pointer-events-none ${positionClass[overlay.position] || positionClass.center}`} style={{ zIndex: LAYER_Z.mediaMessage }}>
             <div className={`${overlay.backdrop ? 'rounded-2xl border border-white/15 bg-black/45 px-12 py-7 shadow-2xl backdrop-blur-sm' : ''} max-w-[88vw]`}>
                 <div className="whitespace-pre-wrap break-words text-center leading-tight tracking-normal" style={contentStyle}>
                     {displayText}

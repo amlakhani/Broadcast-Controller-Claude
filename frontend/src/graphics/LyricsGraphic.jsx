@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import gsap from 'gsap';
 import { useGSAP } from '@gsap/react';
 import { applyAnimationIn, applyAnimationOut } from './AnimationUtils';
+import { LAYER_Z } from './layerZ';
 
 export default function LyricsGraphic({ socket, windowMode }) {
     const [data, setData] = useState(null);
@@ -171,9 +172,9 @@ export default function LyricsGraphic({ socket, windowMode }) {
     return (
         <div 
             ref={containerRef} 
-            id="lyrics-overlay" 
-            className={`absolute opacity-0 w-full flex justify-center z-[6500] ${windowMode === 'stage' ? 'hidden' : ''}`}
-            style={getContainerStyle()}
+            id="lyrics-overlay"
+            className={`absolute opacity-0 w-full flex justify-center ${windowMode === 'stage' ? 'hidden' : ''}`}
+            style={{ ...getContainerStyle(), zIndex: LAYER_Z.lyrics }}
         >
             <div 
                 ref={panelRef} 

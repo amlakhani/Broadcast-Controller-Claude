@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { authUrl } from '../auth';
 import { createThrottledEmitter } from '../utils/performance';
+import { LAYER_Z } from './layerZ';
 
 export default function MediaGraphic({ socket, windowMode }) {
     const [mediaData, setMediaData] = useState(null);
@@ -362,10 +363,10 @@ export default function MediaGraphic({ socket, windowMode }) {
     const isPreview = isPassiveOutput;
 
     return (
-        <>
+        <div style={{ position: 'absolute', inset: 0, zIndex: LAYER_Z.media, isolation: 'isolate' }}>
             {mediaData && (
-                <div 
-                    id="media-overlay" 
+                <div
+                    id="media-overlay"
                     key={`media-${mediaData.type}-${mediaData.id || mediaData.path}-${mediaData.ts || ''}`}
                     ref={containerRef}
                     className="absolute inset-0 bg-black flex items-center justify-center z-[6000]"
@@ -448,6 +449,6 @@ export default function MediaGraphic({ socket, windowMode }) {
                     })()}
                 </div>
             )}
-        </>
+        </div>
     );
 }

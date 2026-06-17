@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { ParticleRenderer } from './particlesRenderer';
+import { LAYER_Z } from './layerZ';
 
 // Creates a control surface over the particle renderer. Prefers an OffscreenCanvas + Worker so
 // simulation and GPU draws run entirely off the main thread; falls back to a main-thread WebGL
@@ -106,7 +107,8 @@ export default function ParticlesGraphic({ socket }) {
     return (
         <canvas
             ref={canvasRef}
-            className="fixed inset-0 pointer-events-none z-[9999]"
+            className="fixed inset-0 pointer-events-none"
+            style={{ zIndex: LAYER_Z.particles }}
         />
     );
 }

@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import gsap from 'gsap';
+import { LAYER_Z } from './layerZ';
 
 const clampPercent = (value, fallback) => {
     const parsed = parseFloat(value);
@@ -117,9 +118,9 @@ export default function SabhaTimerGraphic({ socket, windowMode }) {
             id="sabha-overlay" 
             ref={containerRef}
             className={`absolute inset-0 pointer-events-none flex flex-col justify-end opacity-0 ${!sabhaData?.showing ? 'hidden' : ''}`}
-            style={{ 
-                zIndex: 999999,
-                display: !sabhaData?.showing ? 'none' : 'flex' 
+            style={{
+                zIndex: LAYER_Z.countdown,
+                display: !sabhaData?.showing ? 'none' : 'flex'
             }}
         >
             <div 

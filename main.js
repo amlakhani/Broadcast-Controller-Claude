@@ -39,6 +39,10 @@ app.commandLine.appendSwitch('enable-gpu-rasterization');
 app.commandLine.appendSwitch('enable-zero-copy');
 // On dual-GPU laptops (e.g. MacBook Pro, gaming laptops) prefer the discrete GPU. Harmless on
 // single-GPU machines.
+// NOTE: this only controls which GPU *renders*. If the output monitors are driven by a DisplayLink
+// (USB virtual display) dock rather than a native DP/HDMI output, the heavy cost is DisplayLink's
+// per-frame framebuffer capture+compress (attributed to DWM), not this app — and no GPU flag fixes
+// that. For smooth full-motion video, drive the output displays from a native GPU output.
 app.commandLine.appendSwitch('force_high_performance_gpu');
 
 function isLocalAppUrl(urlString) {

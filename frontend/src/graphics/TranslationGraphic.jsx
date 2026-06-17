@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import gsap from 'gsap';
 import { useGSAP } from '@gsap/react';
 import { applyAnimationIn, applyAnimationOut } from './AnimationUtils';
+import { LAYER_Z } from './layerZ';
 
 // Helper to prune finalized sentences so the total text stays within 2 lines,
 // while guaranteeing each finalized sentence stays visible for a minimum duration.
@@ -173,9 +174,9 @@ export default function TranslationGraphic({ socket, windowMode }) {
     return (
         <div 
             ref={containerRef} 
-            id="translation-overlay" 
-            className={`absolute opacity-0 w-full flex justify-center z-[6400] ${windowMode === 'stage' ? 'hidden' : ''}`}
-            style={getContainerStyle()}
+            id="translation-overlay"
+            className={`absolute opacity-0 w-full flex justify-center ${windowMode === 'stage' ? 'hidden' : ''}`}
+            style={{ ...getContainerStyle(), zIndex: LAYER_Z.translation }}
         >
             <div 
                 ref={panelRef} 

@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import gsap from 'gsap';
 import { useGSAP } from '@gsap/react';
 import { applyAnimationIn, applyAnimationOut } from './AnimationUtils';
+import { LAYER_Z } from './layerZ';
 
 const DEFAULT_DESIGN = {
     shapeStyle: 'glass-card',
@@ -303,6 +304,7 @@ export default function LowerThirdsGraphic({ socket, windowMode }) {
     const normalizedX = Math.max(0, Math.min(Number(design.posX) || 0, 100));
     const normalizedY = Math.max(0, Math.min(Number(design.posY) || 0, 100));
     const positionStyle = {
+        zIndex: LAYER_Z.lowerThirds,
         left: isFullBand ? 0 : `${normalizedX}%`,
         bottom: isFullBand ? 0 : `${normalizedY}%`,
         width: isFullBand ? '100vw' : 'auto',
