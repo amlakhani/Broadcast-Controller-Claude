@@ -83,10 +83,15 @@
     "express": "^4.19.0",
     "microsoft-cognitiveservices-speech-sdk": "^1.50.0",
     "socket.io": "^4.7.0",
-    "ws": "^8.18.3"
+    "ws": "^8.21.0"
   },
   "devDependencies": {
     "electron": "^41.3.0",
     "electron-builder": "^26.8.1"
+  },
+  "overrides": {
+    "ws": "^8.21.0",
+    "qs": "^6.15.2",
+    "tmp": "^0.2.6"
   }
 }
