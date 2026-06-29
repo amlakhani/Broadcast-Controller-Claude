@@ -207,6 +207,38 @@ test('remote pairing validates code, then allows remote socket auth', async () =
     assert.equal(remote.connected, true);
 });
 
+test('repeated wrong pairing codes lock the client out, then a valid pair is rejected while locked', async () => {
+    await serverModule.setRemoteAccessEnabled(true);
+    const validCode = serverModule.getRemoteStatus().pairingCode;
+
+    // Five wrong codes are each rejected with 401; the fifth trips the lockout.
+    for (let i = 0; i < 5; i += 1) {
+        const attempt = await pairRemote({ code: '000000' });
+        assert.equal(attempt.response.status, 401, `attempt ${i + 1} should be 401`);
+    }
+
+    // Now even the correct code is refused with 429 until the lockout expires.
+    const locked = await pairRemote({ code: validCode });
+    assert.equal(locked.response.status, 429);
+    assert.equal(locked.body.ok, false);
+    assert.ok(locked.body.retryAfter > 0);
+    assert.ok(Number(locked.response.headers.get('retry-after')) > 0);
+});
+
+test('a successful pair rotates the code so the same code cannot be reused', async () => {
+    await serverModule.setRemoteAccessEnabled(true);
+    const firstCode = serverModule.getRemoteStatus().pairingCode;
+
+    const paired = await pairRemote({ code: firstCode });
+    assert.equal(paired.response.status, 200);
+
+    const rotatedCode = serverModule.getRemoteStatus().pairingCode;
+    assert.notEqual(rotatedCode, firstCode);
+
+    const reuse = await pairRemote({ code: firstCode });
+    assert.equal(reuse.response.status, 401);
+});
+
 test('revoked or disabled remote sessions cannot stay connected', async () => {
     await serverModule.setRemoteAccessEnabled(true);
     const paired = await pairRemote({ code: serverModule.getRemoteStatus().pairingCode });

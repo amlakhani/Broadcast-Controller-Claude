@@ -44,6 +44,13 @@ const DEFAULT_MEDIA_MESSAGE_OVERLAY = {
     backdrop: true
 };
 const REMOTE_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+// Pairing brute-force protection: after PAIRING_MAX_FAILURES wrong codes from a
+// single client IP, that IP is locked out for PAIRING_LOCKOUT_MS. Combined with
+// rotating the 6-digit code on every successful pair, this bounds an attacker to
+// a handful of guesses per lockout window instead of unlimited.
+const PAIRING_MAX_FAILURES = 5;
+const PAIRING_LOCKOUT_MS = 30 * 1000;
+const PAIRING_ATTEMPT_TTL_MS = 5 * 60 * 1000;
 
 let translationGlossaryDir = process.env.BROADCAST_CONTROLLER_USER_DATA_DIR || path.join(os.homedir(), '.broadcast-controller');
 let translationGlossaryCache = null;
@@ -51,6 +58,7 @@ let localAiSettingsCache = null;
 let remoteAccessEnabled = false;
 let remotePairingCode = generatePairingCode();
 let remoteSessions = new Map();
+let pairingAttempts = new Map();
 let serverHost = '127.0.0.1';
 let registeredLocalMedia = new Map();
 
@@ -108,6 +116,41 @@ function getRemoteSession(token) {
 
 function isValidRemoteToken(token) {
     return remoteAccessEnabled && Boolean(getRemoteSession(token));
+}
+
+function isValidPairingCode(code) {
+    if (typeof code !== 'string' || code.length !== remotePairingCode.length) return false;
+    return crypto.timingSafeEqual(Buffer.from(code), Buffer.from(remotePairingCode));
+}
+
+// req.ip ignores X-Forwarded-For unless trust proxy is set (it isn't), so this is
+// the real TCP peer and can't be spoofed by a header to evade the rate limit.
+function getClientIp(req) {
+    return req.ip || req.socket?.remoteAddress || 'unknown';
+}
+
+function prunePairingAttempts(now = Date.now()) {
+    for (const [ip, record] of pairingAttempts) {
+        if (record.lockedUntil <= now && (now - record.lastAttemptAt) > PAIRING_ATTEMPT_TTL_MS) {
+            pairingAttempts.delete(ip);
+        }
+    }
+}
+
+function getPairingLockMs(ip, now = Date.now()) {
+    const record = pairingAttempts.get(ip);
+    return record && record.lockedUntil > now ? record.lockedUntil - now : 0;
+}
+
+function registerPairingFailure(ip, now = Date.now()) {
+    const record = pairingAttempts.get(ip) || { failures: 0, lockedUntil: 0, lastAttemptAt: now };
+    record.failures += 1;
+    record.lastAttemptAt = now;
+    if (record.failures >= PAIRING_MAX_FAILURES) {
+        record.lockedUntil = now + PAIRING_LOCKOUT_MS;
+        record.failures = 0;
+    }
+    pairingAttempts.set(ip, record);
 }
 
 function requireAuth(req, res, next) {
@@ -695,14 +738,34 @@ app.post('/api/remote/pair', (req, res) => {
         return res.status(403).json({ ok: false, error: 'Remote Operators is disabled on the main controller.' });
     }
 
+    const ip = getClientIp(req);
+    const now = Date.now();
+    prunePairingAttempts(now);
+
+    const lockMs = getPairingLockMs(ip, now);
+    if (lockMs > 0) {
+        const retryAfter = Math.ceil(lockMs / 1000);
+        res.set('Retry-After', String(retryAfter));
+        return res.status(429).json({
+            ok: false,
+            error: `Too many pairing attempts. Try again in ${retryAfter}s.`,
+            retryAfter
+        });
+    }
+
     const code = typeof req.body?.code === 'string' ? req.body.code.replace(/\D/g, '') : '';
     const deviceName = typeof req.body?.deviceName === 'string' && req.body.deviceName.trim()
         ? req.body.deviceName.trim().slice(0, 80)
         : 'Remote Controller';
 
-    if (code !== remotePairingCode) {
+    if (!isValidPairingCode(code)) {
+        registerPairingFailure(ip, now);
         return res.status(401).json({ ok: false, error: 'Pairing code is not valid.' });
     }
+
+    // Successful pair: clear this IP's failures and rotate the code so it can't be reused.
+    pairingAttempts.delete(ip);
+    remotePairingCode = generatePairingCode();
 
     const token = crypto.randomBytes(32).toString('hex');
     const session = {
@@ -1261,6 +1324,7 @@ function resetServerStateForTests() {
     };
     lastClearSnapshot = null;
     registeredLocalMedia = new Map();
+    pairingAttempts.clear();
     cleanupWorker();
 }
 
@@ -2108,6 +2172,7 @@ async function setRemoteAccessEnabled(enabled) {
     const currentPort = app.get('port') || server.address()?.port || DEFAULT_PORT;
     remoteAccessEnabled = enabled;
     remotePairingCode = generatePairingCode();
+    pairingAttempts.clear();
 
     if (!enabled) {
         remoteSessions.clear();
