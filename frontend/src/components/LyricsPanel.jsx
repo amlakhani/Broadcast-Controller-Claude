@@ -1,10 +1,15 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { AlertCircle, Library, Loader2, Music, PauseCircle, Play, RotateCcw, Save, Search, SkipBack, SkipForward, Trash2, XCircle } from 'lucide-react';
 import { authUrl } from '../auth';
-import { deferUntilIdle, readLocalStorageArraySafe, useDebouncedLocalStorageEffect } from '../utils/performance';
+import { deferUntilIdle, readLocalStorageArraySafe, readLocalStorageObjectSafe, useDebouncedLocalStorageEffect } from '../utils/performance';
+import { DEFAULT_GUJ_FONT, GUJ_FONT_OPTIONS } from '../utils/lyricsFonts';
+import { parseAnirdeshText } from '../utils/anirdesh';
+import { groupVersesIntoSlides, normalizeLinesPerSlide, remapSlideIndex, slideLabel } from '../utils/lyricsSlides';
 
 const LIBRARY_KEY = 'bc_song_library_v1';
 const CUE_MODE_KEY = 'bc_lyrics_cue_mode_v1';
+const LYRICS_STYLE_KEY = 'bc_lyrics_style_v1';
+const LINES_PER_SLIDE_KEY = 'bc_lyrics_lines_per_slide_v1';
 const CUE_MODES = {
     FAST_TAKE: 'fastTake',
     SAFE_ARM: 'safeArm'
@@ -25,6 +30,7 @@ export default function LyricsPanel({ socket }) {
     
     // Typography State
     const [fontFamily, setFontFamily] = useState("'Outfit', sans-serif");
+    const [gujFontFamily, setGujFontFamily] = useState(DEFAULT_GUJ_FONT);
     const [fontWeight, setFontWeight] = useState('400');
     const [fontColor, setFontColor] = useState('#ffffff');
     const [fontSize, setFontSize] = useState('64');
@@ -41,6 +47,7 @@ export default function LyricsPanel({ socket }) {
     const [armedVerseIndex, setArmedVerseIndex] = useState(null);
     const [liveVerseIndex, setLiveVerseIndex] = useState(null);
     const [cueMode, setCueMode] = useState(() => localStorage.getItem(CUE_MODE_KEY) || CUE_MODES.FAST_TAKE);
+    const [linesPerSlide, setLinesPerSlide] = useState(() => normalizeLinesPerSlide(localStorage.getItem(LINES_PER_SLIDE_KEY)));
     const [errorMessage, setErrorMessage] = useState('');
 
     // Search State
@@ -54,7 +61,12 @@ export default function LyricsPanel({ socket }) {
     const errorTimerRef = useRef(null);
 
     const isVerseBlank = (verse) => !verse || (!verse.eng?.trim() && !verse.guj?.trim());
-    const canShowArmed = armedVerseIndex !== null && !isVerseBlank(parsedVerses[armedVerseIndex]);
+
+    // What the operator actually arms and takes. Derived, never stored: `parsedVerses` stays
+    // one-line-per-entry because the song library persists it verbatim.
+    const slides = useMemo(() => groupVersesIntoSlides(parsedVerses, linesPerSlide), [parsedVerses, linesPerSlide]);
+
+    const canShowArmed = armedVerseIndex !== null && !isVerseBlank(slides[armedVerseIndex]);
 
     const setTemporaryError = (message) => {
         setErrorMessage(message);
@@ -62,8 +74,11 @@ export default function LyricsPanel({ socket }) {
         errorTimerRef.current = window.setTimeout(() => setErrorMessage(''), 3600);
     };
 
+    // Takes the freshly parsed LINE array and arms the first usable SLIDE, since the
+    // armed/live indices address slides rather than lines.
     const resetCueState = (verses) => {
-        const nextIndex = verses.findIndex(v => !isVerseBlank(v));
+        const nextSlides = groupVersesIntoSlides(verses, linesPerSlide);
+        const nextIndex = nextSlides.findIndex(v => !isVerseBlank(v));
         setArmedVerseIndex(nextIndex >= 0 ? nextIndex : null);
         setLiveVerseIndex(null);
     };
@@ -72,6 +87,23 @@ export default function LyricsPanel({ socket }) {
         setCueMode(mode);
         localStorage.setItem(CUE_MODE_KEY, mode);
     };
+
+    const handleLinesPerSlideChange = (value) => {
+        setLinesPerSlide(normalizeLinesPerSlide(value));
+        localStorage.setItem(LINES_PER_SLIDE_KEY, String(normalizeLinesPerSlide(value)));
+    };
+
+    // Toggling the setting reshapes the slide array, so armed/live indices would otherwise
+    // dangle past its end. Remap them so the operator keeps their place mid-song.
+    const prevLinesPerSlideRef = useRef(linesPerSlide);
+    useEffect(() => {
+        const previous = prevLinesPerSlideRef.current;
+        if (previous === linesPerSlide) return;
+        prevLinesPerSlideRef.current = linesPerSlide;
+        const count = groupVersesIntoSlides(parsedVerses, linesPerSlide).length;
+        setArmedVerseIndex(prev => remapSlideIndex(prev, previous, linesPerSlide, count));
+        setLiveVerseIndex(prev => remapSlideIndex(prev, previous, linesPerSlide, count));
+    }, [linesPerSlide, parsedVerses]);
 
     const doSearch = useCallback(async (q) => {
         if (!q || q.length < 2) { setSearchResults([]); return; }
@@ -128,10 +160,39 @@ export default function LyricsPanel({ socket }) {
         setLibrary(newLib);
     };
 
-    const getStyle = () => ({
-        fontFamily, fontWeight, fontSize, color: fontColor,
+    const getStyle = useCallback(() => ({
+        fontFamily, gujFontFamily, fontWeight, fontSize, color: fontColor,
         letterSpacing, bold: isBold, italic: isItalic, underline: isUnderline
-    });
+    }), [fontFamily, gujFontFamily, fontWeight, fontSize, fontColor, letterSpacing, isBold, isItalic, isUnderline]);
+
+    // Restore saved typography (lyrics styling was previously not persisted at all).
+    useEffect(() => deferUntilIdle(() => {
+        const saved = readLocalStorageObjectSafe(LYRICS_STYLE_KEY);
+        if (saved.fontFamily) setFontFamily(saved.fontFamily);
+        if (saved.gujFontFamily) setGujFontFamily(saved.gujFontFamily);
+        if (saved.fontWeight) setFontWeight(saved.fontWeight);
+        if (saved.fontSize) setFontSize(saved.fontSize);
+        if (saved.color) setFontColor(saved.color);
+        if (saved.letterSpacing !== undefined) setLetterSpacing(saved.letterSpacing);
+        if (saved.bold !== undefined) setIsBold(Boolean(saved.bold));
+        if (saved.italic !== undefined) setIsItalic(Boolean(saved.italic));
+        if (saved.underline !== undefined) setIsUnderline(Boolean(saved.underline));
+    }), []);
+
+    const styleSnapshot = getStyle();
+    useDebouncedLocalStorageEffect(LYRICS_STYLE_KEY, styleSnapshot);
+
+    // Push typography to the output as it changes. The relay (server.js) and the
+    // graphic's listener already existed but nothing ever emitted on this channel,
+    // so font changes used to land only on the next verse take.
+    useEffect(() => {
+        if (!socket) return;
+        socket.emit('update_lyrics_style', getStyle());
+    }, [socket, getStyle]);
+
+    // Preview the chosen face using the operator's own lyric where available.
+    const gujSampleText = (lyricGu.trim() || parsedVerses[0]?.guj || '').trim();
+    const previewGujText = (gujSampleText.split('\n')[0] || 'જય સ્વામિનારાયણ').slice(0, 22);
 
     // Parsing Logic
     const parseTextBlocks = (text) => {
@@ -159,88 +220,12 @@ export default function LyricsPanel({ socket }) {
         }
     };
 
-    const _anirdeshIsJunk = (l) => {
-        if (!l || l.length < 2) return true;
-        const lt = l.trim();
-        if (/^(꠶ટેક|ટેક|°ṭek|ṭek|[0-9૦-૯]+)$/i.test(lt)) return false; 
-        if (/^\(.*\)$/.test(l)) return true;
-        if (/^\[.*\]$/.test(l)) return true;
-        if (/^Pad\s*[-–]\s*\d+$/i.test(l)) return true;
-        if (/^પદ\s*[-–]\s*[\d૦-૯]+/.test(l)) return true;
-        if (/\([^)]*સુદ[^)]*\)/.test(l)) return true;
-        if (/\([^)]*sud\s+\d+[^)]*\)/i.test(l)) return true;
-        if (/^Sadhu\b/i.test(l)) return true;
-        if (/^(Sadguru|Swami|Sant)\s+\w/i.test(l)) return true;
-        if (/^\d+-\d+[:\s]/.test(l)) return true;
-        if (/^Raag[s]?\s*[(:]/i.test(l)) return true;
-        if (/^રાગ[:\s(]/i.test(l)) return true;
-        if (/^સાખી/i.test(l)) return true;
-        if (/^Sakhi/i.test(l)) return true;
-        if (/your browser does not support/i.test(l)) return true;
-        if (/listen to ['"'\u2018\u2019]/i.test(l)) return true;
-        if (/^0:\d+\s*\//.test(l)) return true;
-        if (/^(Pads|Translation|Hindi|Title|Utsav|Writer|Media|Artist|Raag|Multi Pads|Kirtan Study|Quick Links|Search|Part-No|Kirtan Selection|Alphabetical|Kirtan number|Utsavs|Cheshta|Share|Home|Next|Prev|Publication|Publication Media|Sort kirtans|Updeshna Pad|Shri Harina Pad|Avi Aksharvarni Jan|Sadguru|Bhajan|Prarthana|Ashram Bhajanavali|Category)$/i.test(lt)) return true;
-        return false;
-    };
-
     const parseAnirdeshLyrics = (html) => {
-        let clean = html.replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '')
+        const clean = html.replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '')
             .replace(/<audio[\s\S]*?<\/audio>/gi, '');
         const doc = new DOMParser().parseFromString(clean, 'text/html');
-        let body = doc.body ? (doc.body.innerText || doc.body.textContent || '') : '';
-
-        ['Publication Media', 'Sort kirtans by', 'Ashram Bhajanavali'].forEach((m) => {
-            const i = body.indexOf(m); if (i > 100) body = body.substring(0, i);
-        });
-
-        const parts = body.split('Category:');
-        const guLines = [], enLines = [];
-
-        const stripMarkers = (l) => l.replace(/[ .…°-]*(?:[0-9૦-૯]+|꠶ટેક|ટેક|ભલે|bhale|Pad)[ .…°0-9૦-૯-]*$/i, '').trim();
-
-        if (parts.length >= 2) {
-            let skipped = false;
-            parts[1].split('\n').forEach((l) => {
-                l = l.trim(); if (!l) return;
-                if (!skipped) { skipped = true; return; }
-                if (_anirdeshIsJunk(l)) return;
-                if (/^[†*]/.test(l)) return;
-                if (/[\u0A80-\u0AFF]/.test(l) || /^[0-9]+$/.test(l) || /^(꠶ટેક|ટેક)$/.test(l)) {
-                    guLines.push(stripMarkers(l));
-                }
-            });
-        }
-
-        if (parts.length >= 3) {
-            let skippedEN = false;
-            const rawEN = [];
-            parts[2].split('\n').forEach((l) => {
-                l = l.trim(); if (!l) return;
-                if (!skippedEN) { skippedEN = true; return; }
-                if (_anirdeshIsJunk(l)) return;
-                if (/^[†*]/.test(l)) return;
-                if (/[\u0A80-\u0AFF]/.test(l)) return;
-                if (l.length < 2) return;
-                if (/\?\s/.test(l)) return;
-                rawEN.push(stripMarkers(l));
-            });
-
-            let cutIdx = rawEN.length;
-            if (rawEN.length > 4) {
-                const norm = (s) => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[.,;:!?…'"]/g, '').replace(/\s+/g, ' ').trim();
-                const firstNorm = norm(rawEN[0]);
-                for (let i = Math.floor(rawEN.length / 2); i < rawEN.length; i++) {
-                    const ni = norm(rawEN[i]);
-                    const niWords = ni.split(' '), fnWords = firstNorm.split(' ');
-                    const wordMatch = niWords[0] === fnWords[0] || fnWords[0].startsWith(niWords[0]) || niWords[0].startsWith(fnWords[0]);
-                    const restMatch = niWords.slice(1).join(' ') === fnWords.slice(1).join(' ');
-                    if (ni === firstNorm || (wordMatch && restMatch)) { cutIdx = i; break; }
-                }
-            }
-            enLines.push(...rawEN.slice(0, cutIdx));
-        }
-
-        return { GU: guLines, EN: enLines };
+        const body = doc.body ? (doc.body.innerText || doc.body.textContent || '') : '';
+        return parseAnirdeshText(body);
     };
 
     const fetchFromUrl = async (url) => {
@@ -352,18 +337,18 @@ export default function LyricsPanel({ socket }) {
     }, [posX, posY, bgStyle, bgIntensity, bgHeight, bgSoftness, isGradEnabled, langOpt, animStyle, autoClear, socket]);
 
     const armVerse = (index) => {
-        if (parsedVerses.length === 0) return;
-        const clamped = Math.max(0, Math.min(index, parsedVerses.length - 1));
+        if (slides.length === 0) return;
+        const clamped = Math.max(0, Math.min(index, slides.length - 1));
         setArmedVerseIndex(clamped);
     };
 
     const moveArmedVerse = (direction) => {
-        if (parsedVerses.length === 0) return;
-        const startIndex = armedVerseIndex === null ? (direction > 0 ? -1 : parsedVerses.length) : armedVerseIndex;
-        for (let step = 1; step <= parsedVerses.length; step++) {
+        if (slides.length === 0) return;
+        const startIndex = armedVerseIndex === null ? (direction > 0 ? -1 : slides.length) : armedVerseIndex;
+        for (let step = 1; step <= slides.length; step++) {
             const nextIndex = startIndex + direction * step;
-            if (nextIndex < 0 || nextIndex >= parsedVerses.length) break;
-            if (!isVerseBlank(parsedVerses[nextIndex])) {
+            if (nextIndex < 0 || nextIndex >= slides.length) break;
+            if (!isVerseBlank(slides[nextIndex])) {
                 setArmedVerseIndex(nextIndex);
                 return;
             }
@@ -371,10 +356,10 @@ export default function LyricsPanel({ socket }) {
     };
 
     const showVerseAt = (index) => {
-        const verse = parsedVerses[index];
+        const verse = slides[index];
         if (!socket || !verse) return;
         if (isVerseBlank(verse)) {
-            setTemporaryError(`Verse ${index + 1} is blank.`);
+            setTemporaryError(`${slideLabel(verse, index)} is blank.`);
             return;
         }
         if (!socket) return;
@@ -441,7 +426,7 @@ export default function LyricsPanel({ socket }) {
             const active = document.activeElement;
             const tagName = active?.tagName?.toLowerCase();
             const isTyping = tagName === 'input' || tagName === 'textarea' || tagName === 'select' || active?.isContentEditable;
-            if (isTyping || parsedVerses.length === 0) return;
+            if (isTyping || slides.length === 0) return;
 
             if (['ArrowRight', 'ArrowDown'].includes(e.key)) {
                 e.preventDefault();
@@ -460,7 +445,7 @@ export default function LyricsPanel({ socket }) {
 
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
-    }, [parsedVerses, armedVerseIndex, liveVerseIndex, socket, animStyle, langOpt, autoClear, fontFamily, fontWeight, fontSize, fontColor, letterSpacing, isBold, isItalic, isUnderline, bgStyle, posX, posY, isGradEnabled, bgHeight, bgIntensity, bgSoftness]);
+    }, [slides, armedVerseIndex, liveVerseIndex, socket, animStyle, langOpt, autoClear, fontFamily, gujFontFamily, fontWeight, fontSize, fontColor, letterSpacing, isBold, isItalic, isUnderline, bgStyle, posX, posY, isGradEnabled, bgHeight, bgIntensity, bgSoftness]);
 
     const getVerseTileClass = (verse, index) => {
         const isArmed = index === armedVerseIndex;
@@ -472,8 +457,8 @@ export default function LyricsPanel({ socket }) {
         return 'surface text-slate-800 dark:text-slate-200 hover:border-indigo-400 hover:bg-indigo-500/5';
     };
 
-    const armedVerse = armedVerseIndex !== null ? parsedVerses[armedVerseIndex] : null;
-    const liveVerse = liveVerseIndex !== null ? parsedVerses[liveVerseIndex] : null;
+    const armedVerse = armedVerseIndex !== null ? slides[armedVerseIndex] : null;
+    const liveVerse = liveVerseIndex !== null ? slides[liveVerseIndex] : null;
     const showGujarati = langOpt === 'both' || langOpt === 'guj';
     const showEnglish = langOpt === 'both' || langOpt === 'eng';
     const currentTitle = songTitle.trim() || 'Untitled Kirtan';
@@ -634,18 +619,21 @@ export default function LyricsPanel({ socket }) {
                             </div>
 
                             <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-2 max-h-[420px] overflow-y-auto pr-1">
-                                {parsedVerses.map((verse, i) => {
+                                {slides.map((verse, i) => {
                                     const isBlank = isVerseBlank(verse);
+                                    // Static class strings: Tailwind cannot see interpolated names.
+                                    const tileMinHeight = linesPerSlide > 1 ? 'min-h-[136px]' : 'min-h-[104px]';
+                                    const clamp = linesPerSlide > 1 ? 'line-clamp-4' : 'line-clamp-2';
                                     return (
-                                        <button key={i} onClick={() => !isBlank && handleVerseTileClick(i)} onDoubleClick={() => cueMode === CUE_MODES.SAFE_ARM && showVerseAt(i)} disabled={isBlank} className={`min-h-[104px] rounded-lg border p-3 text-left transition active:scale-[0.99] overflow-hidden ${getVerseTileClass(verse, i)}`}>
+                                        <button key={i} onClick={() => !isBlank && handleVerseTileClick(i)} onDoubleClick={() => cueMode === CUE_MODES.SAFE_ARM && showVerseAt(i)} disabled={isBlank} className={`${tileMinHeight} rounded-lg border p-3 text-left transition active:scale-[0.99] overflow-hidden ${getVerseTileClass(verse, i)}`}>
                                             <div className="flex items-center justify-between gap-2 mb-2">
-                                                <span className="text-[10px] uppercase tracking-widest font-bold">Verse {i + 1}</span>
+                                                <span className="text-[10px] uppercase tracking-widest font-bold">{slideLabel(verse, i)}</span>
                                                 <span className="text-[9px] font-bold uppercase tracking-wider">
                                                     {i === liveVerseIndex ? 'Live' : i === armedVerseIndex ? 'Armed' : isBlank ? 'Blank' : 'Ready'}
                                                 </span>
                                             </div>
-                                            {showGujarati && <div className={`font-guj font-bold text-sm leading-snug line-clamp-2 ${verse.guj ? '' : 'text-slate-400 italic'}`}>{verse.guj || 'No Gujarati line'}</div>}
-                                            {showEnglish && <div className={`text-xs leading-snug line-clamp-2 mt-1 ${verse.eng ? 'text-slate-500 dark:text-slate-400 italic' : 'text-slate-400 italic'}`}>{verse.eng || 'No English line'}</div>}
+                                            {showGujarati && <div className={`font-guj font-bold text-sm leading-snug whitespace-pre-line ${clamp} ${verse.guj ? '' : 'text-slate-400 italic'}`}>{verse.guj || 'No Gujarati line'}</div>}
+                                            {showEnglish && <div className={`text-xs leading-snug whitespace-pre-line mt-1 ${clamp} ${verse.eng ? 'text-slate-500 dark:text-slate-400 italic' : 'text-slate-400 italic'}`}>{verse.eng || 'No English line'}</div>}
                                             <div className="mt-2 text-[9px] font-bold uppercase tracking-wider text-slate-400">
                                                 {isBlank ? 'Cannot send blank' : cueMode === CUE_MODES.FAST_TAKE ? 'Click to take live' : 'Click to arm'}
                                             </div>
@@ -690,8 +678,15 @@ export default function LyricsPanel({ socket }) {
                     </div>
                     <div className="space-y-1.5">
                         <label className="block text-sm font-medium text-slate-700 dark:text-slate-300">Auto Clear (s)</label>
-                        <input type="number" value={autoClear} onChange={e=>setAutoClear(e.target.value)} placeholder="0 = Manual" min="0" 
+                        <input type="number" value={autoClear} onChange={e=>setAutoClear(e.target.value)} placeholder="0 = Manual" min="0"
                                className="control-field px-4 py-2" />
+                    </div>
+                    <div className="space-y-1.5">
+                        <label className="block text-sm font-medium text-slate-700 dark:text-slate-300">Lines per Slide</label>
+                        <select value={linesPerSlide} onChange={e=>handleLinesPerSlideChange(e.target.value)} className="control-field px-4 py-2">
+                            <option value="1">1 line at a time</option>
+                            <option value="2">2 lines at a time</option>
+                        </select>
                     </div>
                 </div>
 
@@ -845,12 +840,24 @@ export default function LyricsPanel({ socket }) {
                         </div>
 
                         <div className="space-y-1">
-                            <label className="block text-[10px] font-medium text-slate-500 uppercase">Font Family</label>
+                            <label className="block text-[10px] font-medium text-slate-500 uppercase">English Font</label>
                             <select value={fontFamily} onChange={e=>setFontFamily(e.target.value)} className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-[10px] text-white outline-none">
                                 <option value="'Outfit', sans-serif">Outfit (Default)</option>
                                 <option value="'Inter', sans-serif">Inter</option>
                                 <option value="'Poppins', sans-serif">Poppins</option>
                             </select>
+                        </div>
+
+                        <div className="space-y-1">
+                            <label className="block text-[10px] font-medium text-slate-500 uppercase">Gujarati Font</label>
+                            <select value={gujFontFamily} onChange={e=>setGujFontFamily(e.target.value)} className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-[10px] text-white outline-none">
+                                {GUJ_FONT_OPTIONS.map(font => (
+                                    <option key={font.value} value={font.value}>{font.label}</option>
+                                ))}
+                            </select>
+                            <div className="rounded bg-slate-950 px-2 py-1.5 text-center text-lg text-white" style={{ fontFamily: gujFontFamily }}>
+                                {previewGujText}
+                            </div>
                         </div>
                     </div>
                 </div>

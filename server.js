@@ -4,6 +4,7 @@ import { Server } from 'socket.io';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import https from 'https';
+import zlib from 'zlib';
 import fs from 'fs';
 import os from 'os';
 import crypto from 'crypto';
@@ -51,12 +52,24 @@ const REMOTE_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 const PAIRING_MAX_FAILURES = 5;
 const PAIRING_LOCKOUT_MS = 30 * 1000;
 const PAIRING_ATTEMPT_TTL_MS = 5 * 60 * 1000;
+// The pairing code is embedded in the scannable QR, so it rotates on a timer to keep a
+// photographed QR from staying useful. The grace window keeps the immediately-previous code
+// valid briefly so a scan (or manual entry) that lands mid-rotation still succeeds.
+const PAIRING_CODE_ROTATE_MS = 30 * 1000;
+const PAIRING_CODE_GRACE_MS = 10 * 1000;
 
 let translationGlossaryDir = process.env.BROADCAST_CONTROLLER_USER_DATA_DIR || path.join(os.homedir(), '.broadcast-controller');
 let translationGlossaryCache = null;
 let localAiSettingsCache = null;
 let remoteAccessEnabled = false;
 let remotePairingCode = generatePairingCode();
+let remotePairingCodeIssuedAt = Date.now();
+let previousPairingCode = '';
+let previousPairingCodeExpiresAt = 0;
+let pairingRotateTimer = null;
+let remoteNetworkSelection = null;
+let lastBlockedRemote = null;
+let lastBlockedEmitAt = 0;
 let remoteSessions = new Map();
 let pairingAttempts = new Map();
 let serverHost = '127.0.0.1';
@@ -118,9 +131,51 @@ function isValidRemoteToken(token) {
     return remoteAccessEnabled && Boolean(getRemoteSession(token));
 }
 
+function timingSafeEqualString(a, b) {
+    if (typeof a !== 'string' || typeof b !== 'string') return false;
+    if (!a.length || a.length !== b.length) return false;
+    return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
 function isValidPairingCode(code) {
-    if (typeof code !== 'string' || code.length !== remotePairingCode.length) return false;
-    return crypto.timingSafeEqual(Buffer.from(code), Buffer.from(remotePairingCode));
+    if (timingSafeEqualString(code, remotePairingCode)) return true;
+    // Grace window: a code retired by *timed* rotation stays valid briefly. A code retired by a
+    // successful pair is cleared outright (see rotatePairingCode), so it can never be reused.
+    if (previousPairingCode && Date.now() < previousPairingCodeExpiresAt) {
+        return timingSafeEqualString(code, previousPairingCode);
+    }
+    return false;
+}
+
+// grace=true  -> timed rotation; the outgoing code stays usable for PAIRING_CODE_GRACE_MS.
+// grace=false -> the outgoing code dies immediately (successful pair, enable/disable).
+function rotatePairingCode({ grace = false } = {}) {
+    if (grace) {
+        previousPairingCode = remotePairingCode;
+        previousPairingCodeExpiresAt = Date.now() + PAIRING_CODE_GRACE_MS;
+    } else {
+        previousPairingCode = '';
+        previousPairingCodeExpiresAt = 0;
+    }
+    remotePairingCode = generatePairingCode();
+    remotePairingCodeIssuedAt = Date.now();
+    return remotePairingCode;
+}
+
+function stopPairingRotation() {
+    if (!pairingRotateTimer) return;
+    clearInterval(pairingRotateTimer);
+    pairingRotateTimer = null;
+}
+
+function startPairingRotation() {
+    stopPairingRotation();
+    pairingRotateTimer = setInterval(() => {
+        rotatePairingCode({ grace: true });
+        emitRemoteAccessStatus();
+    }, PAIRING_CODE_ROTATE_MS);
+    // Never hold the process (or a test run) open just for the rotation timer.
+    pairingRotateTimer.unref?.();
 }
 
 // req.ip ignores X-Forwarded-For unless trust proxy is set (it isn't), so this is
@@ -198,9 +253,9 @@ function getAllowedOrigin(port = app.get('port')) {
         `http://localhost:${port}`
     ]);
     if (remoteAccessEnabled) {
-        for (const address of getLanAddresses()) {
-            origins.add(`http://${address}:${port}`);
-        }
+        // Only the selected network's address is a valid origin.
+        const active = getActiveRemoteAddress();
+        if (active) origins.add(`http://${active}:${port}`);
     }
     return origins;
 }
@@ -216,8 +271,8 @@ function sendAppHtml(res, fileName) {
     res.send(html.replace('</head>', `<script>window.__BC_AUTH_TOKEN__=${JSON.stringify(AUTH_TOKEN)};</script></head>`));
 }
 
-function sendRemoteHtml(res) {
-    const html = fs.readFileSync(path.join(__dirname, 'public_react', 'index.html'), 'utf8');
+function sendRemoteHtml(res, fileName = 'index.html') {
+    const html = fs.readFileSync(path.join(__dirname, 'public_react', fileName), 'utf8');
     res.set('Content-Type', 'text/html; charset=utf-8');
     res.send(html.replace('</head>', '<script>window.__BC_REMOTE_ENTRY__=true;</script></head>'));
 }
@@ -235,6 +290,108 @@ function getLanAddresses() {
     return addresses;
 }
 
+// Adapters that are almost never the LAN a phone is on. Used only for ranking the
+// "auto" default — every adapter is still selectable.
+const VIRTUAL_ADAPTER_PATTERNS = [
+    /virtualbox/i, /host-?only/i, /vethernet/i, /hyper-?v/i, /vmware/i,
+    /tailscale/i, /zerotier/i, /docker/i, /wsl/i, /loopback/i, /bluetooth/i
+];
+
+function isVirtualAdapter(name = '') {
+    return VIRTUAL_ADAPTER_PATTERNS.some(pattern => pattern.test(name));
+}
+
+function getNetworkAdapters() {
+    const interfaces = os.networkInterfaces();
+    const adapters = [];
+    for (const [name, entries] of Object.entries(interfaces)) {
+        const ipv4 = (entries || []).find(entry => entry.family === 'IPv4' && !entry.internal);
+        if (ipv4) adapters.push({ name, address: ipv4.address, isVirtual: isVirtualAdapter(name) });
+    }
+    // Real adapters first; stable alphabetical within each group.
+    adapters.sort((a, b) => (a.isVirtual === b.isVirtual ? a.name.localeCompare(b.name) : (a.isVirtual ? 1 : -1)));
+    return adapters;
+}
+
+function getRemoteNetworkPath() {
+    return path.join(translationGlossaryDir, 'remote-network.json');
+}
+
+// Selection is stored by adapter NAME, not IP — DHCP moves IPs, names are stable.
+function loadRemoteNetworkSelection() {
+    if (remoteNetworkSelection) return remoteNetworkSelection;
+    try {
+        const selectionPath = getRemoteNetworkPath();
+        if (fs.existsSync(selectionPath)) {
+            const parsed = JSON.parse(fs.readFileSync(selectionPath, 'utf8'));
+            if (typeof parsed?.selected === 'string' && parsed.selected.trim()) {
+                remoteNetworkSelection = parsed.selected.trim();
+                return remoteNetworkSelection;
+            }
+        }
+    } catch (err) {
+        console.error('Failed to load remote network selection:', err);
+    }
+    remoteNetworkSelection = 'auto';
+    return remoteNetworkSelection;
+}
+
+function saveRemoteNetworkSelection(selected) {
+    const value = typeof selected === 'string' && selected.trim() ? selected.trim() : 'auto';
+    remoteNetworkSelection = value;
+    try {
+        fs.mkdirSync(translationGlossaryDir, { recursive: true });
+        fs.writeFileSync(getRemoteNetworkPath(), JSON.stringify({ selected: value }, null, 2), 'utf8');
+    } catch (err) {
+        console.error('Failed to save remote network selection:', err);
+    }
+    return value;
+}
+
+function getSelectedNetwork() {
+    const adapters = getNetworkAdapters();
+    const selection = loadRemoteNetworkSelection();
+    if (selection === 'auto') {
+        return adapters.find(adapter => !adapter.isVirtual) || adapters[0] || null;
+    }
+    return adapters.find(adapter => adapter.name === selection) || null;
+}
+
+// The single LAN address remote devices may reach us on ('' when unavailable).
+function getActiveRemoteAddress() {
+    return getSelectedNetwork()?.address || '';
+}
+
+function normalizeIpAddress(address = '') {
+    if (typeof address !== 'string') return '';
+    return address.replace(/^::ffff:/i, '');
+}
+
+// Must cover every loopback spelling — a naive '127.0.0.1' compare would lock the app's
+// own windows (control/graphics/stage/backstage/NDI all connect over loopback) out.
+function isLoopbackAddress(address) {
+    const ip = normalizeIpAddress(address);
+    return ip === '::1' || ip.startsWith('127.');
+}
+
+// Gate on the interface a connection ARRIVED on, so remote access is confined to the
+// selected network. Loopback is always allowed, regardless of selection or enable state.
+function isAllowedInterface(localAddress) {
+    if (isLoopbackAddress(localAddress)) return true;
+    if (!remoteAccessEnabled) return false;
+    const active = getActiveRemoteAddress();
+    return Boolean(active) && normalizeIpAddress(localAddress) === active;
+}
+
+function recordBlockedRemote(address) {
+    lastBlockedRemote = { address: normalizeIpAddress(address) || 'unknown', when: Date.now() };
+    // Surface promptly in Settings, but don't spam the socket under a scan/flood.
+    if (Date.now() - lastBlockedEmitAt > 3000) {
+        lastBlockedEmitAt = Date.now();
+        emitRemoteAccessStatus();
+    }
+}
+
 function getRemoteStatus() {
     const port = app.get('port');
     const sessions = [...remoteSessions.entries()]
@@ -247,10 +404,19 @@ function getRemoteStatus() {
             pairedAt: session.pairedAt,
             expiresAt: session.expiresAt
         }));
+    const activeAddress = getActiveRemoteAddress();
+    const reachable = remoteAccessEnabled && Boolean(port) && Boolean(activeAddress);
     return {
         enabled: remoteAccessEnabled,
         pairingCode: remoteAccessEnabled ? remotePairingCode : '',
-        lanUrls: remoteAccessEnabled && port ? getLanAddresses().map(address => `http://${address}:${port}/remote`) : [],
+        pairingCodeExpiresAt: remoteAccessEnabled ? remotePairingCodeIssuedAt + PAIRING_CODE_ROTATE_MS : 0,
+        lanUrls: reachable ? [`http://${activeAddress}:${port}/remote`] : [],
+        slidesUrls: reachable ? [`http://${activeAddress}:${port}/slides`] : [],
+        networks: getNetworkAdapters(),
+        selectedNetwork: loadRemoteNetworkSelection(),
+        activeAddress,
+        networkUnavailable: remoteAccessEnabled && !activeAddress,
+        lastBlocked: lastBlockedRemote,
         sessions
     };
 }
@@ -697,6 +863,15 @@ function streamLocalFile(req, res, localFile, notFoundMessage = 'File not found'
     }
 }
 
+// Confine remote access to the selected network. Runs ahead of every route and the static
+// handlers, so a device on another network cannot even fetch the JS bundle. Loopback always
+// passes, which is what keeps the app's own windows working.
+app.use((req, res, next) => {
+    if (isAllowedInterface(req.socket?.localAddress)) return next();
+    recordBlockedRemote(req.socket?.remoteAddress);
+    return res.status(403).send('Forbidden: remote access is limited to a different network.');
+});
+
 app.get('/', requireAuth, (req, res) => {
     sendAppHtml(res, 'index.html');
 });
@@ -724,6 +899,15 @@ app.get('/backstage.html', requireAuth, (req, res) => {
 app.get('/remote', (req, res) => {
     sendRemoteHtml(res);
 });
+
+// Touch-first slides remote (phone/iPad). Pairs the same way as /remote.
+// Must stay a single path segment: the built HTML references assets
+// relatively ("./assets/..."), which only resolves to /assets at depth 1.
+app.get('/slides', (req, res) => {
+    sendRemoteHtml(res, 'remote.html');
+});
+
+app.get('/remote/slides', (req, res) => res.redirect('/slides'));
 
 app.get('/api/remote/status', (req, res) => {
     if (isValidAuthToken(getRequestToken(req))) {
@@ -764,8 +948,9 @@ app.post('/api/remote/pair', (req, res) => {
     }
 
     // Successful pair: clear this IP's failures and rotate the code so it can't be reused.
+    // No grace here — the code that was just consumed must die immediately.
     pairingAttempts.delete(ip);
-    remotePairingCode = generatePairingCode();
+    rotatePairingCode({ grace: false });
 
     const token = crypto.randomBytes(32).toString('hex');
     const session = {
@@ -810,6 +995,14 @@ app.post('/api/local-media/register', requireLocalAuth, (req, res) => {
 app.use(express.static(path.join(__dirname, 'public_react'), { index: false }));
 // Fallback to 'public' for legacy assets like logo.png
 app.use(express.static(path.join(__dirname, 'public'), { index: false }));
+// Self-hosted typography: Unicode Gujarati webfonts (fonts/unicode) and the legacy
+// 8-bit Gujarati TTFs (fonts/). Serving these locally is what lets Gujarati lyrics
+// render with no internet — previously the only Gujarati face came from a CDN.
+app.use('/fonts', express.static(path.join(__dirname, 'fonts'), {
+    index: false,
+    immutable: true,
+    maxAge: '30d'
+}));
 
 // Endpoint to stream local video files with Range support (for seeking/streaming)
 app.get('/local-video', requireAuth, (req, res) => {
@@ -938,8 +1131,170 @@ app.get('/search-anirdesh', requireAuth, (req, res) => {
     proxyReq.end();
 });
 
-// YouTube Playlist fetcher proxy
-app.get('/fetch-youtube-playlist', requireAuth, (req, res) => {
+// --- YouTube playlist scraping helpers ---
+
+// Request gzip so the ~1MB playlist page and each 100-video continuation
+// response transfer compressed — the main speed win for large playlists.
+const YT_BROWSE_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br'
+};
+
+// Reuse one TLS connection across the (sequential) continuation requests.
+const ytBrowseAgent = new https.Agent({ keepAlive: true });
+
+// Decompress a response body buffer according to its Content-Encoding.
+function decodeResponseBody(response, buffer) {
+    const encoding = (response.headers['content-encoding'] || '').toLowerCase();
+    if (encoding === 'gzip') return zlib.gunzipSync(buffer);
+    if (encoding === 'deflate') return zlib.inflateSync(buffer);
+    if (encoding === 'br') return zlib.brotliDecompressSync(buffer);
+    return buffer;
+}
+
+// Fetch a URL and resolve with the full response body as a string.
+function httpsGetText(url, headers = {}) {
+    return new Promise((resolve, reject) => {
+        https.get(url, { headers, agent: ytBrowseAgent }, (response) => {
+            if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+                // Follow a single redirect (e.g. consent → playlist).
+                response.resume();
+                return httpsGetText(response.headers.location, headers).then(resolve, reject);
+            }
+            const chunks = [];
+            response.on('data', chunk => { chunks.push(chunk); });
+            response.on('end', () => {
+                try {
+                    resolve(decodeResponseBody(response, Buffer.concat(chunks)).toString('utf8'));
+                } catch (e) {
+                    reject(e);
+                }
+            });
+        }).on('error', reject);
+    });
+}
+
+// POST a JSON body and resolve with the parsed JSON response.
+function httpsPostJson(url, headers, bodyObj) {
+    return new Promise((resolve, reject) => {
+        const payload = JSON.stringify(bodyObj);
+        const parsed = new URL(url);
+        const options = {
+            method: 'POST',
+            hostname: parsed.hostname,
+            path: parsed.pathname + parsed.search,
+            agent: ytBrowseAgent,
+            headers: {
+                ...headers,
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(payload)
+            }
+        };
+        const request = https.request(options, (response) => {
+            const chunks = [];
+            response.on('data', chunk => { chunks.push(chunk); });
+            response.on('end', () => {
+                try {
+                    resolve(JSON.parse(decodeResponseBody(response, Buffer.concat(chunks)).toString('utf8')));
+                } catch (e) {
+                    reject(e);
+                }
+            });
+        });
+        request.on('error', reject);
+        request.write(payload);
+        request.end();
+    });
+}
+
+// Extract a brace-balanced JSON object substring starting at the first `{`
+// at or after `startIndex`, respecting string literals and escape sequences.
+function extractBalancedJson(text, startIndex) {
+    const open = text.indexOf('{', startIndex);
+    if (open === -1) return null;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = open; i < text.length; i++) {
+        const ch = text[i];
+        if (inString) {
+            if (escaped) { escaped = false; }
+            else if (ch === '\\') { escaped = true; }
+            else if (ch === '"') { inString = false; }
+            continue;
+        }
+        if (ch === '"') { inString = true; }
+        else if (ch === '{') { depth++; }
+        else if (ch === '}') {
+            depth--;
+            if (depth === 0) return text.slice(open, i + 1);
+        }
+    }
+    return null;
+}
+
+// Locate and parse the ytInitialData blob from a YouTube HTML page.
+function extractYtInitialData(html) {
+    const anchors = ['var ytInitialData =', 'window["ytInitialData"] =', 'ytInitialData ='];
+    for (const anchor of anchors) {
+        const idx = html.indexOf(anchor);
+        if (idx === -1) continue;
+        const jsonStr = extractBalancedJson(html, idx + anchor.length);
+        if (!jsonStr) continue;
+        try {
+            return JSON.parse(jsonStr);
+        } catch {
+            // Try the next anchor form.
+        }
+    }
+    return null;
+}
+
+// Collect { type, id, name } videos from a list of renderer items, de-duping
+// against `seen`. Handles both YouTube's current `lockupViewModel` format and
+// the legacy `playlistVideoRenderer`. Returns the next continuation token if any.
+function collectPlaylistItems(items, results, seen) {
+    let continuationToken = null;
+    if (!Array.isArray(items)) return continuationToken;
+    for (const item of items) {
+        const lock = item?.lockupViewModel;
+        const legacy = item?.playlistVideoRenderer;
+        if (lock && lock.contentId && lock.contentType === 'LOCKUP_CONTENT_TYPE_VIDEO') {
+            if (!seen.has(lock.contentId)) {
+                seen.add(lock.contentId);
+                results.push({
+                    type: 'youtube',
+                    id: lock.contentId,
+                    name: lock.metadata?.lockupMetadataViewModel?.title?.content || `Video: ${lock.contentId}`
+                });
+            }
+        } else if (legacy && legacy.videoId) {
+            if (!seen.has(legacy.videoId)) {
+                seen.add(legacy.videoId);
+                results.push({
+                    type: 'youtube',
+                    id: legacy.videoId,
+                    name: legacy.title?.runs?.[0]?.text || legacy.title?.simpleText || `Video: ${legacy.videoId}`
+                });
+            }
+        } else if (item?.continuationItemViewModel) {
+            continuationToken = item.continuationItemViewModel
+                ?.continuationCommand?.innertubeCommand?.continuationCommand?.token || null;
+        } else if (item?.continuationItemRenderer) {
+            continuationToken = item.continuationItemRenderer
+                ?.continuationEndpoint?.continuationCommand?.token || null;
+        }
+    }
+    return continuationToken;
+}
+
+const YT_MAX_VIDEOS = 5000;
+const YT_MAX_PAGES = 60;
+
+// YouTube Playlist fetcher proxy — scrapes the playlist page, then paginates
+// through YouTube's internal InnerTube browse API to fetch the whole playlist.
+app.get('/fetch-youtube-playlist', requireAuth, async (req, res) => {
     let playlistUrl = decodeURIComponent(req.query.url || '');
     if (!isAllowedHostname(playlistUrl, ['youtube.com', 'youtu.be']) || !playlistUrl.includes('list=')) {
         return res.status(400).send('Invalid YouTube Playlist URL');
@@ -951,68 +1306,95 @@ app.get('/fetch-youtube-playlist', requireAuth, (req, res) => {
         const listId = url.searchParams.get('list');
         playlistUrl = `https://www.youtube.com/playlist?list=${listId}`;
     }
-    
-    const options = {
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9'
+
+    const parsedMax = parseInt(req.query.max, 10);
+    const maxVideos = Number.isFinite(parsedMax) && parsedMax > 0
+        ? Math.min(parsedMax, YT_MAX_VIDEOS)
+        : YT_MAX_VIDEOS;
+
+    try {
+        const html = await httpsGetText(playlistUrl, YT_BROWSE_HEADERS);
+        const initialData = extractYtInitialData(html);
+        if (!initialData) {
+            console.error('YouTube playlist scrape: ytInitialData not found');
+            return res.status(500).send('Failed to parse playlist data');
         }
-    };
 
-    https.get(playlistUrl, options, (response) => {
-        let data = '';
-        response.on('data', chunk => { data += chunk; });
-        response.on('end', () => {
+        const results = [];
+        const seen = new Set();
+
+        // Current format: lockupViewModel items live directly in itemSectionRenderer.contents.
+        const itemSection = initialData.contents?.twoColumnBrowseResultsRenderer?.tabs?.[0]
+            ?.tabRenderer?.content?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents;
+        // Legacy format nested them under playlistVideoListRenderer.contents.
+        const contents = itemSection?.[0]?.playlistVideoListRenderer?.contents || itemSection;
+
+        let continuationToken = collectPlaylistItems(contents, results, seen);
+
+        // Extract InnerTube credentials for continuation requests.
+        const apiKeyMatch = html.match(/"INNERTUBE_API_KEY":"([^"]+)"/);
+        const clientVersionMatch = html.match(/"INNERTUBE_CONTEXT_CLIENT_VERSION":"([^"]+)"/)
+            || html.match(/"clientVersion":"([^"]+)"/);
+        const apiKey = apiKeyMatch?.[1];
+        const clientVersion = clientVersionMatch?.[1];
+
+        // Paginate through continuation tokens (best-effort).
+        let pages = 0;
+        while (
+            continuationToken && apiKey && clientVersion &&
+            results.length < maxVideos && pages < YT_MAX_PAGES
+        ) {
+            pages++;
             try {
-                const results = [];
-                // Extract ytInitialData
-                const regex = /var ytInitialData = (\{.*?\});/;
-                const match = data.match(regex);
-                
-                if (match) {
-                    const json = JSON.parse(match[1]);
-                    // Navigate to contents
-                    const contents = json.contents?.twoColumnBrowseResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents?.[0]?.playlistVideoListRenderer?.contents;
-                    
-                    if (contents && Array.isArray(contents)) {
-                        contents.forEach(item => {
-                            const v = item.playlistVideoRenderer;
-                            if (v && v.videoId) {
-                                results.push({
-                                    type: 'youtube',
-                                    id: v.videoId,
-                                    name: v.title?.runs?.[0]?.text || `Video: ${v.videoId}`
-                                });
-                            }
-                        });
-                    }
+                const browseUrl = `https://www.youtube.com/youtubei/v1/browse?key=${apiKey}`;
+                const body = {
+                    context: { client: { clientName: 'WEB', clientVersion } },
+                    continuation: continuationToken
+                };
+                const json = await httpsPostJson(browseUrl, YT_BROWSE_HEADERS, body);
+                const actions = json.onResponseReceivedActions || [];
+                let nextToken = null;
+                for (const action of actions) {
+                    const items = action?.appendContinuationItemsAction?.continuationItems;
+                    const token = collectPlaylistItems(items, results, seen);
+                    if (token) nextToken = token;
                 }
-
-                if (results.length === 0) {
-                    // Fallback to naive regex if JSON path failed
-                    const videoRegex = /"videoId":"([^"]+)","title":\{"runs":\[\{"text":"([^"]+)"\}\]/g;
-                    let m;
-                    while ((m = videoRegex.exec(data)) !== null) {
-                        if (!results.find(r => r.id === m[1])) {
-                            results.push({ type: 'youtube', id: m[1], name: m[2] });
-                        }
-                    }
-                }
-
-                res.json(results);
+                continuationToken = nextToken;
             } catch (e) {
-                console.error("Scrape Error:", e);
-                res.status(500).send("Failed to parse playlist data");
+                console.error('YouTube playlist continuation failed:', e.message);
+                break; // Best-effort: return what we have so far.
             }
-        });
-    }).on('error', (err) => {
+        }
+
+        res.json(maxVideos < results.length ? results.slice(0, maxVideos) : results);
+    } catch (err) {
+        console.error('YouTube playlist scrape error:', err.message);
         res.status(500).send('Fetch error: ' + err.message);
-    });
+    }
 });
 
 // Local Video Streamer
 app.get('/stream-video', requireAuth, (req, res) => {
     streamLocalFile(req, res, resolveMediaRequest(req, STREAM_EXTENSIONS), 'Media not found');
+});
+
+// Single slide image for image/PDF decks. Lets the slides remote render
+// previews and thumbnails without ever receiving the whole `images` array.
+app.get('/api/presentation/slide/:index', requireAuth, (req, res) => {
+    const images = currentPresState?.images;
+    if (currentPresState?.mode !== 'images' || !Array.isArray(images)) {
+        return res.status(404).send('No image deck loaded');
+    }
+    const index = Number.parseInt(req.params.index, 10);
+    if (!Number.isInteger(index) || index < 0 || index >= images.length) {
+        return res.status(404).send('Slide not found');
+    }
+    const match = /^data:([\w/+.-]+);base64,(.*)$/s.exec(images[index] || '');
+    if (!match) return res.status(404).send('Slide not available');
+
+    res.set('Content-Type', match[1]);
+    res.set('Cache-Control', 'no-cache');
+    res.send(Buffer.from(match[2], 'base64'));
 });
 
 
@@ -1028,6 +1410,7 @@ const EMPTY_PRESENTATION_STATE = {
 };
 
 let currentPresState = null;
+let currentPresLibrary = [];
 let currentStagePresToggle = false;
 let currentStageTimerState = null;
 let currentStageMessage = null;
@@ -1208,6 +1591,25 @@ function emitOperatorState(target = io) {
     target.emit('operator_state_update', getOperatorState());
 }
 
+// Slim presentation state for lightweight clients (the slides remote).
+// Deliberately omits `images`, which can be many megabytes of base64.
+function getPresMeta() {
+    const state = currentPresState || EMPTY_PRESENTATION_STATE;
+    return {
+        mode: state.mode || 'none',
+        baseUrl: state.baseUrl || '',
+        slideId: state.slideId || '',
+        currentIdx: state.currentIdx || 0,
+        totalSlides: state.totalSlides || 0,
+        isCanva: Boolean(state.isCanva),
+        showing: Boolean(state.showing)
+    };
+}
+
+function emitPresMeta(target = io) {
+    target.emit('pres_meta', getPresMeta());
+}
+
 function validateTranslationConfig(config) {
     const engine = TRANSLATION_ENGINES.has(config?.engine) ? config.engine : 'azure';
     const key = typeof config?.key === 'string' ? config.key.trim() : '';
@@ -1270,7 +1672,14 @@ const cleanupWorker = ({ emitStatus = false, status = 'idle', error = null, engi
 };
 
 function resetServerStateForTests() {
+    stopPairingRotation();
+    remoteNetworkSelection = null;
+    lastBlockedRemote = null;
+    lastBlockedEmitAt = 0;
+    previousPairingCode = '';
+    previousPairingCodeExpiresAt = 0;
     currentPresState = null;
+    currentPresLibrary = [];
     currentStagePresToggle = false;
     currentStageTimerState = null;
     currentStageMessage = null;
@@ -1367,6 +1776,11 @@ io.use((socket, next) => {
     const origin = socket.handshake.headers.origin || '';
     const token = socket.handshake.auth?.token || socket.handshake.query?.auth || '';
     const remoteToken = socket.handshake.auth?.remoteToken || socket.handshake.query?.remoteToken || '';
+    // Same network confinement as the HTTP middleware (loopback always allowed).
+    if (!isAllowedInterface(socket.request?.socket?.localAddress)) {
+        recordBlockedRemote(socket.request?.socket?.remoteAddress);
+        return next(new Error('Unauthorized'));
+    }
     if (!isAllowedOrigin(origin)) {
         return next(new Error('Unauthorized'));
     }
@@ -1441,6 +1855,8 @@ io.on('connection', (socket) => {
 
     // Send cached state to the new client
     if (currentPresState) socket.emit('pres_update', currentPresState);
+    emitPresMeta(socket);
+    if (currentPresLibrary.length) socket.emit('pres_library_update', currentPresLibrary);
     socket.emit('stage_pres_toggle_update', currentStagePresToggle);
     
     if (currentStageTimerState) {
@@ -1520,6 +1936,14 @@ io.on('connection', (socket) => {
         } catch (err) {
             sendSocketResult(ack, { ok: false, error: err.message || 'Could not update remote access.' });
         }
+    });
+
+    // Local-only: a remote must never be able to widen the network it reaches us on.
+    onLocalSocket(socket, 'remote_network_set', (selected, ack) => {
+        saveRemoteNetworkSelection(selected);
+        lastBlockedRemote = null;
+        emitRemoteAccessStatus();
+        sendSocketResult(ack, { ok: true, status: getRemoteStatus() });
     });
 
     let autoClearTimer = null;
@@ -1608,6 +2032,7 @@ io.on('connection', (socket) => {
         io.emit('photo_stop');
         io.emit('media_message_overlay_update', currentMediaMessageOverlay);
         io.emit('pres_update', currentPresState);
+        emitPresMeta();
         io.emit('stop_sabha');
         io.emit('hide_translation');
         emitOperatorState();
@@ -1636,6 +2061,7 @@ io.on('connection', (socket) => {
         if (lastClearSnapshot.presentationState) {
             currentPresState = lastClearSnapshot.presentationState;
             io.emit('pres_update', currentPresState);
+            emitPresMeta();
         }
         if (lastClearSnapshot.sabhaState) {
             currentSabhaState = { ...lastClearSnapshot.sabhaState, showing: true };
@@ -1905,10 +2331,51 @@ io.on('connection', (socket) => {
     socket.on('pres_update', (data) => {
         currentPresState = data;
         io.emit('pres_update', data);
+        emitPresMeta();
         emitOperatorState();
     });
 
     socket.on('pres_nav', (data) => io.emit('pres_nav', data));
+
+    // Server-authoritative navigation. Lets lightweight clients (the slides
+    // remote) move the deck without echoing the whole state object back.
+    socket.on('pres_goto', (payload) => {
+        if (!currentPresState || currentPresState.mode === 'none') return;
+        const total = currentPresState.totalSlides || 0;
+        if (total <= 0) return;
+
+        const current = currentPresState.currentIdx || 0;
+        let next = current;
+        const direction = payload?.direction;
+        if (direction === 'next') next = current + 1;
+        else if (direction === 'prev') next = current - 1;
+        else if (direction === 'first') next = 0;
+        else if (direction === 'last') next = total - 1;
+        else if (Number.isInteger(payload?.index)) next = payload.index;
+        else return;
+
+        next = Math.max(0, Math.min(next, total - 1));
+        if (next === current) return;
+
+        currentPresState = { ...currentPresState, currentIdx: next };
+        io.emit('pres_update', currentPresState);
+        emitPresMeta();
+        emitOperatorState();
+    });
+
+    socket.on('pres_set_showing', (showing) => {
+        if (!currentPresState || currentPresState.mode === 'none') return;
+        currentPresState = { ...currentPresState, showing: Boolean(showing) };
+        io.emit('pres_update', currentPresState);
+        emitPresMeta();
+        emitOperatorState();
+    });
+
+    // The desktop panel owns the saved-deck library; cache it so remotes can list it.
+    socket.on('pres_library_update', (library) => {
+        currentPresLibrary = Array.isArray(library) ? library : [];
+        socket.broadcast.emit('pres_library_update', currentPresLibrary);
+    });
 
     socket.on('start_translation', (config) => {
         if (config?.engine === 'local' && !requireLocalSocket(socket)) return;
@@ -2171,8 +2638,15 @@ async function setRemoteAccessEnabled(enabled) {
 
     const currentPort = app.get('port') || server.address()?.port || DEFAULT_PORT;
     remoteAccessEnabled = enabled;
-    remotePairingCode = generatePairingCode();
+    rotatePairingCode({ grace: false });
     pairingAttempts.clear();
+    lastBlockedRemote = null;
+
+    if (enabled) {
+        startPairingRotation();
+    } else {
+        stopPairingRotation();
+    }
 
     if (!enabled) {
         remoteSessions.clear();
@@ -2245,6 +2719,11 @@ export {
     setRemoteAccessEnabled,
     getRemoteStatus,
     expireRemoteSessionForTests,
+    rotatePairingCode,
+    saveRemoteNetworkSelection,
+    getNetworkAdapters,
+    isLoopbackAddress,
+    isAllowedInterface,
     getAuthToken,
     resetServerStateForTests,
     setTranslationWorkerFactoryForTests,

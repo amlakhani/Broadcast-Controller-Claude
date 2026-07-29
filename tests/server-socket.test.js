@@ -170,6 +170,7 @@ afterEach(async () => {
     }
     await serverModule.setRemoteAccessEnabled(false);
     serverModule.setTranslationWorkerFactoryForTests(null);
+    serverModule.saveRemoteNetworkSelection('auto');
     serverModule.resetServerStateForTests();
     serverModule.saveTranslationGlossary([]);
     serverModule.saveLocalAiSettings({
@@ -372,6 +373,257 @@ test('remote sessions can control show operations but not local admin actions', 
     });
     const blockedAction = await waitFor(graphicsRemote, 'action_forbidden');
     assert.match(blockedAction.error, /main controller/);
+});
+
+test('loopback is never blocked, in every spelling', async () => {
+    // The lockout guard: the app's own windows (control/graphics/stage/backstage/NDI) all
+    // connect over loopback, so these must hold regardless of remote access or selection.
+    for (const address of ['127.0.0.1', '127.1.2.3', '::1', '::ffff:127.0.0.1']) {
+        assert.equal(serverModule.isLoopbackAddress(address), true, `${address} should be loopback`);
+        assert.equal(serverModule.isAllowedInterface(address), true, `${address} should be allowed`);
+    }
+
+    await serverModule.setRemoteAccessEnabled(true);
+    for (const address of ['127.0.0.1', '::1', '::ffff:127.0.0.1']) {
+        assert.equal(serverModule.isAllowedInterface(address), true, `${address} allowed while enabled`);
+    }
+
+    // And the real controller path still works end to end over loopback.
+    const local = await connectClient();
+    assert.equal(local.connected, true);
+    const page = await fetchWithRetry(`${baseUrl}/?auth=${serverModule.getAuthToken()}`);
+    assert.equal(page.status, 200);
+});
+
+test('remote access is confined to the selected network interface', async () => {
+    const adapters = serverModule.getNetworkAdapters();
+
+    // Disabled: nothing but loopback may arrive.
+    assert.equal(serverModule.isAllowedInterface('10.99.99.99'), false);
+
+    await serverModule.setRemoteAccessEnabled(true);
+    const active = serverModule.getRemoteStatus().activeAddress;
+
+    if (adapters.length > 0) {
+        assert.equal(typeof active, 'string');
+        assert.ok(active, 'an adapter should be auto-selected when one exists');
+        assert.equal(serverModule.isAllowedInterface(active), true, 'selected address must be allowed');
+        // IPv4-mapped form of the same address must also pass.
+        assert.equal(serverModule.isAllowedInterface(`::ffff:${active}`), true);
+    }
+    // An address that is not the selected adapter is refused.
+    assert.equal(serverModule.isAllowedInterface('10.99.99.99'), false);
+});
+
+test('an unavailable selected network keeps enforcing instead of opening up', async () => {
+    serverModule.saveRemoteNetworkSelection('No Such Adapter 9000');
+    await serverModule.setRemoteAccessEnabled(true);
+
+    const status = serverModule.getRemoteStatus();
+    assert.equal(status.activeAddress, '');
+    assert.equal(status.networkUnavailable, true);
+    assert.deepEqual(status.lanUrls, [], 'no URLs published when the adapter is gone');
+    assert.deepEqual(status.slidesUrls, []);
+
+    // Critically: it must NOT fall back to allowing every network.
+    assert.equal(serverModule.isAllowedInterface('10.99.99.99'), false);
+    assert.equal(serverModule.isAllowedInterface('192.168.1.50'), false);
+    // Loopback still works, so the operator can undo the setting.
+    assert.equal(serverModule.isAllowedInterface('127.0.0.1'), true);
+});
+
+test('remote_network_set is local-only and updates the published status', async () => {
+    await serverModule.setRemoteAccessEnabled(true);
+    const paired = await pairRemote({ code: serverModule.getRemoteStatus().pairingCode });
+    const remote = await connectRemote(paired.body.remoteToken);
+
+    const forbidden = await emitWithAck(remote, 'remote_network_set', 'Some Adapter');
+    assert.equal(forbidden.ok, false, 'a remote must not be able to widen its own access');
+    assert.equal(serverModule.getRemoteStatus().selectedNetwork, 'auto');
+
+    const local = await connectClient();
+    const allowed = await emitWithAck(local, 'remote_network_set', 'Ethernet Test');
+    assert.equal(allowed.ok, true);
+    assert.equal(allowed.status.selectedNetwork, 'Ethernet Test');
+    assert.equal(serverModule.getRemoteStatus().selectedNetwork, 'Ethernet Test');
+});
+
+test('timed rotation keeps the previous code alive briefly; a used code dies at once', async () => {
+    await serverModule.setRemoteAccessEnabled(true);
+    const original = serverModule.getRemoteStatus().pairingCode;
+
+    // Timed rotation -> the outgoing code stays valid inside the grace window.
+    serverModule.rotatePairingCode({ grace: true });
+    const rotated = serverModule.getRemoteStatus().pairingCode;
+    assert.notEqual(rotated, original, 'rotation must mint a new code');
+
+    const graced = await pairRemote({ code: original, deviceName: 'Mid-scan' });
+    assert.equal(graced.response.status, 200, 'the just-retired code should still pair within grace');
+
+    // A successful pair rotates WITHOUT grace, so the code it consumed is dead immediately.
+    const afterPair = serverModule.getRemoteStatus().pairingCode;
+    const reuse = await pairRemote({ code: original });
+    assert.equal(reuse.response.status, 401, 'a consumed code must never work again');
+    assert.notEqual(afterPair, original);
+});
+
+test('two timed rotations retire the oldest code', async () => {
+    await serverModule.setRemoteAccessEnabled(true);
+    const oldest = serverModule.getRemoteStatus().pairingCode;
+
+    serverModule.rotatePairingCode({ grace: true });
+    serverModule.rotatePairingCode({ grace: true });
+
+    const stale = await pairRemote({ code: oldest });
+    assert.equal(stale.response.status, 401, 'only the immediately-previous code gets grace');
+});
+
+test('remote status exposes the QR countdown and network fields', async () => {
+    await serverModule.setRemoteAccessEnabled(true);
+    const status = serverModule.getRemoteStatus();
+
+    assert.ok(status.pairingCodeExpiresAt > Date.now(), 'countdown target should be in the future');
+    assert.ok(Array.isArray(status.networks));
+    for (const adapter of status.networks) {
+        assert.equal(typeof adapter.name, 'string');
+        assert.equal(typeof adapter.address, 'string');
+        assert.equal(typeof adapter.isVirtual, 'boolean');
+    }
+    assert.equal(status.selectedNetwork, 'auto');
+    assert.equal(typeof status.activeAddress, 'string');
+
+    // Disabled: no code and no countdown leak out.
+    await serverModule.setRemoteAccessEnabled(false);
+    const off = serverModule.getRemoteStatus();
+    assert.equal(off.pairingCode, '');
+    assert.equal(off.pairingCodeExpiresAt, 0);
+});
+
+test('pres_goto navigates authoritatively and clamps at both ends', async () => {
+    const operator = await connectClient();
+    operator.emit('pres_update', {
+        mode: 'images', baseUrl: '', slideId: '', currentIdx: 0,
+        totalSlides: 3, images: ['a', 'b', 'c'], isCanva: false, showing: false
+    });
+    await waitFor(operator, 'pres_update');
+
+    const next = waitFor(operator, 'pres_update');
+    operator.emit('pres_goto', { direction: 'next' });
+    assert.equal((await next).currentIdx, 1);
+
+    const last = waitFor(operator, 'pres_update');
+    operator.emit('pres_goto', { direction: 'last' });
+    assert.equal((await last).currentIdx, 2);
+
+    // Already on the last slide: 'next' must be a silent no-op.
+    let extra = 0;
+    operator.on('pres_update', () => { extra += 1; });
+    operator.emit('pres_goto', { direction: 'next' });
+    await new Promise(resolve => setTimeout(resolve, 80));
+    assert.equal(extra, 0, 'pres_goto past the end should not broadcast');
+
+    const jumped = waitFor(operator, 'pres_update');
+    operator.emit('pres_goto', { index: 0 });
+    assert.equal((await jumped).currentIdx, 0);
+
+    // Out-of-range index clamps into the deck.
+    const clamped = waitFor(operator, 'pres_update');
+    operator.emit('pres_goto', { index: 99 });
+    assert.equal((await clamped).currentIdx, 2);
+});
+
+test('pres_goto and pres_set_showing are no-ops without a loaded deck', async () => {
+    const operator = await connectClient();
+    let broadcasts = 0;
+    operator.on('pres_update', () => { broadcasts += 1; });
+
+    operator.emit('pres_goto', { direction: 'next' });
+    operator.emit('pres_set_showing', true);
+    await new Promise(resolve => setTimeout(resolve, 80));
+    assert.equal(broadcasts, 0);
+});
+
+test('pres_set_showing toggles the live flag', async () => {
+    const operator = await connectClient();
+    operator.emit('pres_update', {
+        mode: 'url', baseUrl: 'https://example.test/embed?slide=', slideId: 'x',
+        currentIdx: 0, totalSlides: 4, images: [], isCanva: false, showing: false
+    });
+    await waitFor(operator, 'pres_update');
+
+    const live = waitFor(operator, 'pres_update');
+    operator.emit('pres_set_showing', true);
+    assert.equal((await live).showing, true);
+
+    const down = waitFor(operator, 'pres_update');
+    operator.emit('pres_set_showing', false);
+    assert.equal((await down).showing, false);
+});
+
+test('pres_meta mirrors slide state without shipping the images array', async () => {
+    const operator = await connectClient();
+    const metaSeen = waitFor(operator, 'pres_meta');
+    operator.emit('pres_update', {
+        mode: 'images', baseUrl: '', slideId: '', currentIdx: 1,
+        totalSlides: 3, images: ['a', 'b', 'c'], isCanva: false, showing: true
+    });
+
+    const meta = await metaSeen;
+    assert.equal(meta.mode, 'images');
+    assert.equal(meta.currentIdx, 1);
+    assert.equal(meta.totalSlides, 3);
+    assert.equal(meta.showing, true);
+    assert.ok(!('images' in meta), 'pres_meta must not carry the images array');
+
+    // New clients get pres_meta replayed on connect.
+    const { waits } = await connectClientWithReplay(['pres_meta']);
+    const replayed = await waits.pres_meta;
+    assert.equal(replayed.currentIdx, 1);
+    assert.ok(!('images' in replayed));
+});
+
+test('a paired remote can drive slides through pres_goto and pres_set_showing', async () => {
+    await serverModule.setRemoteAccessEnabled(true);
+    const paired = await pairRemote({ code: serverModule.getRemoteStatus().pairingCode, deviceName: 'iPad' });
+    const remote = await connectRemote(paired.body.remoteToken);
+    const local = await connectClient();
+
+    local.emit('pres_update', {
+        mode: 'images', baseUrl: '', slideId: '', currentIdx: 0,
+        totalSlides: 3, images: ['a', 'b', 'c'], isCanva: false, showing: false
+    });
+    await waitFor(local, 'pres_update');
+
+    const advanced = waitFor(local, 'pres_update');
+    remote.emit('pres_goto', { direction: 'next' });
+    assert.equal((await advanced).currentIdx, 1, 'remote should advance the deck for everyone');
+
+    const live = waitFor(local, 'pres_update');
+    remote.emit('pres_set_showing', true);
+    assert.equal((await live).showing, true);
+});
+
+test('serves a single deck slide over HTTP for lightweight remotes', async () => {
+    const operator = await connectClient();
+    // 1x1 transparent GIF.
+    const gif = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+    operator.emit('pres_update', {
+        mode: 'images', baseUrl: '', slideId: '', currentIdx: 0,
+        totalSlides: 1, images: [gif], isCanva: false, showing: false
+    });
+    await waitFor(operator, 'pres_update');
+
+    const token = serverModule.getAuthToken();
+    const ok = await fetchWithRetry(`${baseUrl}/api/presentation/slide/0?auth=${token}`);
+    assert.equal(ok.status, 200);
+    assert.equal(ok.headers.get('content-type'), 'image/gif');
+    assert.ok((await ok.arrayBuffer()).byteLength > 0);
+
+    const missing = await fetchWithRetry(`${baseUrl}/api/presentation/slide/5?auth=${token}`);
+    assert.equal(missing.status, 404);
+
+    const unauthorized = await fetchWithRetry(`${baseUrl}/api/presentation/slide/0`);
+    assert.equal(unauthorized.status, 403);
 });
 
 test('replays cached presentation, output mode, and layer visibility to new clients', async () => {

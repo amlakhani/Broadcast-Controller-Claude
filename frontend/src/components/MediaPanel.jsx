@@ -1,10 +1,14 @@
 import { useState, useEffect, useRef } from 'react';
-import { Video, Play, Film, Trash2, GripVertical, Image as ImageIcon, Layout, Monitor, Trash, Grid, List, Globe, Folder, Upload, Type } from 'lucide-react';
+import { Video, Play, Film, Trash2, GripVertical, Image as ImageIcon, Layout, Monitor, Trash, Grid, List, Globe, Folder, Upload, Type, X, Clock } from 'lucide-react';
 import { authFetch, authUrl } from '../auth';
 import { deferUntilIdle, readLocalStorageArraySafe, useDebouncedLocalStorageEffect, useThrottledCallback } from '../utils/performance';
+import { scheduleTick, localDateKey, formatCountdown, formatClock12, formatDays } from '../utils/schedule';
+
+const WEEKDAY_OPTIONS = [['S', 0], ['M', 1], ['T', 2], ['W', 3], ['T', 4], ['F', 5], ['S', 6]];
 
 const MEDIA_PLAYLIST_KEY = 'bc_media_playlist_v1';
 const PHOTO_PLAYLIST_KEY = 'bc_photo_playlist_v1';
+const SCHEDULED_PLAYS_KEY = 'bc_scheduled_plays_v1';
 const VIEW_MODE_KEY = 'bc_media_view_mode';
 const MEDIA_FOLDERS_KEY = 'bc_media_folders_v1';
 const ACTIVE_FOLDER_KEY = 'bc_media_active_folder_v1';
@@ -26,6 +30,7 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
 
     const [youtubeUrl, setYoutubeUrl] = useState('');
     const [youtubePlaylistUrl, setYoutubePlaylistUrl] = useState('');
+    const [playlistLimit, setPlaylistLimit] = useState(''); // newest N to fetch; blank = all
     const [selectedLocalPath, setSelectedLocalPath] = useState('');
     const [localFileName, setLocalFileName] = useState('No file selected');
     const [webpageUrl, setWebpageUrl] = useState('');
@@ -50,6 +55,18 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
 
     const [isFetchingYt, setIsFetchingYt] = useState(false);
     const [isFetchingPlaylist, setIsFetchingPlaylist] = useState(false);
+
+    // YouTube playlist import picker: fetched videos (or null when closed) + selected ids.
+    const [playlistPickerItems, setPlaylistPickerItems] = useState(null);
+    const [selectedVideoIds, setSelectedVideoIds] = useState(() => new Set());
+
+    // Scheduled Plays: auto-play a library item at a clock time (once/daily).
+    const [scheduledPlays, setScheduledPlays] = useState([]);
+    const [scheduleNow, setScheduleNow] = useState(() => new Date());
+    const [newScheduleIdx, setNewScheduleIdx] = useState('');
+    const [newScheduleTime, setNewScheduleTime] = useState('');
+    const [newScheduleMode, setNewScheduleMode] = useState('once');
+    const [newScheduleDays, setNewScheduleDays] = useState([]);
 
     // Particle States
     const [particlesEnabled, setParticlesEnabled] = useState(false);
@@ -86,7 +103,9 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
         setPlaylist(readLocalStorageArraySafe(MEDIA_PLAYLIST_KEY));
         setPhotoPlaylist(readLocalStorageArraySafe(PHOTO_PLAYLIST_KEY));
         setMediaFolders(readLocalStorageArraySafe(MEDIA_FOLDERS_KEY, DEFAULT_FOLDERS));
+        setScheduledPlays(readLocalStorageArraySafe(SCHEDULED_PLAYS_KEY));
     }), []);
+    useDebouncedLocalStorageEffect(SCHEDULED_PLAYS_KEY, scheduledPlays);
 
     useDebouncedLocalStorageEffect(MEDIA_PLAYLIST_KEY, playlist);
     useDebouncedLocalStorageEffect(PHOTO_PLAYLIST_KEY, photoPlaylist);
@@ -330,16 +349,20 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
         if (!url) { alert("Please enter a YouTube Playlist URL."); return; }
         if (!url.includes('list=')) { alert("Invalid Playlist URL. Must contain 'list='"); return; }
 
+        // Optionally cap to the newest N videos (blank / invalid = fetch all).
+        const limit = parseInt(playlistLimit, 10);
+        const params = Number.isFinite(limit) && limit > 0 ? { url, max: String(limit) } : { url };
+
         setIsFetchingPlaylist(true);
         try {
-            const response = await fetch(authUrl('/fetch-youtube-playlist', { url }));
+            const response = await fetch(authUrl('/fetch-youtube-playlist', params));
             if (response.ok) {
                 const items = await response.json();
                 if (items && items.length > 0) {
-                    const folderId = getFolderIdForNewItem(activeFolderId);
-                    setPlaylist(prev => [...items.map(item => ({ ...item, folderId })), ...prev]);
+                    // Open the picker with everything selected by default.
+                    setPlaylistPickerItems(items);
+                    setSelectedVideoIds(new Set(items.map(item => item.id)));
                     setYoutubePlaylistUrl('');
-                    alert(`Added ${items.length} videos from playlist.`);
                 } else {
                     alert("No videos found in this playlist.");
                 }
@@ -351,6 +374,37 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
             alert("Error fetching playlist.");
         }
         setIsFetchingPlaylist(false);
+    };
+
+    const toggleVideoSelected = (id) => {
+        setSelectedVideoIds(prev => {
+            const next = new Set(prev);
+            if (next.has(id)) next.delete(id); else next.add(id);
+            return next;
+        });
+    };
+
+    const allPickerSelected = playlistPickerItems
+        ? selectedVideoIds.size === playlistPickerItems.length
+        : false;
+
+    const toggleSelectAllPicker = () => {
+        if (!playlistPickerItems) return;
+        setSelectedVideoIds(allPickerSelected ? new Set() : new Set(playlistPickerItems.map(i => i.id)));
+    };
+
+    const closePlaylistPicker = () => {
+        setPlaylistPickerItems(null);
+        setSelectedVideoIds(new Set());
+    };
+
+    const confirmImportPlaylist = () => {
+        if (!playlistPickerItems) return;
+        const folderId = getFolderIdForNewItem(activeFolderId);
+        const selected = playlistPickerItems.filter(item => selectedVideoIds.has(item.id));
+        if (selected.length === 0) return;
+        setPlaylist(prev => [...selected.map(item => ({ ...item, folderId })), ...prev]);
+        closePlaylistPicker();
     };
 
     const toggleMute = () => {
@@ -485,6 +539,72 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
         setCurrentTime(0);
         setIsPlaying(true);
     };
+
+    // --- Scheduled Plays: fire a library item at a clock time (once/daily) ---
+    // The interval reads the latest schedules + play fn via a ref to dodge stale
+    // closures (same concern as the media_next handler above).
+    const scheduleRuntimeRef = useRef({ scheduledPlays, playPlaylistItem });
+    scheduleRuntimeRef.current = { scheduledPlays, playPlaylistItem };
+
+    useEffect(() => {
+        const interval = setInterval(() => {
+            const { scheduledPlays: schedules, playPlaylistItem: play } = scheduleRuntimeRef.current;
+            if (!schedules || schedules.length === 0) return;
+            const now = new Date();
+            setScheduleNow(now); // drives the live countdown display
+            const fireIds = new Set();
+            for (const s of schedules) {
+                if (scheduleTick(s, now).shouldFire) fireIds.add(s.id);
+            }
+            if (fireIds.size === 0) return;
+            const todayKey = localDateKey(now);
+            for (const s of schedules) {
+                if (fireIds.has(s.id) && s.item) play(s.item);
+            }
+            setScheduledPlays(prev => prev.map(s => {
+                if (!fireIds.has(s.id)) return s;
+                return s.mode === 'once'
+                    ? { ...s, enabled: false, lastFiredDate: todayKey }
+                    : { ...s, lastFiredDate: todayKey };
+            }));
+        }, 1000);
+        return () => clearInterval(interval);
+    }, []);
+
+    const toggleNewScheduleDay = (day) => setNewScheduleDays(prev => (
+        prev.includes(day) ? prev.filter(d => d !== day) : [...prev, day]
+    ));
+
+    const addSchedule = () => {
+        if (newScheduleIdx === '' || !newScheduleTime) return;
+        if (newScheduleMode === 'weekly' && newScheduleDays.length === 0) return;
+        const item = playlist[Number(newScheduleIdx)];
+        if (!item) return;
+        setScheduledPlays(prev => [...prev, {
+            id: `sched-${Date.now()}`,
+            item,
+            time: newScheduleTime,
+            mode: newScheduleMode,
+            days: newScheduleMode === 'weekly' ? [...newScheduleDays].sort((a, b) => a - b) : undefined,
+            enabled: true,
+            lastFiredDate: null,
+        }]);
+        setNewScheduleIdx('');
+        setNewScheduleTime('');
+        setNewScheduleMode('once');
+        setNewScheduleDays([]);
+    };
+
+    const removeSchedule = (id) => setScheduledPlays(prev => prev.filter(s => s.id !== id));
+
+    const toggleSchedule = (id) => setScheduledPlays(prev => prev.map(s => {
+        if (s.id !== id) return s;
+        const enabling = !s.enabled;
+        const patch = { enabled: enabling };
+        // Re-enabling a fired one-time schedule makes it eligible again.
+        if (enabling && s.mode === 'once') patch.lastFiredDate = null;
+        return { ...s, ...patch };
+    }));
 
     const movePlaylistItem = (index, direction, e) => {
         e.stopPropagation();
@@ -1005,12 +1125,17 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
                     <div className="space-y-3 border-t section-rule pt-2">
                         <label className="block text-sm font-medium text-slate-700 dark:text-slate-300">YouTube Playlist URL</label>
                         <div className="flex space-x-2">
-                            <input type="text" value={youtubePlaylistUrl} onChange={e=>setYoutubePlaylistUrl(e.target.value)} placeholder="Playlist URL..." 
+                            <input type="text" value={youtubePlaylistUrl} onChange={e=>setYoutubePlaylistUrl(e.target.value)} placeholder="Playlist URL..."
                                 className="control-field flex-1 px-3 py-1.5 text-sm" />
+                            <input type="number" min="1" value={playlistLimit} onChange={e=>setPlaylistLimit(e.target.value)}
+                                title="Newest videos to fetch (leave blank for all)" placeholder="All"
+                                style={{ flex: '0 0 4rem', width: '4rem' }}
+                                className="control-field px-2 py-1.5 text-sm text-center" />
                             <button onClick={handleAddYoutubePlaylist} disabled={isFetchingPlaylist} className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs px-3 rounded-lg font-bold transition">
                                 {isFetchingPlaylist ? '...' : '+ Playlist'}
                             </button>
                         </div>
+                        <p className="text-xs text-slate-500 dark:text-slate-400">Fetches the newest videos first. Leave the count blank to load the whole playlist.</p>
                     </div>
                 </div>
 
@@ -1045,6 +1170,81 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
                             </button>
                         </div>
                     </div>
+                </div>
+
+                {/* Scheduled Videos */}
+                <div className="surface-muted space-y-3 rounded-lg p-3">
+                    <div className="flex items-center space-x-2">
+                        <Clock className="w-4 h-4 text-amber-500" />
+                        <label className="block text-sm font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wide">Scheduled Videos</label>
+                    </div>
+
+                    <div className="space-y-2">
+                        <select value={newScheduleIdx} onChange={e => setNewScheduleIdx(e.target.value)}
+                            className="control-field w-full px-3 py-1.5 text-sm">
+                            <option value="">Choose a video…</option>
+                            {playlist.map((item, i) => (
+                                <option key={i} value={i}>{getItemTitle(item)}</option>
+                            ))}
+                        </select>
+                        <input type="time" value={newScheduleTime} onChange={e => setNewScheduleTime(e.target.value)}
+                            className="control-field w-full px-3 py-1.5 text-sm" />
+                        <div className="flex overflow-hidden rounded-lg border border-slate-500/20">
+                            {[['once', 'Once'], ['daily', 'Daily'], ['weekly', 'Days']].map(([mode, label]) => (
+                                <button key={mode} onClick={() => setNewScheduleMode(mode)}
+                                    className={`flex-1 px-3 py-1.5 text-xs font-bold transition ${newScheduleMode === mode ? 'bg-amber-500 text-white' : 'bg-slate-500/10 text-slate-500'}`}>{label}</button>
+                            ))}
+                        </div>
+                        {newScheduleMode === 'weekly' && (
+                            <div className="flex justify-between gap-1">
+                                {WEEKDAY_OPTIONS.map(([label, day], i) => {
+                                    const active = newScheduleDays.includes(day);
+                                    return (
+                                        <button key={i} onClick={() => toggleNewScheduleDay(day)}
+                                            title={['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][day]}
+                                            className={`h-7 flex-1 rounded text-xs font-bold transition ${active ? 'bg-amber-500 text-white' : 'bg-slate-500/10 text-slate-500 hover:bg-slate-500/20'}`}>
+                                            {label}
+                                        </button>
+                                    );
+                                })}
+                            </div>
+                        )}
+                        <button onClick={addSchedule} disabled={newScheduleIdx === '' || !newScheduleTime || (newScheduleMode === 'weekly' && newScheduleDays.length === 0)}
+                            className="control-button-muted flex w-full items-center justify-center px-4 py-2 text-sm font-medium active:scale-95 disabled:cursor-not-allowed disabled:opacity-40">
+                            + Schedule
+                        </button>
+                    </div>
+
+                    {scheduledPlays.length > 0 ? (
+                        <div className="space-y-1.5 border-t section-rule pt-2">
+                            {scheduledPlays.map(s => {
+                                const { secondsUntil } = scheduleTick(s, scheduleNow);
+                                const done = s.mode === 'once' && !!s.lastFiredDate;
+                                return (
+                                    <div key={s.id} className="flex items-center gap-2 rounded-md bg-slate-500/5 px-2 py-1.5">
+                                        <div className="min-w-0 flex-1">
+                                            <div className="truncate text-sm text-slate-700 dark:text-slate-200">{getItemTitle(s.item)}</div>
+                                            <div className="flex items-center gap-1.5 text-[11px] text-slate-500 dark:text-slate-400">
+                                                <span className="font-semibold">{formatClock12(s.time)}</span>
+                                                <span className="rounded bg-slate-500/15 px-1 py-0.5 uppercase tracking-wide">{s.mode === 'daily' ? 'Daily' : s.mode === 'weekly' ? formatDays(s.days) : 'Once'}</span>
+                                                <span>{done ? 'Done' : (s.enabled ? formatCountdown(secondsUntil) : 'Off')}</span>
+                                            </div>
+                                        </div>
+                                        <button onClick={() => toggleSchedule(s.id)} title={s.enabled ? 'Disable' : 'Enable'}
+                                            className={`flex-none rounded px-2 py-1 text-[10px] font-bold uppercase tracking-wide transition ${s.enabled ? 'bg-emerald-500/15 text-emerald-600' : 'bg-slate-500/15 text-slate-500'}`}>
+                                            {s.enabled ? 'On' : 'Off'}
+                                        </button>
+                                        <button onClick={() => removeSchedule(s.id)} title="Delete schedule"
+                                            className="flex-none rounded p-1 text-slate-400 transition hover:bg-red-600/10 hover:text-red-600">
+                                            <Trash2 className="h-3.5 w-3.5" />
+                                        </button>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    ) : (
+                        <p className="text-xs text-slate-500 dark:text-slate-400">Auto-play a video at a set time. Fires while the Controller window is open.</p>
+                    )}
                 </div>
             </div>
 
@@ -1358,6 +1558,92 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
                                 onChange={e => setParticleIntensity(parseInt(e.target.value))}
                                 className="w-full h-1.5 bg-slate-200 dark:bg-slate-700 rounded-lg appearance-none cursor-pointer accent-indigo-500" 
                             />
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* YouTube playlist import picker */}
+            {playlistPickerItems !== null && (
+                <div
+                    className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm"
+                    onMouseDown={closePlaylistPicker}
+                >
+                    <div
+                        className="surface-raised flex max-h-[85vh] w-full max-w-xl flex-col overflow-hidden rounded-3xl shadow-2xl"
+                        onMouseDown={e => e.stopPropagation()}
+                    >
+                        {/* Header */}
+                        <div className="flex shrink-0 items-start justify-between gap-3 border-b section-rule p-5">
+                            <div>
+                                <h3 className="text-base font-bold text-slate-800 dark:text-slate-100">Import Playlist</h3>
+                                <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                                    {playlistPickerItems.length} video{playlistPickerItems.length === 1 ? '' : 's'} found — choose which to import
+                                </p>
+                            </div>
+                            <button
+                                onClick={closePlaylistPicker}
+                                className="rounded-full p-1.5 text-slate-500 transition hover:bg-slate-500/10 hover:text-slate-800 dark:hover:text-slate-100"
+                                aria-label="Close"
+                            >
+                                <X className="h-4 w-4" />
+                            </button>
+                        </div>
+
+                        {/* Toolbar */}
+                        <div className="flex shrink-0 items-center justify-between gap-3 border-b section-rule px-5 py-2.5">
+                            <button
+                                onClick={toggleSelectAllPicker}
+                                className="control-button-muted px-3 py-1 text-xs font-bold"
+                            >
+                                {allPickerSelected ? 'Deselect all' : 'Select all'}
+                            </button>
+                            <span className="text-xs font-semibold text-slate-500 dark:text-slate-400">
+                                {selectedVideoIds.size} of {playlistPickerItems.length} selected
+                            </span>
+                        </div>
+
+                        {/* Video list */}
+                        <div className="min-h-0 flex-1 overflow-y-auto p-2">
+                            {playlistPickerItems.map(item => {
+                                const checked = selectedVideoIds.has(item.id);
+                                return (
+                                    <label
+                                        key={item.id}
+                                        className="flex cursor-pointer items-center gap-3 rounded-lg px-2 py-1.5 transition hover:bg-slate-500/10"
+                                    >
+                                        <input
+                                            type="checkbox"
+                                            checked={checked}
+                                            onChange={() => toggleVideoSelected(item.id)}
+                                            className="h-4 w-4 shrink-0 cursor-pointer accent-indigo-500"
+                                        />
+                                        <img
+                                            src={`https://i.ytimg.com/vi/${item.id}/default.jpg`}
+                                            alt=""
+                                            loading="lazy"
+                                            className="h-9 w-16 shrink-0 rounded bg-slate-200 object-cover dark:bg-slate-700"
+                                        />
+                                        <span className="min-w-0 flex-1 truncate text-sm text-slate-700 dark:text-slate-200">
+                                            {item.name}
+                                        </span>
+                                    </label>
+                                );
+                            })}
+                        </div>
+
+                        {/* Footer */}
+                        <div className="flex shrink-0 items-center justify-end gap-2 border-t section-rule p-4">
+                            <button onClick={closePlaylistPicker} className="control-button-muted px-4 py-1.5 text-sm font-bold">
+                                Cancel
+                            </button>
+                            <button
+                                onClick={confirmImportPlaylist}
+                                disabled={selectedVideoIds.size === 0}
+                                className="rounded-lg bg-indigo-600 px-4 py-1.5 text-sm font-bold text-white transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-40"
+                            >
+                                Import Selected ({selectedVideoIds.size})
+                            </button>
                         </div>
                     </div>
                 </div>

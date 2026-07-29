@@ -362,11 +362,18 @@ function onLocalSocket(socket, event, handler) {
 }
 
 // GPU diagnostic: confirms hardware acceleration (especially "video_decode") is active.
-// NOTE: the GPU process initializes asynchronously, so the "startup" snapshot can show
-// everything as software ("disabled_software", gl=none) before init finishes — that is
-// expected and NOT a problem. The "settled" snapshot, taken a few seconds later, is the one
-// that reflects reality. Both are written to <userData>/gpu-status.json (and the console) so
-// you can verify on any machine, including packaged Windows builds.
+// NOTE: the GPU process initializes asynchronously, so the "startup" snapshot shows everything
+// as software ("disabled_software", gl=none) before init finishes — that is expected and NOT a
+// problem, so it is recorded to disk but deliberately NOT printed (it reads like a failure).
+// Only the "settled" snapshot, taken a few seconds later, reflects reality and is summarized to
+// the console — as one line when healthy, or a loud warning with detail when acceleration is
+// genuinely degraded. Both snapshots are always written to <userData>/gpu-status.json so you can
+// verify on any machine, including packaged Windows builds.
+
+// Features that must be accelerated for smooth broadcast output. Others (raw_draw,
+// skia_graphite, webnn, ...) are off by default in healthy Chromium and are not signals.
+const KEY_GPU_FEATURES = ['2d_canvas', 'gpu_compositing', 'rasterization', 'video_decode', 'webgl'];
+
 async function captureGpuSnapshot(label) {
     const snap = { label, when: new Date().toISOString(), featureStatus: null, gpuInfo: null };
     try {
@@ -380,19 +387,37 @@ async function captureGpuSnapshot(label) {
     } catch (err) {
         snap.gpuInfo = { error: String(err) };
     }
-    console.log(`[GPU] ${label}:`, JSON.stringify(snap.featureStatus, null, 2));
     return snap;
+}
+
+function summarizeGpuSnapshot(snap) {
+    const featureStatus = snap?.featureStatus || {};
+    const degraded = KEY_GPU_FEATURES.filter(feature => !String(featureStatus[feature] || '').startsWith('enabled'));
+    const activeDevice = (snap?.gpuInfo?.gpuDevice || []).find(device => device.active);
+    return { degraded, device: activeDevice?.deviceString || 'unknown GPU' };
 }
 
 async function logGpuStatus() {
     const report = { startup: null, settled: null };
-    // Immediate snapshot (may be pre-initialization).
+    // Immediate snapshot (pre-initialization; recorded but not printed — see note above).
     report.startup = await captureGpuSnapshot('startup');
     write();
+
     // Settled snapshot a few seconds later, after the GPU process has initialized.
     setTimeout(async () => {
         report.settled = await captureGpuSnapshot('settled');
         write();
+
+        const statusPath = path.join(app.getPath('userData'), 'gpu-status.json');
+        const { degraded, device } = summarizeGpuSnapshot(report.settled);
+        if (degraded.length === 0) {
+            console.log(`[GPU] Hardware acceleration active on ${device}.`);
+        } else {
+            console.warn(`[GPU] Running WITHOUT full hardware acceleration on ${device}.`);
+            console.warn(`[GPU] Degraded: ${degraded.join(', ')}. Expect CPU-bound output and video jitter.`);
+            console.warn('[GPU] Feature status:', JSON.stringify(report.settled.featureStatus, null, 2));
+            console.warn(`[GPU] Full report: ${statusPath}`);
+        }
     }, 5000);
 
     function write() {

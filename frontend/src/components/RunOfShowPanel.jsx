@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useState } from 'react';
 import { ArrowDown, ArrowUp, Check, CopyPlus, ExternalLink, Film, Image as ImageIcon, Layers, ListChecks, Play, Plus, RefreshCw, Save, SkipForward, Trash2, Upload } from 'lucide-react';
-import { deferUntilIdle, readLocalStorageArraySafe, useDebouncedLocalStorageEffect } from '../utils/performance';
+import { deferUntilIdle, readLocalStorageArraySafe, readLocalStorageObjectSafe, useDebouncedLocalStorageEffect } from '../utils/performance';
+import { DEFAULT_GUJ_FONT } from '../utils/lyricsFonts';
 
 const RUN_OF_SHOW_KEY = 'bc_run_of_show_v1';
+const LYRICS_STYLE_KEY = 'bc_lyrics_style_v1';
 const MEDIA_PLAYLIST_KEY = 'bc_media_playlist_v1';
 const PHOTO_PLAYLIST_KEY = 'bc_photo_playlist_v1';
 const STATUSES = ['pending', 'armed', 'fired', 'skipped', 'done'];
@@ -295,7 +297,12 @@ export default function RunOfShowPanel({ socket, onNavigate, onBlackout }) {
                 posX: 50,
                 posY: 80,
                 autoClear: 0,
-                style: { fontFamily: "'Outfit', sans-serif", fontWeight: '400', fontSize: '64', color: '#ffffff', letterSpacing: '0' }
+                style: {
+                    fontFamily: "'Outfit', sans-serif",
+                    // Without this a fired cue would silently reset Gujarati back to Rasa.
+                    gujFontFamily: readLocalStorageObjectSafe(LYRICS_STYLE_KEY).gujFontFamily || DEFAULT_GUJ_FONT,
+                    fontWeight: '400', fontSize: '64', color: '#ffffff', letterSpacing: '0'
+                }
             });
         } else if (action.type === 'lower_third') {
             socket?.emit('show_lower_third', {
@@ -303,7 +310,8 @@ export default function RunOfShowPanel({ socket, onNavigate, onBlackout }) {
                 title: payload.title || '',
                 subtitle2: payload.subtitle2 || '',
                 autoClear: 0,
-                animation: 'slide'
+                // 'slide' is not a real animation id — it silently fell back to elastic.
+                animation: 'elastic'
             });
         } else if (action.type === 'presentation') {
             socket?.emit('pres_update', {

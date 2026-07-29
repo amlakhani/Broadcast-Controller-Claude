@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef } from 'react';
 import gsap from 'gsap';
 import { useGSAP } from '@gsap/react';
 import { applyAnimationIn, applyAnimationOut } from './AnimationUtils';
@@ -7,7 +7,10 @@ import { LAYER_Z } from './layerZ';
 export default function LyricsGraphic({ socket, windowMode }) {
     const [data, setData] = useState(null);
     const [style, setStyle] = useState({});
-    
+    // Shrinks the text just enough to keep a tall slide (e.g. 2 lines per take) in frame.
+    // Only ever <= 1, so the operator's chosen font size stays the maximum.
+    const [fitScale, setFitScale] = useState(1);
+
     const containerRef = useRef(null);
     const panelRef = useRef(null);
     const textContainerRef = useRef(null);
@@ -149,12 +152,48 @@ export default function LyricsGraphic({ socket, windowMode }) {
         return true;
     };
 
+    const getGujFontSize = () => (style.fontSize ? `${style.fontSize * fitScale}px` : undefined);
+
     const getEngFontSize = () => {
-        if (getLangVisibility('guj') && getLangVisibility('eng') && style.fontSize) {
-            return `${style.fontSize * 0.75}px`;
-        }
-        return style.fontSize ? `${style.fontSize}px` : undefined;
+        if (!style.fontSize) return undefined;
+        const base = getLangVisibility('guj') && getLangVisibility('eng') ? style.fontSize * 0.75 : style.fontSize;
+        return `${base * fitScale}px`;
     };
+
+    // Height the panel may occupy. The centred layout is anchored at posY and grows in BOTH
+    // directions, so it can only use twice the smaller gap to an edge; cinematic is pinned to
+    // the bottom and may use most of the frame.
+    const getMaxPanelHeight = () => {
+        const frame = containerRef.current?.parentElement?.clientHeight || window.innerHeight || 0;
+        if (!frame) return 0;
+        if (isCinematic) return frame * 0.8;
+        const posY = data?.posY ?? 88;
+        const room = Math.min(posY, 100 - posY) / 100;
+        return Math.max(frame * 0.2, frame * room * 2);
+    };
+
+    // Re-measure whenever the content, size or placement changes.
+    useLayoutEffect(() => {
+        setFitScale(1);
+    }, [data?.gujText, data?.engText, data?.posY, data?.bgStyle, data?.langOpt, style.fontSize, style.fontFamily, style.gujFontFamily]);
+
+    useLayoutEffect(() => {
+        if (windowMode === 'stage' || fitScale !== 1) return;
+        const panel = panelRef.current;
+        if (!panel) return;
+        const maxHeight = getMaxPanelHeight();
+        const height = panel.offsetHeight;
+        if (!maxHeight || !height || height <= maxHeight) return;
+        // Font size scales near-linearly with block height, so one ratio step suffices —
+        // no need for the decrementing loop used by the confidence monitor.
+        setFitScale(Math.max(0.4, (maxHeight / height) * 0.98));
+    });
+
+    useEffect(() => {
+        const onResize = () => setFitScale(1);
+        window.addEventListener('resize', onResize);
+        return () => window.removeEventListener('resize', onResize);
+    }, []);
 
     const getContainerStyle = () => {
         if (windowMode === 'stage') return {};
@@ -178,7 +217,8 @@ export default function LyricsGraphic({ socket, windowMode }) {
         >
             <div 
                 ref={panelRef} 
-                className={`lyrics-glass-panel px-16 py-8 relative z-10 ${getBgClass(data?.bgStyle)}`}
+                className={`lyrics-glass-panel relative z-10 ${getBgClass(data?.bgStyle)}`}
+                style={{ padding: `${32 * fitScale}px ${64 * fitScale}px` }}
             >
                 {/* Cinematic Gradient Overlay - Exact Reference Implementation */}
                 {isCinematic && (() => {
@@ -203,12 +243,15 @@ export default function LyricsGraphic({ socket, windowMode }) {
                 })()}
 
                 <div ref={textContainerRef} className="w-full relative z-10">
-                    <div 
+                    {/* Leading matters once a slide carries more than one line: 1.3 keeps
+                        Gujarati matras and ascenders clear, 1.25 stops the English pair from
+                        reading cramped. */}
+                    <div
                         ref={gujRef}
-                        className={`text-6xl text-white font-guj font-semibold leading-[1.05] drop-shadow-lg ${getLangVisibility('guj') && data?.gujText ? '' : 'hidden'}`}
+                        className={`text-6xl text-white font-guj font-semibold leading-[1.3] drop-shadow-lg ${getLangVisibility('guj') && data?.gujText ? '' : 'hidden'}`}
                         style={{
-                            fontFamily: "'Rasa', serif",
-                            fontSize: style.fontSize ? `${style.fontSize}px` : undefined,
+                            fontFamily: style.gujFontFamily || "'Rasa', serif",
+                            fontSize: getGujFontSize(),
                             fontWeight: style.fontWeight,
                             color: style.color,
                             letterSpacing: style.letterSpacing !== undefined ? `${style.letterSpacing}px` : undefined,
@@ -220,7 +263,7 @@ export default function LyricsGraphic({ socket, windowMode }) {
                     
                     <div 
                         ref={engRef}
-                        className={`text-5xl text-slate-300 font-eng font-medium leading-[1.05] drop-shadow-md mt-2 ${getLangVisibility('eng') && data?.engText ? '' : 'hidden'}`}
+                        className={`text-5xl text-slate-300 font-eng font-medium leading-[1.25] drop-shadow-md mt-2 ${getLangVisibility('eng') && data?.engText ? '' : 'hidden'}`}
                         style={{
                             fontFamily: style.fontFamily,
                             fontSize: getEngFontSize(),

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { ArrowDown, ArrowUp, Clapperboard, CopyPlus, Layers, Play, Save, Sparkles, Trash2 } from 'lucide-react';
+import { GUJ_FONT_OPTIONS } from '../utils/lyricsFonts';
 import {
     ANIMATION_PRESETS,
     BACKGROUND_STYLES,
@@ -36,12 +37,19 @@ function draftReducer(state, action) {
             return normalizeDraft(mergeSection(state, action.section, action.values));
         case 'apply_template': {
             const patch = templateToDraftPatch(action.template);
+            // Apply the template's layout too — previously it was dropped, so presets
+            // that set width/position/alignment (e.g. Full Band) never looked as designed.
+            // Behaviour keeps the operator's autoClear/langOpt but takes the preset's motion.
             return normalizeDraft({
                 ...state,
                 appearance: patch.appearance,
-                layout: state.layout,
+                layout: patch.layout,
                 typography: patch.typography,
-                behavior: state.behavior
+                behavior: {
+                    ...state.behavior,
+                    animation: patch.behavior.animation,
+                    animationSpeed: patch.behavior.animationSpeed
+                }
             });
         }
         case 'load_cue':
@@ -53,10 +61,13 @@ function draftReducer(state, action) {
                     ...state.appearance,
                     shapeStyle: DEFAULT_LT_DESIGN.shapeStyle,
                     accentColor: DEFAULT_LT_DESIGN.accentColor,
+                    accentColor2: DEFAULT_LT_DESIGN.accentColor2,
+                    accentGradient: DEFAULT_LT_DESIGN.accentGradient,
                     panelOpacity: DEFAULT_LT_DESIGN.panelOpacity,
                     shadowIntensity: DEFAULT_LT_DESIGN.shadowIntensity,
                     borderWidth: DEFAULT_LT_DESIGN.borderWidth,
-                    borderColor: DEFAULT_LT_DESIGN.borderColor
+                    borderColor: DEFAULT_LT_DESIGN.borderColor,
+                    cornerRadius: DEFAULT_LT_DESIGN.cornerRadius
                 },
                 layout: {
                     ...state.layout,
@@ -296,13 +307,14 @@ export default function LowerThirdsPanel({ socket }) {
     const draftY = appearance.shapeStyle === 'full-band' ? 0 : Math.max(0, Math.min(Number(layout.posY) || 0, 100));
     const draftLeft = appearance.shapeStyle === 'full-band' ? 0 : (draftX / 100) * 250;
     const draftBottom = (draftY / 100) * 140;
+    const SQUARE_PREVIEW_SHAPES = ['sharp-block', 'angled', 'full-band', 'gradient-scrim', 'chamfered', 'chevron'];
     const previewShapeClass = appearance.shapeStyle === 'pill'
         ? 'rounded-full'
-        : appearance.shapeStyle === 'sharp-block'
-            ? 'rounded-none'
-            : appearance.shapeStyle === 'angled'
-                ? 'rounded-none'
-                : appearance.shapeStyle === 'full-band'
+        : appearance.shapeStyle === 'outline'
+            ? 'rounded-lg bg-transparent border-2'
+            : appearance.shapeStyle === 'stacked'
+                ? 'rounded-sm'
+                : SQUARE_PREVIEW_SHAPES.includes(appearance.shapeStyle)
                     ? 'rounded-none'
                     : 'rounded-lg';
 
@@ -632,6 +644,27 @@ export default function LowerThirdsPanel({ socket }) {
                             <FieldLabel>Logo Size</FieldLabel>
                             <input type="number" min="60" max="260" value={layout.logoSize} onChange={e => updateSection('layout', { logoSize: Number(e.target.value) })} className={compactInputClass} />
                         </div>
+                        <div className="space-y-1">
+                            <FieldLabel>Accent 2</FieldLabel>
+                            <input type="color" value={appearance.accentColor2} onChange={e => updateSection('appearance', { accentColor2: e.target.value })} className="control-field h-8 px-1 py-1 cursor-pointer" />
+                        </div>
+                        <div className="space-y-1">
+                            <FieldLabel>Gradient Accent</FieldLabel>
+                            <button onClick={() => updateSection('appearance', { accentGradient: !appearance.accentGradient })}
+                                className={`w-full rounded-lg border px-2 py-1.5 text-[10px] font-bold transition ${appearance.accentGradient ? 'bg-indigo-600 text-white border-indigo-600' : 'control-button-muted'}`}>
+                                {appearance.accentGradient ? 'On' : 'Off'}
+                            </button>
+                        </div>
+                        <div className="space-y-1">
+                            <FieldLabel>Corner Radius</FieldLabel>
+                            <input type="number" min="-1" max="120" value={appearance.cornerRadius}
+                                title="-1 keeps each shape's own radius"
+                                onChange={e => updateSection('appearance', { cornerRadius: Number(e.target.value) })} className={compactInputClass} />
+                        </div>
+                        <div className="space-y-1">
+                            <FieldLabel>Text Glow</FieldLabel>
+                            <input type="number" min="0" max="100" value={typography.textGlow} onChange={e => updateSection('typography', { textGlow: Number(e.target.value) })} className={compactInputClass} />
+                        </div>
                     </div>
                     <div className="space-y-2">
                         <div className="flex items-center justify-between">
@@ -646,6 +679,15 @@ export default function LowerThirdsPanel({ socket }) {
                                 </button>
                             ))}
                         </div>
+                    </div>
+                    <div className="space-y-1">
+                        <div className="flex items-center justify-between">
+                            <FieldLabel>Animation Speed</FieldLabel>
+                            <span className="text-[10px] font-bold text-slate-500">{Number(behavior.animationSpeed || 1).toFixed(2)}x</span>
+                        </div>
+                        <input type="range" min="0.5" max="2" step="0.05" value={behavior.animationSpeed || 1}
+                            onChange={e => updateSection('behavior', { animationSpeed: Number(e.target.value) })}
+                            className="w-full h-1.5 bg-slate-200 dark:bg-slate-700 rounded-lg appearance-none cursor-pointer accent-indigo-500" />
                     </div>
                 </div>
 
@@ -667,6 +709,14 @@ export default function LowerThirdsPanel({ socket }) {
                                 <option value="'Open Sans', sans-serif">Open Sans</option>
                             </select>
                         </div>
+                        <div className="space-y-1.5 col-span-2">
+                            <FieldLabel>Gujarati Title Font</FieldLabel>
+                            <select value={typography.gujFontFamily} onChange={e => updateSection('typography', { gujFontFamily: e.target.value })} className={compactInputClass}>
+                                {GUJ_FONT_OPTIONS.map(font => (
+                                    <option key={font.value} value={font.value}>{font.label}</option>
+                                ))}
+                            </select>
+                        </div>
                         <div className="space-y-1.5">
                             <FieldLabel>Weight</FieldLabel>
                             <select value={typography.fontWeight} onChange={e => updateSection('typography', { fontWeight: e.target.value })} className={compactInputClass}>
@@ -678,9 +728,30 @@ export default function LowerThirdsPanel({ socket }) {
                             </select>
                         </div>
                         <div className="space-y-1.5">
-                            <FieldLabel>Color</FieldLabel>
+                            <FieldLabel>Color (all lines)</FieldLabel>
                             <input type="color" value={typography.color} onChange={e => updateSection('typography', { color: e.target.value })} className="control-field h-8 px-1 py-1 cursor-pointer" />
                         </div>
+                        {/* Per-line overrides. Blank inherits the colour above, which is what
+                            keeps templates saved before this existed looking identical. */}
+                        {[
+                            ['nameColor', 'Name'],
+                            ['titleColor', 'Title'],
+                            ['subtitleColor', 'Subtitle']
+                        ].map(([key, label]) => (
+                            <div key={key} className="space-y-1.5">
+                                <FieldLabel>{label} Colour</FieldLabel>
+                                <div className="flex gap-1">
+                                    <input type="color" value={typography[key] || typography.color}
+                                        onChange={e => updateSection('typography', { [key]: e.target.value })}
+                                        className="control-field h-8 flex-1 px-1 py-1 cursor-pointer" />
+                                    <button onClick={() => updateSection('typography', { [key]: '' })}
+                                        title="Inherit the colour above"
+                                        className={`rounded px-2 text-[9px] font-bold transition ${typography[key] ? 'control-button-muted' : 'bg-indigo-600 text-white'}`}>
+                                        AUTO
+                                    </button>
+                                </div>
+                            </div>
+                        ))}
                         <div className="space-y-1.5">
                             <FieldLabel>Size</FieldLabel>
                             <input type="number" value={typography.fontSizeFactor} onChange={e => updateSection('typography', { fontSizeFactor: e.target.value })} className={compactInputClass} />

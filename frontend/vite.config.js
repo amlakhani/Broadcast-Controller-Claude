@@ -15,7 +15,8 @@ export default defineConfig({
       input: {
         main: resolve(__dirname, 'index.html'),
         graphics: resolve(__dirname, 'graphics.html'),
-        backstage: resolve(__dirname, 'backstage.html')
+        backstage: resolve(__dirname, 'backstage.html'),
+        remote: resolve(__dirname, 'remote.html')
       }
     }
   }

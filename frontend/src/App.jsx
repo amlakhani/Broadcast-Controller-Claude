@@ -13,6 +13,8 @@ import MediaPanel from './components/MediaPanel';
 import StageDisplayPanel from './components/StageDisplayPanel';
 import TranslationPanel from './components/TranslationPanel';
 import BackstageCueSheetPanel from './components/BackstageCueSheetPanel';
+import RemotePairing from './components/RemotePairing';
+import RemoteQr from './components/RemoteQr';
 
 const DEFAULT_LAYER_VISIBILITY = {
   presentation: true,
@@ -222,109 +224,6 @@ const PreviewIframe = ({ isSidebar = false, activeTab }) => {
     </div>
   );
 };
-
-function RemotePairing({ onPaired }) {
-  const [deviceName, setDeviceName] = useState(() => localStorage.getItem('bc-remote-device-name') || '');
-  const [code, setCode] = useState('');
-  const [status, setStatus] = useState(null);
-  const [error, setError] = useState('');
-  const [isPairing, setIsPairing] = useState(false);
-
-  useEffect(() => {
-    fetch('/api/remote/status')
-      .then(response => response.json())
-      .then(setStatus)
-      .catch(() => setStatus({ enabled: false }));
-  }, []);
-
-  const handleSubmit = async (event) => {
-    event.preventDefault();
-    setError('');
-    setIsPairing(true);
-    try {
-      const response = await fetch('/api/remote/pair', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          code,
-          deviceName: deviceName.trim() || 'Remote Controller',
-        }),
-      });
-      const result = await response.json().catch(() => ({}));
-      if (!response.ok || !result.ok) {
-        throw new Error(result.error || 'Pairing failed.');
-      }
-      localStorage.setItem('bc-remote-token', result.remoteToken);
-      localStorage.setItem('bc-remote-session', JSON.stringify(result.session));
-      localStorage.setItem('bc-remote-device-name', deviceName.trim() || 'Remote Controller');
-      onPaired(result.remoteToken, result.session);
-    } catch (err) {
-      setError(err.message || 'Pairing failed.');
-    } finally {
-      setIsPairing(false);
-    }
-  };
-
-  return (
-    <div className="app-bg min-h-screen flex items-center justify-center p-4">
-      <form onSubmit={handleSubmit} className="surface-raised w-full max-w-lg rounded-xl p-5">
-        <div className="mb-5 flex items-center gap-3">
-          <div className="surface-raised flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded-lg p-px">
-            <img src="/logo.png" className="h-full w-full rounded-[7px] object-cover" alt="Broadcast Controller logo" />
-          </div>
-          <div>
-            <div className="text-lg font-bold leading-none text-slate-900 dark:text-white">Remote Controller</div>
-            <div className="mt-1 text-[10px] font-bold uppercase tracking-[0.25em] text-blue-600 dark:text-blue-400">Pair with Main Controller</div>
-          </div>
-        </div>
-
-        {status && !status.enabled && (
-          <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs font-semibold text-amber-700 dark:text-amber-300">
-            Remote Operators is currently disabled on the main controller.
-          </div>
-        )}
-
-        <div className="space-y-3">
-          <label className="block">
-            <span className="text-xs font-bold uppercase tracking-wider text-slate-500">Device Name</span>
-            <input
-              value={deviceName}
-              onChange={event => setDeviceName(event.target.value)}
-              placeholder="Remote laptop"
-              className="control-field mt-1 px-3 py-2 text-sm"
-            />
-          </label>
-
-          <label className="block">
-            <span className="text-xs font-bold uppercase tracking-wider text-slate-500">Pairing Code</span>
-            <input
-              value={code}
-              onChange={event => setCode(event.target.value.replace(/\D/g, '').slice(0, 6))}
-              inputMode="numeric"
-              placeholder="000000"
-              className="control-field mt-1 px-3 py-3 text-center text-2xl font-black tracking-[0.35em]"
-            />
-          </label>
-        </div>
-
-        {error && (
-          <div className="mt-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs font-semibold text-red-600 dark:text-red-300">
-            {error}
-          </div>
-        )}
-
-        <button
-          type="submit"
-          disabled={isPairing || code.length !== 6}
-          className="mt-5 w-full rounded-lg bg-blue-600 px-4 py-3 text-sm font-bold uppercase tracking-wider text-white transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          {isPairing ? 'Pairing...' : 'Pair Remote Controller'}
-        </button>
-      </form>
-    </div>
-  );
-}
-
 
 function App() {
   const isRemoteClient = isRemoteEntry() && !getAuthToken();
@@ -755,6 +654,14 @@ function App() {
     });
   };
 
+  const handleRemoteNetworkChange = (selected) => {
+    if (!socket) return;
+    socket.emit('remote_network_set', selected, (result) => {
+      if (result?.status) setRemoteAccessStatus(result.status);
+      if (result && !result.ok) window.alert(result.error || 'Could not change the remote network.');
+    });
+  };
+
   const handleRemoteSessionRevoke = (sessionId) => {
     if (!socket) return;
     socket.emit('remote_session_revoke', sessionId, (result) => {
@@ -1151,20 +1058,78 @@ function App() {
                     </div>
                   </div>
 
+                  {remoteAccessStatus?.enabled && remoteAccessStatus?.networkUnavailable ? (
+                    <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs font-semibold text-amber-700 dark:text-amber-300">
+                      Selected network “{remoteAccessStatus.selectedNetwork}” is unavailable — remote devices cannot connect. Pick another network below.
+                    </div>
+                  ) : null}
+                  {remoteAccessStatus?.enabled && remoteAccessStatus?.lastBlocked ? (
+                    <div className="rounded-lg border border-slate-500/20 bg-slate-500/10 px-3 py-2 text-xs font-semibold text-slate-600 dark:text-slate-300">
+                      Blocked a connection from {remoteAccessStatus.lastBlocked.address} — remote access is limited to{' '}
+                      {remoteAccessStatus.activeAddress || 'the selected network'}.
+                    </div>
+                  ) : null}
+
+                  <div className="surface-muted rounded-lg p-3">
+                    <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Network</div>
+                    <select
+                      value={remoteAccessStatus?.selectedNetwork || 'auto'}
+                      onChange={event => handleRemoteNetworkChange(event.target.value)}
+                      className="control-field mt-2 w-full px-3 py-2 text-sm"
+                    >
+                      <option value="auto">Auto — prefer a real network adapter</option>
+                      {(remoteAccessStatus?.networks || []).map(net => (
+                        <option key={net.name} value={net.name}>
+                          {net.name} ({net.address}){net.isVirtual ? ' · virtual' : ''}
+                        </option>
+                      ))}
+                    </select>
+                    <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+                      Remote devices can only connect over this network. The controller itself always works.
+                    </p>
+                  </div>
+
                   <div className="grid grid-cols-1 gap-3 lg:grid-cols-[1fr_220px]">
                     <div className="surface-muted rounded-lg p-3">
                       <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">LAN URL</div>
                       {remoteAccessStatus?.enabled && remoteAccessStatus?.lanUrls?.length ? (
                         <div className="mt-2 space-y-1">
                           {remoteAccessStatus.lanUrls.map(url => (
-                            <div key={url} className="surface break-all rounded-md px-3 py-2 text-xs font-bold text-blue-600 dark:text-blue-400">
-                              {url}
+                            <div key={url} className="surface flex items-center gap-3 rounded-md px-3 py-2">
+                              <span className="min-w-0 flex-1 break-all text-xs font-bold text-blue-600 dark:text-blue-400">{url}</span>
+                              <RemoteQr
+                                url={url}
+                                code={remoteAccessStatus.pairingCode}
+                                expiresAt={remoteAccessStatus.pairingCodeExpiresAt}
+                                label="Remote Controller"
+                              />
                             </div>
                           ))}
                         </div>
                       ) : (
                         <div className="mt-2 text-xs font-semibold text-slate-500">Enable Remote Operators to publish a LAN pairing URL.</div>
                       )}
+                      {remoteAccessStatus?.enabled && remoteAccessStatus?.slidesUrls?.length ? (
+                        <>
+                          <div className="mt-3 text-[10px] font-bold uppercase tracking-wider text-slate-500">Slides Remote (phone / iPad)</div>
+                          <div className="mt-2 space-y-1">
+                            {remoteAccessStatus.slidesUrls.map(url => (
+                              <div key={url} className="surface flex items-center gap-3 rounded-md px-3 py-2">
+                                <span className="min-w-0 flex-1 break-all text-xs font-bold text-amber-600 dark:text-amber-400">{url}</span>
+                                <RemoteQr
+                                  url={url}
+                                  code={remoteAccessStatus.pairingCode}
+                                  expiresAt={remoteAccessStatus.pairingCodeExpiresAt}
+                                  label="Slides Remote"
+                                />
+                              </div>
+                            ))}
+                          </div>
+                          <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+                            Scanning pairs automatically. The code changes every 30 seconds.
+                          </p>
+                        </>
+                      ) : null}
                     </div>
                     <div className="surface-muted rounded-lg p-3 text-center">
                       <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Pairing Code</div>
