@@ -28,13 +28,16 @@ function renameIfExists(from, to) {
     }
 }
 
-run('electron-builder', ['--mac', '--arm64']);
+// --publish never: only build the DMGs. Without it, electron-builder detects
+// CI and tries to auto-publish to GitHub Releases (needs GH_TOKEN and fails).
+// Publishing is handled explicitly by the release workflow / operator instead.
+run('electron-builder', ['--mac', '--arm64', '--publish', 'never']);
 
 run('node', ['scripts/rebuild-ndi-mac.js'], {
     env: { npm_config_arch: 'x64' }
 });
 run('node', ['scripts/verify-ndi-mac.js', '--arch=x64']);
-run('electron-builder', ['--mac', '--x64']);
+run('electron-builder', ['--mac', '--x64', '--publish', 'never']);
 
 renameIfExists(
     path.join(outputDir, `Broadcast Controller-${version}.dmg`),

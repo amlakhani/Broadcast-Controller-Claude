@@ -21,9 +21,9 @@
     "prebuild:mac": "npm run build:frontend && npm run check:ndi:mac && npm run rebuild:ndi:mac && npm run verify:ndi:mac",
     "build:mac": "node scripts/build-mac.js",
     "prebuild:win": "npm run build:frontend && npm run check:ndi:win && npm run rebuild:ndi:win && npm run verify:ndi:win",
-    "build:win": "electron-builder --win",
+    "build:win": "electron-builder --win --publish never",
     "prebuild:all": "npm run build:frontend",
-    "build:all": "electron-builder --mac --x64 --arm64 --win --x64",
+    "build:all": "electron-builder --mac --x64 --arm64 --win --x64 --publish never",
     "package": "npm run build:all"
   },
   "build": {
