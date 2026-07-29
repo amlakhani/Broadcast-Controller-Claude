@@ -39,6 +39,19 @@ Grab the installer for your machine and run it:
 > macOS builds are unsigned, so the first launch needs **right‑click → Open** (or `xattr -dr com.apple.quarantine "/Applications/Broadcast Controller.app"`).
 
 ### Run from source (developers)
+
+**Prerequisites** — `@stagetimerio/grandiose` (the NDI module) is a native
+Node addon, so it compiles from source the first time you run `npm install`.
+Without the platform toolchain below, that step fails with a raw `node-gyp`
+error instead of running:
+
+| Platform | Required |
+|---|---|
+| **Windows** | [Node.js](https://nodejs.org/) 18+ · [Python 3](https://www.python.org/) · **Visual Studio Build Tools 2022** with the **"Desktop development with C++"** workload ([download](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022)) |
+| **macOS** | [Node.js](https://nodejs.org/) 18+ · **Xcode Command Line Tools** (`xcode-select --install`) |
+
+`npm install` checks for these automatically (see `scripts/check-build-prereqs.js`) and fails fast with a specific, actionable message if something's missing, rather than the raw compiler error.
+
 ```bash
 # 1. Install dependencies (root + frontend)
 npm install
@@ -56,7 +69,7 @@ npm start
 npm run build:mac     # produces arm64 + Intel .dmg in "application packages/"
 npm run build:win     # run on Windows: nsis installer + portable .exe
 ```
-Mac builds rebuild and validate the native NDI module per‑architecture automatically.
+Mac builds rebuild and validate the native NDI module per‑architecture automatically. `build:mac` must run on macOS — Apple's DMG packaging and code‑signing tooling isn't cross‑platform, and there's no Windows workaround for this step.
 
 ---
 
