@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { ParticleRenderer } from './particlesRenderer';
 import { LAYER_Z } from './layerZ';
+import { useStage } from './stage';
 
 // Creates a control surface over the particle renderer. Prefers an OffscreenCanvas + Worker so
 // simulation and GPU draws run entirely off the main thread; falls back to a main-thread WebGL
@@ -50,6 +51,10 @@ export default function ParticlesGraphic({ socket }) {
 
     const canvasRef = useRef(null);
     const controllerRef = useRef(null);
+    // Particle size and velocity are absolute canvas pixels, so the backing store has to be
+    // the design frame. Sizing it from the window used to make the same "dust" preset render
+    // half-size and half-speed relative to frame on a 4K output.
+    const { width: stageWidth, height: stageHeight } = useStage();
 
     useEffect(() => {
         if (!socket) return;
@@ -81,20 +86,18 @@ export default function ParticlesGraphic({ socket }) {
         const controller = createParticleController(canvas);
         controllerRef.current = controller;
         controller.configure({ type, intensity, speed });
-        controller.resize(window.innerWidth, window.innerHeight);
+        // Fixed to the stage, so no window resize listener is needed — the stage scales the
+        // rendered result instead of re-seeding the simulation on every window change.
+        controller.resize(stageWidth, stageHeight);
         controller.start();
 
-        const onResize = () => controller.resize(window.innerWidth, window.innerHeight);
-        window.addEventListener('resize', onResize);
-
         return () => {
-            window.removeEventListener('resize', onResize);
             controller.destroy();
             controllerRef.current = null;
         };
         // type/intensity/speed are applied via the effect below; only (re)create on enable.
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [enabled]);
+    }, [enabled, stageWidth, stageHeight]);
 
     // Apply config changes without recreating the worker/context.
     useEffect(() => {
@@ -107,8 +110,8 @@ export default function ParticlesGraphic({ socket }) {
     return (
         <canvas
             ref={canvasRef}
-            className="fixed inset-0 pointer-events-none"
-            style={{ zIndex: LAYER_Z.particles }}
+            className="absolute inset-0 pointer-events-none"
+            style={{ zIndex: LAYER_Z.particles, width: '100%', height: '100%' }}
         />
     );
 }

@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import gsap from 'gsap';
 import { LAYER_Z } from './layerZ';
+import { STAGE_HEIGHT } from './stage';
 
 const clampPercent = (value, fallback) => {
     const parsed = parseFloat(value);
@@ -127,8 +128,10 @@ export default function SabhaTimerGraphic({ socket, windowMode }) {
                 id="sabha-panel" 
                 className="w-full relative flex flex-col items-center justify-center"
                 style={{
-                    paddingBottom: '8vh',
-                    paddingTop: '10vh'
+                    // Was 8vh/10vh. Percentage padding resolves against the containing
+                    // block's *width*, so these have to be pixels of the stage height.
+                    paddingBottom: `${STAGE_HEIGHT * 0.08}px`,
+                    paddingTop: `${STAGE_HEIGHT * 0.1}px`
                 }}
             >
                 {/* Dynamic Background Layer */}

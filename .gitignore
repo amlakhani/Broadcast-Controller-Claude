@@ -9,6 +9,10 @@ public_react/
 
 # macOS
 .DS_Store
+._*
+
+# Claude Code project config/session data
+.claude/
 
 # Logs
 *.log

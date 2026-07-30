@@ -3,8 +3,10 @@ import gsap from 'gsap';
 import { useGSAP } from '@gsap/react';
 import { applyAnimationIn, applyAnimationOut } from './AnimationUtils';
 import { LAYER_Z } from './layerZ';
+import { useStage } from './stage';
 
 export default function LyricsGraphic({ socket, windowMode }) {
+    const { height: stageHeight } = useStage();
     const [data, setData] = useState(null);
     const [style, setStyle] = useState({});
     // Shrinks the text just enough to keep a tall slide (e.g. 2 lines per take) in frame.
@@ -164,7 +166,10 @@ export default function LyricsGraphic({ socket, windowMode }) {
     // directions, so it can only use twice the smaller gap to an edge; cinematic is pinned to
     // the bottom and may use most of the frame.
     const getMaxPanelHeight = () => {
-        const frame = containerRef.current?.parentElement?.clientHeight || window.innerHeight || 0;
+        // The stage frame, not the window. The old `parentElement.clientHeight` always read 0
+        // (the layer wrapper is display:contents) and fell through to window.innerHeight, so
+        // the same verse auto-shrank on one output and overflowed on another.
+        const frame = stageHeight;
         if (!frame) return 0;
         if (isCinematic) return frame * 0.8;
         const posY = data?.posY ?? 88;
@@ -189,11 +194,7 @@ export default function LyricsGraphic({ socket, windowMode }) {
         setFitScale(Math.max(0.4, (maxHeight / height) * 0.98));
     });
 
-    useEffect(() => {
-        const onResize = () => setFitScale(1);
-        window.addEventListener('resize', onResize);
-        return () => window.removeEventListener('resize', onResize);
-    }, []);
+    // No window-resize re-fit: the fit is measured in stage coordinates, which never change.
 
     const getContainerStyle = () => {
         if (windowMode === 'stage') return {};

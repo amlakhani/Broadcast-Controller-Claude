@@ -92,6 +92,8 @@ The graphics output renders over a green / black / transparent background (for c
 |---|---|
 | ![Lower third output](docs/screenshots/11-graphics-output-lower-third.png) | ![Particle overlay output](docs/screenshots/12-graphics-output-particles.png) |
 
+**Fixed 1920×1080 frame.** Graphics are composed on a fixed 1920×1080 design canvas ([`frontend/src/graphics/stage.js`](frontend/src/graphics/stage.js)) that is scaled to fit whatever the output window is. What you see in the Live Preview is what goes to the projector, the 4K screen and the NDI feed — identical placement and identical type size, measured as a fraction of frame. A non‑16:9 output (e.g. an ultrawide) letterboxes or pillarboxes into the key colour rather than stretching or cropping the graphics.
+
 **Layer order (bottom → top).** Every layer is composited in one predictable, centrally‑defined stack ([`frontend/src/graphics/layerZ.js`](frontend/src/graphics/layerZ.js)) so overlays never fight each other:
 
 `Media → Slides → Particles → Media message → Lyrics → Lower thirds → Translation → Pre‑show countdown`

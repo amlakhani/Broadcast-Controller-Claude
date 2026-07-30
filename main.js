@@ -3,9 +3,24 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { NdiOutputService } from './ndi_output_service.js';
+import { AtemService } from './atem_service.js';
+import { VideohubService } from './videohub_service.js';
+import { NovaStarService } from './novastar_service.js';
 
 // Start the existing Express server automatically and grab its socket instance
-import { io, app as expressApp, server, setTranslationGlossaryDir, getAuthToken } from './server.js'; 
+import {
+    io,
+    app as expressApp,
+    server,
+    setTranslationGlossaryDir,
+    getAuthToken,
+    loadAtemSettings,
+    saveAtemSettings,
+    loadVideohubSettings,
+    saveVideohubSettings,
+    loadNovastarSettings,
+    saveNovastarSettings,
+} from './server.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -17,6 +32,9 @@ let stageWindow;
 let backstageWindow;
 let serverPort = null;
 let ndiOutputService = null;
+let atemService = null;
+let videohubService = null;
+let novastarService = null;
 
 function localAppUrl(pathname = '/', params = {}) {
     const url = new URL(`http://127.0.0.1:${serverPort}${pathname}`);
@@ -438,6 +456,56 @@ app.whenReady().then(() => {
         onStatus: (status) => io.emit('ndi_status_update', status)
     });
 
+    atemService = new AtemService({
+        // Remote-paired clients must never see the switcher's LAN address or the
+        // full input list, so the fan-out is split by socket type.
+        onStatus: (status) => {
+            for (const socket of io.sockets.sockets.values()) {
+                socket.emit('atem_status_update', isLocalSocket(socket) ? status : atemService.getPublicStatus());
+            }
+        }
+    });
+
+    const atemSettings = loadAtemSettings();
+    if (atemSettings.autoConnect && atemSettings.address) {
+        atemService.connect({ address: atemSettings.address, port: atemSettings.port });
+    }
+
+    videohubService = new VideohubService({
+        // Same split as ATEM above: remote-paired clients never see the
+        // hub's LAN address or full I/O list.
+        onStatus: (status) => {
+            for (const socket of io.sockets.sockets.values()) {
+                socket.emit('videohub_status_update', isLocalSocket(socket) ? status : videohubService.getPublicStatus());
+            }
+        }
+    });
+
+    const videohubSettings = loadVideohubSettings();
+    if (videohubSettings.autoConnect && videohubSettings.address) {
+        videohubService.connect({ address: videohubSettings.address, port: videohubSettings.port });
+    }
+
+    novastarService = new NovaStarService({
+        // Same split as ATEM/Videohub above: remote-paired clients never see
+        // the processor's LAN address, credentials, or screen/preset list.
+        onStatus: (status) => {
+            for (const socket of io.sockets.sockets.values()) {
+                socket.emit('novastar_status_update', isLocalSocket(socket) ? status : novastarService.getPublicStatus());
+            }
+        }
+    });
+
+    const novastarSettings = loadNovastarSettings();
+    if (novastarSettings.autoConnect && novastarSettings.address) {
+        novastarService.connect({
+            address: novastarSettings.address,
+            port: novastarSettings.port,
+            pId: novastarSettings.pId,
+            secretKey: novastarSettings.secretKey
+        });
+    }
+
     session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
         const allowedOrigins = new Set([
             `http://127.0.0.1:${serverPort}`,
@@ -574,6 +642,352 @@ app.whenReady().then(() => {
                 socket.emit('ndi_status_update', ndiOutputService.getStatus());
             }
         });
+
+        // --- ATEM switcher -------------------------------------------------
+        // All privileged: these open a socket to, and drive, physical broadcast
+        // hardware. Status is readable by anyone but redacted for remote clients.
+        onLocalSocket(socket, 'atem_connect', async (config = {}, ack) => {
+            if (!atemService) return;
+            const saved = loadAtemSettings();
+            const savedConnection = config.connectionId
+                ? saved.connections.find(c => c.id === config.connectionId)
+                : null;
+            const settings = savedConnection || (config.address ? config : saved);
+            const status = await atemService.connect({ address: settings.address, port: settings.port });
+            // Remember what's active so a restart resumes the same saved
+            // connection and the saved-connections chip row stays in sync.
+            saveAtemSettings({ ...saved, address: settings.address, port: settings.port, activeConnectionId: config.connectionId || null });
+            if (typeof ack === 'function') ack({ ok: status.connectionState !== 'error', status });
+        });
+
+        onLocalSocket(socket, 'atem_disconnect', async (payload, ack) => {
+            // `payload` is unused — kept so the handler matches the (payload, ack)
+            // shape every client call through emitAck() sends, even when there's
+            // nothing to send. A bare (ack) param here would silently swallow the
+            // ack function and hang the caller's promise forever.
+            await atemService?.disconnect();
+            if (typeof ack === 'function') ack({ ok: true });
+        });
+
+        onLocalSocket(socket, 'atem_set_armed', (armed, ack) => {
+            atemService?.setArmed(armed);
+            if (typeof ack === 'function') ack({ ok: true, armed: !!armed });
+        });
+
+        onLocalSocket(socket, 'atem_push_boxes', (payload = {}, ack) => {
+            const result = atemService?.pushBoxes(payload.patches || [], payload.ssrcId || 0)
+                || { ok: false, error: 'ATEM service unavailable.' };
+            if (typeof ack === 'function') ack(result);
+        });
+
+        onLocalSocket(socket, 'atem_push_properties', async (payload = {}, ack) => {
+            const result = await atemService?.pushProperties(payload.props || {}, payload.ssrcId || 0);
+            if (typeof ack === 'function') ack(result || { ok: false, error: 'ATEM service unavailable.' });
+        });
+
+        onLocalSocket(socket, 'atem_pull_state', (payload = {}, ack) => {
+            const boxes = atemService?.pullBoxes(payload.ssrcId || 0);
+            if (typeof ack === 'function') ack({ ok: Array.isArray(boxes), boxes });
+        });
+
+        socket.on('atem_status_request', () => {
+            if (!atemService) return;
+            socket.emit('atem_status_update', isLocalSocket(socket)
+                ? atemService.getStatus()
+                : atemService.getPublicStatus());
+        });
+
+        // --- ATEM switcher: Program/Preview, transitions, keyers, router -----
+        // Same privilege split as the ATEM block above: all writes are local-only.
+        const atemUnavailable = { ok: false, error: 'ATEM service unavailable.' };
+
+        onLocalSocket(socket, 'atem_cut', async (payload = {}, ack) => {
+            const result = await atemService?.cut(payload.me || 0);
+            if (typeof ack === 'function') ack(result || atemUnavailable);
+        });
+
+        onLocalSocket(socket, 'atem_auto_transition', async (payload = {}, ack) => {
+            const result = await atemService?.autoTransition(payload.me || 0);
+            if (typeof ack === 'function') ack(result || atemUnavailable);
+        });
+
+        onLocalSocket(socket, 'atem_fade_to_black', async (payload = {}, ack) => {
+            const result = await atemService?.fadeToBlack(payload.me || 0);
+            if (typeof ack === 'function') ack(result || atemUnavailable);
+        });
+
+        onLocalSocket(socket, 'atem_set_program', async (payload = {}, ack) => {
+            const result = await atemService?.setProgramInput(payload.input, payload.me || 0);
+            if (typeof ack === 'function') ack(result || atemUnavailable);
+        });
+
+        onLocalSocket(socket, 'atem_set_preview', async (payload = {}, ack) => {
+            const result = await atemService?.setPreviewInput(payload.input, payload.me || 0);
+            if (typeof ack === 'function') ack(result || atemUnavailable);
+        });
+
+        onLocalSocket(socket, 'atem_set_aux', async (payload = {}, ack) => {
+            const result = await atemService?.setAuxSource(payload.source, payload.bus || 0);
+            if (typeof ack === 'function') ack(result || atemUnavailable);
+        });
+
+        onLocalSocket(socket, 'atem_set_transition_style', async (payload = {}, ack) => {
+            const result = await atemService?.setTransitionStyle(payload.props || {}, payload.me || 0);
+            if (typeof ack === 'function') ack(result || atemUnavailable);
+        });
+
+        onLocalSocket(socket, 'atem_push_transition_position', (payload = {}, ack) => {
+            const result = atemService?.pushTransitionPosition(payload.position, payload.me || 0) || atemUnavailable;
+            if (typeof ack === 'function') ack(result);
+        });
+
+        onLocalSocket(socket, 'atem_push_transition_settings', (payload = {}, ack) => {
+            const result = atemService?.pushTransitionSettings(payload.kind, payload.props || {}, payload.me || 0) || atemUnavailable;
+            if (typeof ack === 'function') ack(result);
+        });
+
+        onLocalSocket(socket, 'atem_set_keyer_on_air', async (payload = {}, ack) => {
+            const result = await atemService?.setUpstreamKeyerOnAir(payload.onAir, payload.me || 0, payload.keyer || 0);
+            if (typeof ack === 'function') ack(result || atemUnavailable);
+        });
+
+        onLocalSocket(socket, 'atem_set_keyer_type', async (payload = {}, ack) => {
+            const result = await atemService?.setUpstreamKeyerType(payload.props || {}, payload.me || 0, payload.keyer || 0);
+            if (typeof ack === 'function') ack(result || atemUnavailable);
+        });
+
+        onLocalSocket(socket, 'atem_set_keyer_sources', async (payload = {}, ack) => {
+            const result = await atemService?.setUpstreamKeyerSources(payload.fillSource, payload.cutSource, payload.me || 0, payload.keyer || 0);
+            if (typeof ack === 'function') ack(result || atemUnavailable);
+        });
+
+        onLocalSocket(socket, 'atem_push_keyer_settings', (payload = {}, ack) => {
+            const result = atemService?.pushKeyerSettings(payload.kind, payload.props || {}, payload.me || 0, payload.keyer || 0) || atemUnavailable;
+            if (typeof ack === 'function') ack(result);
+        });
+
+        onLocalSocket(socket, 'atem_set_dsk_on_air', async (payload = {}, ack) => {
+            const result = await atemService?.setDownstreamKeyOnAir(payload.onAir, payload.key || 0);
+            if (typeof ack === 'function') ack(result || atemUnavailable);
+        });
+
+        onLocalSocket(socket, 'atem_set_dsk_tie', async (payload = {}, ack) => {
+            const result = await atemService?.setDownstreamKeyTie(payload.tie, payload.key || 0);
+            if (typeof ack === 'function') ack(result || atemUnavailable);
+        });
+
+        onLocalSocket(socket, 'atem_auto_dsk', async (payload = {}, ack) => {
+            const result = await atemService?.autoDownstreamKey(payload.key || 0, payload.isTowardsOnAir);
+            if (typeof ack === 'function') ack(result || atemUnavailable);
+        });
+
+        onLocalSocket(socket, 'atem_set_dsk_sources', async (payload = {}, ack) => {
+            const result = await atemService?.setDownstreamKeySources(payload.fillSource, payload.cutSource, payload.key || 0);
+            if (typeof ack === 'function') ack(result || atemUnavailable);
+        });
+
+        onLocalSocket(socket, 'atem_push_dsk_settings', (payload = {}, ack) => {
+            const result = atemService?.pushDskSettings(payload.kind, payload.props || {}, payload.key || 0) || atemUnavailable;
+            if (typeof ack === 'function') ack(result);
+        });
+
+        onLocalSocket(socket, 'atem_pull_me_state', (payload = {}, ack) => {
+            const state = atemService?.pullMixEffectState(payload.me || 0);
+            if (typeof ack === 'function') ack({ ok: !!state, state });
+        });
+
+        onLocalSocket(socket, 'atem_pull_keyer_state', (payload = {}, ack) => {
+            const state = atemService?.pullKeyerState(payload.me || 0, payload.keyer || 0);
+            if (typeof ack === 'function') ack({ ok: !!state, state });
+        });
+
+        onLocalSocket(socket, 'atem_pull_dsk_state', (payload = {}, ack) => {
+            const state = atemService?.pullDskState(payload.key || 0);
+            if (typeof ack === 'function') ack({ ok: !!state, state });
+        });
+
+        // --- Blackmagic Videohub --------------------------------------------
+        // Same privilege split as ATEM above: writes are local-only, status
+        // reads are open but redacted for remote clients.
+        onLocalSocket(socket, 'videohub_connect', async (config = {}, ack) => {
+            if (!videohubService) return;
+            const saved = loadVideohubSettings();
+            const savedConnection = config.connectionId
+                ? saved.connections.find(c => c.id === config.connectionId)
+                : null;
+            const settings = savedConnection || (config.address ? config : saved);
+            const status = await videohubService.connect({ address: settings.address, port: settings.port });
+            saveVideohubSettings({ ...saved, address: settings.address, port: settings.port, activeConnectionId: config.connectionId || null });
+            if (typeof ack === 'function') ack({ ok: status.connectionState !== 'error', status });
+        });
+
+        onLocalSocket(socket, 'videohub_disconnect', async (payload, ack) => {
+            await videohubService?.disconnect();
+            if (typeof ack === 'function') ack({ ok: true });
+        });
+
+        onLocalSocket(socket, 'videohub_take', (payload = {}, ack) => {
+            const result = videohubService?.takeRoutes(payload.pairs || [])
+                || { ok: false, error: 'Videohub service unavailable.' };
+            if (typeof ack === 'function') ack(result);
+        });
+
+        onLocalSocket(socket, 'videohub_undo', (payload, ack) => {
+            const result = videohubService?.undoLastTake()
+                || { ok: false, error: 'Videohub service unavailable.' };
+            if (typeof ack === 'function') ack(result);
+        });
+
+        onLocalSocket(socket, 'videohub_set_lock', (payload = {}, ack) => {
+            const result = videohubService?.setLock(payload.destIndex, !!payload.locked)
+                || { ok: false, error: 'Videohub service unavailable.' };
+            if (typeof ack === 'function') ack(result);
+        });
+
+        onLocalSocket(socket, 'videohub_rename_input', (payload = {}, ack) => {
+            const result = videohubService?.renameInput(payload.index, payload.label || '')
+                || { ok: false, error: 'Videohub service unavailable.' };
+            if (typeof ack === 'function') ack(result);
+        });
+
+        onLocalSocket(socket, 'videohub_rename_output', (payload = {}, ack) => {
+            const result = videohubService?.renameOutput(payload.index, payload.label || '')
+                || { ok: false, error: 'Videohub service unavailable.' };
+            if (typeof ack === 'function') ack(result);
+        });
+
+        socket.on('videohub_status_request', () => {
+            if (!videohubService) return;
+            socket.emit('videohub_status_update', isLocalSocket(socket)
+                ? videohubService.getStatus()
+                : videohubService.getPublicStatus());
+        });
+
+        // --- NovaStar H Series LED processor ---------------------------------
+        // Same privilege split as ATEM/Videohub above: writes are local-only,
+        // status reads are open but redacted for remote clients. Unlike those
+        // two, commands go over HTTP (see novastar_service.js), so there's
+        // also a lightweight novastar_test pre-flight check with no
+        // ATEM/Videohub equivalent — mirrors local_ai_test's role for the
+        // other HTTP-based integration in this app.
+        onLocalSocket(socket, 'novastar_connect', async (config = {}, ack) => {
+            if (!novastarService) return;
+            const saved = loadNovastarSettings();
+            const savedConnection = config.connectionId
+                ? saved.connections.find(c => c.id === config.connectionId)
+                : null;
+            const settings = savedConnection || (config.address ? config : saved);
+            const status = await novastarService.connect({
+                address: settings.address,
+                port: settings.port,
+                pId: settings.pId,
+                secretKey: settings.secretKey
+            });
+            saveNovastarSettings({
+                ...saved,
+                address: settings.address,
+                port: settings.port,
+                pId: settings.pId,
+                secretKey: settings.secretKey,
+                activeConnectionId: config.connectionId || null
+            });
+            if (typeof ack === 'function') ack({ ok: status.connectionState !== 'error', status });
+        });
+
+        onLocalSocket(socket, 'novastar_disconnect', async (payload, ack) => {
+            // (payload, ack) even though payload is unused — see
+            // videohub_disconnect above; a bare (ack) here would silently
+            // hang emitAck() callers.
+            await novastarService?.disconnect();
+            if (typeof ack === 'function') ack({ ok: true });
+        });
+
+        onLocalSocket(socket, 'novastar_test', async (config = {}, ack) => {
+            const result = novastarService
+                ? await novastarService.testConnection({
+                    address: config.address, port: config.port, pId: config.pId, secretKey: config.secretKey
+                })
+                : { ok: false, error: 'NovaStar service unavailable.' };
+            if (typeof ack === 'function') ack(result);
+        });
+
+        onLocalSocket(socket, 'novastar_select_screen', (payload = {}, ack) => {
+            const result = novastarService?.selectScreen(payload.screenId)
+                || { ok: false, error: 'NovaStar service unavailable.' };
+            const saved = loadNovastarSettings();
+            saveNovastarSettings({ ...saved, selectedScreenId: payload.screenId ?? null });
+            if (typeof ack === 'function') ack(result);
+        });
+
+        onLocalSocket(socket, 'novastar_read_screens', async (payload = {}, ack) => {
+            const result = novastarService
+                ? await novastarService.readScreens(payload.deviceId ?? 0)
+                : { ok: false, error: 'NovaStar service unavailable.' };
+            if (typeof ack === 'function') ack(result);
+        });
+
+        onLocalSocket(socket, 'novastar_ftb', async (payload = {}, ack) => {
+            const result = novastarService
+                ? await novastarService.setBlackout(payload)
+                : { ok: false, error: 'NovaStar service unavailable.' };
+            if (typeof ack === 'function') ack(result);
+        });
+
+        onLocalSocket(socket, 'novastar_freeze', async (payload = {}, ack) => {
+            const result = novastarService
+                ? await novastarService.setFreeze(payload)
+                : { ok: false, error: 'NovaStar service unavailable.' };
+            if (typeof ack === 'function') ack(result);
+        });
+
+        onLocalSocket(socket, 'novastar_set_brightness', async (payload = {}, ack) => {
+            const result = novastarService
+                ? await novastarService.setBrightness(payload)
+                : { ok: false, error: 'NovaStar service unavailable.' };
+            if (typeof ack === 'function') ack(result);
+        });
+
+        onLocalSocket(socket, 'novastar_save_brightness', async (payload = {}, ack) => {
+            const result = novastarService
+                ? await novastarService.saveBrightness(payload)
+                : { ok: false, error: 'NovaStar service unavailable.' };
+            if (typeof ack === 'function') ack(result);
+        });
+
+        onLocalSocket(socket, 'novastar_read_presets', async (payload = {}, ack) => {
+            const result = novastarService
+                ? await novastarService.readPresets(payload)
+                : { ok: false, error: 'NovaStar service unavailable.' };
+            if (typeof ack === 'function') ack(result);
+        });
+
+        onLocalSocket(socket, 'novastar_load_preset', async (payload = {}, ack) => {
+            const result = novastarService
+                ? await novastarService.playPreset(payload)
+                : { ok: false, error: 'NovaStar service unavailable.' };
+            if (typeof ack === 'function') ack(result);
+        });
+
+        onLocalSocket(socket, 'novastar_set_text_osd', async (payload = {}, ack) => {
+            const result = novastarService
+                ? await novastarService.setTextOsd(payload)
+                : { ok: false, error: 'NovaStar service unavailable.' };
+            if (typeof ack === 'function') ack(result);
+        });
+
+        onLocalSocket(socket, 'novastar_set_image_osd', async (payload = {}, ack) => {
+            const result = novastarService
+                ? await novastarService.setImageOsd(payload)
+                : { ok: false, error: 'NovaStar service unavailable.' };
+            if (typeof ack === 'function') ack(result);
+        });
+
+        socket.on('novastar_status_request', () => {
+            if (!novastarService) return;
+            socket.emit('novastar_status_update', isLocalSocket(socket)
+                ? novastarService.getStatus()
+                : novastarService.getPublicStatus());
+        });
     });
 
     ipcMain.handle('select-local-video', async () => {
@@ -672,5 +1086,14 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
     ndiOutputService?.stop().catch(err => {
         console.error('Error stopping NDI output:', err);
+    });
+    atemService?.disconnect().catch(err => {
+        console.error('Error disconnecting from ATEM:', err);
+    });
+    videohubService?.disconnect().catch(err => {
+        console.error('Error disconnecting from Videohub:', err);
+    });
+    novastarService?.disconnect().catch(err => {
+        console.error('Error disconnecting from NovaStar:', err);
     });
 });

@@ -184,7 +184,9 @@ export default function TranslationGraphic({ socket, windowMode }) {
                 style={{
                     background: 'rgba(15, 15, 15, 0.88)',
                     borderRadius: '0px',
-                    maxWidth: '85vw',
+                    // 85% of the 1920 stage — pruneSentences() below assumes a ~1400px
+                    // caption box, which only holds if this tracks the frame, not the window.
+                    maxWidth: '85%',
                     display: 'inline-block'
                 }}
             >

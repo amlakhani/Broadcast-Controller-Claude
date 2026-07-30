@@ -642,6 +642,292 @@ function validateLocalAiSettings(settings = loadLocalAiSettings()) {
     };
 }
 
+// --- ATEM switcher settings -------------------------------------------------
+// Same three-part shape as the Local AI block above: normalize / load / save,
+// plus a validate that returns { ok, settings, checks, errors }. Lives on disk in
+// userData rather than localStorage because it is machine config, and because the
+// socket to the hardware is opened by the Node process, not the renderer.
+
+const DEFAULT_ATEM_SETTINGS = {
+    address: '',
+    port: 9910,
+    autoConnect: false,
+    connections: [],
+    activeConnectionId: null
+};
+
+let atemSettingsCache = null;
+
+function getAtemSettingsPath() {
+    return path.join(translationGlossaryDir, 'atem-settings.json');
+}
+
+// Saved connection profiles: a named address/port the operator can switch to
+// without retyping it. Shared by ATEM and Videohub settings below — both are
+// "one device connected at a time" with a quick-switch list on the side.
+function normalizeConnectionList(list, defaultPort) {
+    if (!Array.isArray(list)) return [];
+    return list
+        .map(entry => {
+            const address = typeof entry?.address === 'string' ? entry.address.trim() : '';
+            if (!address) return null;
+            const port = Number(entry?.port);
+            return {
+                id: typeof entry.id === 'string' && entry.id.trim()
+                    ? entry.id.trim()
+                    : `conn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : address,
+                address,
+                port: Number.isInteger(port) && port >= 1 && port <= 65535 ? port : defaultPort
+            };
+        })
+        .filter(Boolean);
+}
+
+function normalizeAtemSettings(settings = {}) {
+    const port = Number(settings.port);
+    return {
+        address: typeof settings.address === 'string' ? settings.address.trim() : '',
+        port: Number.isInteger(port) && port >= 1 && port <= 65535 ? port : DEFAULT_ATEM_SETTINGS.port,
+        autoConnect: settings.autoConnect === true,
+        connections: normalizeConnectionList(settings.connections, DEFAULT_ATEM_SETTINGS.port),
+        activeConnectionId: typeof settings.activeConnectionId === 'string' ? settings.activeConnectionId : null
+    };
+}
+
+function loadAtemSettings() {
+    if (atemSettingsCache) {
+        return atemSettingsCache;
+    }
+
+    try {
+        const settingsPath = getAtemSettingsPath();
+        if (!fs.existsSync(settingsPath)) {
+            atemSettingsCache = { ...DEFAULT_ATEM_SETTINGS };
+            return atemSettingsCache;
+        }
+        atemSettingsCache = normalizeAtemSettings(JSON.parse(fs.readFileSync(settingsPath, 'utf8')));
+        return atemSettingsCache;
+    } catch (err) {
+        console.error('Failed to load ATEM settings:', err);
+        atemSettingsCache = { ...DEFAULT_ATEM_SETTINGS };
+        return atemSettingsCache;
+    }
+}
+
+function saveAtemSettings(settings) {
+    const normalized = normalizeAtemSettings(settings);
+    fs.mkdirSync(translationGlossaryDir, { recursive: true });
+    fs.writeFileSync(getAtemSettingsPath(), JSON.stringify(normalized, null, 2), 'utf8');
+    atemSettingsCache = normalized;
+    return normalized;
+}
+
+// Deliberately NOT restricted to private ranges — some installs route the
+// switcher across subnets.
+//
+// Port is not separately validated: normalizeAtemSettings already silently
+// clamps anything out of range back to the default (9910, the fixed ATEM
+// protocol port), the same "auto-correct, don't reject" treatment this file
+// already gives chunkSeconds in the Local AI settings above. Checking it here
+// too would just always report valid, since normalize never lets it be otherwise.
+function validateAtemSettings(settings = loadAtemSettings()) {
+    const normalized = normalizeAtemSettings(settings);
+    const checks = { address: false };
+    const errors = [];
+
+    checks.address = isValidHost(normalized.address);
+    if (!checks.address) errors.push('Enter a valid switcher IP address or hostname.');
+
+    return { ok: errors.length === 0, settings: normalized, checks, errors };
+}
+
+// Generic IPv4/hostname validation — used by both ATEM and Videohub settings.
+function isValidHost(host) {
+    if (typeof host !== 'string' || !host || host.includes('\0') || host.length > 253) return false;
+    const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+    if (ipv4) {
+        return ipv4.slice(1).every(part => Number(part) <= 255 && String(Number(part)) === part);
+    }
+    // Hostname: letters, digits, hyphens, dots; no leading/trailing hyphen per label.
+    return /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$/.test(host);
+}
+
+// --- Blackmagic Videohub settings --------------------------------------------
+// Same three-part shape as the ATEM block above: normalize / load / save, plus
+// a validate that returns { ok, settings, checks, errors }. One Videohub
+// connected at a time (20x20, 40x40, etc. all speak the same Ethernet
+// protocol and report their own I/O count on connect), with a saved
+// connections list for quickly switching between hubs.
+
+const DEFAULT_VIDEOHUB_SETTINGS = {
+    address: '',
+    port: 9990,
+    autoConnect: false,
+    connections: [],
+    activeConnectionId: null
+};
+
+let videohubSettingsCache = null;
+
+function getVideohubSettingsPath() {
+    return path.join(translationGlossaryDir, 'videohub-settings.json');
+}
+
+function normalizeVideohubSettings(settings = {}) {
+    const port = Number(settings.port);
+    return {
+        address: typeof settings.address === 'string' ? settings.address.trim() : '',
+        port: Number.isInteger(port) && port >= 1 && port <= 65535 ? port : DEFAULT_VIDEOHUB_SETTINGS.port,
+        autoConnect: settings.autoConnect === true,
+        connections: normalizeConnectionList(settings.connections, DEFAULT_VIDEOHUB_SETTINGS.port),
+        activeConnectionId: typeof settings.activeConnectionId === 'string' ? settings.activeConnectionId : null
+    };
+}
+
+function loadVideohubSettings() {
+    if (videohubSettingsCache) {
+        return videohubSettingsCache;
+    }
+
+    try {
+        const settingsPath = getVideohubSettingsPath();
+        if (!fs.existsSync(settingsPath)) {
+            videohubSettingsCache = { ...DEFAULT_VIDEOHUB_SETTINGS };
+            return videohubSettingsCache;
+        }
+        videohubSettingsCache = normalizeVideohubSettings(JSON.parse(fs.readFileSync(settingsPath, 'utf8')));
+        return videohubSettingsCache;
+    } catch (err) {
+        console.error('Failed to load Videohub settings:', err);
+        videohubSettingsCache = { ...DEFAULT_VIDEOHUB_SETTINGS };
+        return videohubSettingsCache;
+    }
+}
+
+function saveVideohubSettings(settings) {
+    const normalized = normalizeVideohubSettings(settings);
+    fs.mkdirSync(translationGlossaryDir, { recursive: true });
+    fs.writeFileSync(getVideohubSettingsPath(), JSON.stringify(normalized, null, 2), 'utf8');
+    videohubSettingsCache = normalized;
+    return normalized;
+}
+
+// Deliberately NOT restricted to private ranges — same reasoning as ATEM above.
+function validateVideohubSettings(settings = loadVideohubSettings()) {
+    const normalized = normalizeVideohubSettings(settings);
+    const checks = { address: false };
+    const errors = [];
+
+    checks.address = isValidHost(normalized.address);
+    if (!checks.address) errors.push('Enter a valid Videohub IP address or hostname.');
+
+    return { ok: errors.length === 0, settings: normalized, checks, errors };
+}
+
+// --- NovaStar H Series settings -----------------------------------------------
+// Same three-part shape as ATEM/Videohub above, extended with the OpenAPI
+// auth pair (pId/secretKey) that HTTP-based hardware needs but the two
+// TCP-based integrations don't. One processor connected at a time, with a
+// saved-connections list for quickly switching between venues/processors —
+// each saved entry carries its own pId/secretKey/screenId since a different
+// H5 unit generally means different OpenAPI credentials.
+
+const DEFAULT_NOVASTAR_SETTINGS = {
+    address: '',
+    port: 80,
+    pId: '',
+    secretKey: '',
+    autoConnect: false,
+    connections: [],
+    activeConnectionId: null,
+    selectedScreenId: null
+};
+
+let novastarSettingsCache = null;
+
+function getNovastarSettingsPath() {
+    return path.join(translationGlossaryDir, 'novastar-settings.json');
+}
+
+// Extends the shared normalizeConnectionList (address/port/name/id) with the
+// per-processor OpenAPI credentials and screen selection, matched back onto
+// each entry by id. Kept separate from normalizeConnectionList itself so
+// ATEM/Videohub's already-validated behavior is untouched.
+function normalizeNovastarConnectionList(list) {
+    const base = normalizeConnectionList(list, DEFAULT_NOVASTAR_SETTINGS.port);
+    const byId = new Map((Array.isArray(list) ? list : []).map(entry => [entry?.id, entry]));
+    return base.map(entry => {
+        const raw = byId.get(entry.id) || {};
+        return {
+            ...entry,
+            pId: typeof raw.pId === 'string' ? raw.pId.trim() : '',
+            secretKey: typeof raw.secretKey === 'string' ? raw.secretKey : '',
+            screenId: Number.isInteger(raw.screenId) ? raw.screenId : null
+        };
+    });
+}
+
+function normalizeNovastarSettings(settings = {}) {
+    const port = Number(settings.port);
+    return {
+        address: typeof settings.address === 'string' ? settings.address.trim() : '',
+        port: Number.isInteger(port) && port >= 1 && port <= 65535 ? port : DEFAULT_NOVASTAR_SETTINGS.port,
+        pId: typeof settings.pId === 'string' ? settings.pId.trim() : '',
+        secretKey: typeof settings.secretKey === 'string' ? settings.secretKey : '',
+        autoConnect: settings.autoConnect === true,
+        connections: normalizeNovastarConnectionList(settings.connections),
+        activeConnectionId: typeof settings.activeConnectionId === 'string' ? settings.activeConnectionId : null,
+        selectedScreenId: Number.isInteger(settings.selectedScreenId) ? settings.selectedScreenId : null
+    };
+}
+
+function loadNovastarSettings() {
+    if (novastarSettingsCache) {
+        return novastarSettingsCache;
+    }
+
+    try {
+        const settingsPath = getNovastarSettingsPath();
+        if (!fs.existsSync(settingsPath)) {
+            novastarSettingsCache = { ...DEFAULT_NOVASTAR_SETTINGS };
+            return novastarSettingsCache;
+        }
+        novastarSettingsCache = normalizeNovastarSettings(JSON.parse(fs.readFileSync(settingsPath, 'utf8')));
+        return novastarSettingsCache;
+    } catch (err) {
+        console.error('Failed to load NovaStar settings:', err);
+        novastarSettingsCache = { ...DEFAULT_NOVASTAR_SETTINGS };
+        return novastarSettingsCache;
+    }
+}
+
+function saveNovastarSettings(settings) {
+    const normalized = normalizeNovastarSettings(settings);
+    fs.mkdirSync(translationGlossaryDir, { recursive: true });
+    fs.writeFileSync(getNovastarSettingsPath(), JSON.stringify(normalized, null, 2), 'utf8');
+    novastarSettingsCache = normalized;
+    return normalized;
+}
+
+// secretKey is deliberately NOT required — some venues run the H5's OpenAPI
+// access effectively open on an isolated LAN, and the documented "disable
+// encryption" signing mode doesn't use it anyway (see novastar_protocol.js).
+// Treat a blank secretKey as "send unsigned", not a validation failure.
+function validateNovastarSettings(settings = loadNovastarSettings()) {
+    const normalized = normalizeNovastarSettings(settings);
+    const checks = { address: false, pId: false };
+    const errors = [];
+
+    checks.address = isValidHost(normalized.address);
+    if (!checks.address) errors.push('Enter a valid NovaStar processor IP address or hostname.');
+
+    checks.pId = normalized.pId.length > 0;
+    if (!checks.pId) errors.push('Enter the OpenAPI Requestor ID (pId).');
+
+    return { ok: errors.length === 0, settings: normalized, checks, errors };
+}
+
 function validateExecutablePath(rawPath) {
     if (typeof rawPath !== 'string' || !rawPath || rawPath.includes('\0')) return false;
     try {
@@ -1701,8 +1987,11 @@ function resetServerStateForTests() {
         lyrics: true,
         translation: true,
         sabhaTimer: true,
-        particles: true
+        particles: true,
+        mediaMessage: true
     };
+    atemSettingsCache = null;
+    novastarSettingsCache = null;
     currentLowerThirdState = null;
     currentLyricsState = null;
     currentSabhaState = {
@@ -2545,6 +2834,76 @@ io.on('connection', (socket) => {
         }
     });
 
+    // ATEM connection settings. Local-only: this is the LAN address of production
+    // hardware, and saving it is machine configuration.
+    onLocalSocket(socket, 'atem_settings_request', (ack) => {
+        const settings = loadAtemSettings();
+        socket.emit('atem_settings_update', settings);
+        sendSocketResult(ack, { ok: true, settings, validation: validateAtemSettings(settings) });
+    });
+
+    onLocalSocket(socket, 'atem_settings_save', (settings, ack) => {
+        try {
+            const validation = validateAtemSettings(settings);
+            if (!validation.ok) {
+                sendSocketResult(ack, { ok: false, error: validation.errors[0], validation });
+                return;
+            }
+            const saved = saveAtemSettings(settings);
+            io.emit('atem_settings_update', saved);
+            sendSocketResult(ack, { ok: true, settings: saved, validation });
+        } catch (err) {
+            sendSocketResult(ack, { ok: false, error: err.message || 'Failed to save ATEM settings.' });
+        }
+    });
+
+    // Blackmagic Videohub connection settings. Local-only: same sensitivity
+    // class as ATEM settings above (LAN address of production hardware).
+    onLocalSocket(socket, 'videohub_settings_request', (ack) => {
+        const settings = loadVideohubSettings();
+        socket.emit('videohub_settings_update', settings);
+        sendSocketResult(ack, { ok: true, settings, validation: validateVideohubSettings(settings) });
+    });
+
+    onLocalSocket(socket, 'videohub_settings_save', (settings, ack) => {
+        try {
+            const validation = validateVideohubSettings(settings);
+            if (!validation.ok) {
+                sendSocketResult(ack, { ok: false, error: validation.errors[0], validation });
+                return;
+            }
+            const saved = saveVideohubSettings(settings);
+            io.emit('videohub_settings_update', saved);
+            sendSocketResult(ack, { ok: true, settings: saved, validation });
+        } catch (err) {
+            sendSocketResult(ack, { ok: false, error: err.message || 'Failed to save Videohub settings.' });
+        }
+    });
+
+    // NovaStar H Series connection settings. Local-only: same sensitivity
+    // class as ATEM/Videohub settings above (LAN address + credentials of
+    // production hardware).
+    onLocalSocket(socket, 'novastar_settings_request', (ack) => {
+        const settings = loadNovastarSettings();
+        socket.emit('novastar_settings_update', settings);
+        sendSocketResult(ack, { ok: true, settings, validation: validateNovastarSettings(settings) });
+    });
+
+    onLocalSocket(socket, 'novastar_settings_save', (settings, ack) => {
+        try {
+            const validation = validateNovastarSettings(settings);
+            if (!validation.ok) {
+                sendSocketResult(ack, { ok: false, error: validation.errors[0], validation });
+                return;
+            }
+            const saved = saveNovastarSettings(settings);
+            io.emit('novastar_settings_update', saved);
+            sendSocketResult(ack, { ok: true, settings: saved, validation });
+        } catch (err) {
+            sendSocketResult(ack, { ok: false, error: err.message || 'Failed to save NovaStar settings.' });
+        }
+    });
+
     onLocalSocket(socket, 'local_ai_settings_request', (ack) => {
         const settings = loadLocalAiSettings();
         socket.emit('local_ai_settings_update', settings);
@@ -2736,5 +3095,20 @@ export {
     loadLocalAiSettings,
     saveLocalAiSettings,
     normalizeLocalAiSettings,
-    validateLocalAiSettings
+    validateLocalAiSettings,
+    getAtemSettingsPath,
+    loadAtemSettings,
+    saveAtemSettings,
+    normalizeAtemSettings,
+    validateAtemSettings,
+    getVideohubSettingsPath,
+    loadVideohubSettings,
+    saveVideohubSettings,
+    normalizeVideohubSettings,
+    validateVideohubSettings,
+    getNovastarSettingsPath,
+    loadNovastarSettings,
+    saveNovastarSettings,
+    normalizeNovastarSettings,
+    validateNovastarSettings
 };

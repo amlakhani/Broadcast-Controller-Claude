@@ -10,6 +10,7 @@ import SabhaTimerGraphic from './graphics/SabhaTimerGraphic';
 import ParticlesGraphic from './graphics/ParticlesGraphic';
 import TranslationGraphic from './graphics/TranslationGraphic';
 import MediaMessageOverlayGraphic from './graphics/MediaMessageOverlayGraphic';
+import StageCanvas from './graphics/StageCanvas';
 
 const socket = io(socketOptions()); // Connects to the host automatically
 
@@ -115,7 +116,7 @@ export default function GraphicsApp() {
             {mode === 'stage' ? (
                 <StageDisplayGraphic socket={socket} windowMode={mode} />
             ) : (
-                <div className="absolute inset-0">
+                <StageCanvas>
                     <div style={layerStyle('presentation')}><PresentationGraphic socket={socket} windowMode={mode} /></div>
                     <div style={layerStyle('translation')}><TranslationGraphic socket={socket} windowMode={mode} /></div>
                     <div style={layerStyle('lowerThirds')}><LowerThirdsGraphic socket={socket} windowMode={mode} /></div>
@@ -124,7 +125,7 @@ export default function GraphicsApp() {
                     <div style={layerStyle('sabhaTimer')}><SabhaTimerGraphic socket={socket} windowMode={mode} /></div>
                     <div style={layerStyle('particles')}><ParticlesGraphic socket={socket} windowMode={mode} /></div>
                     <div style={layerStyle('mediaMessage')}><MediaMessageOverlayGraphic socket={socket} windowMode={mode} /></div>
-                </div>
+                </StageCanvas>
             )}
         </div>
     );

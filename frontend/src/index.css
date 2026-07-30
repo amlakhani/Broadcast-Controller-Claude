@@ -296,9 +296,12 @@
     backdrop-filter: none !important;
     border-radius: 0 !important;
     max-width: 100% !important;
-    width: 100vw !important;
-    padding-bottom: 8vh !important;
-    padding-top: 10vh !important;
+    /* Stage coordinates, not viewport: the graphics output composes inside a fixed
+       1920x1080 frame (see graphics/StageCanvas.jsx), so vw/vh here would track the
+       output window instead of the frame. 86.4px / 108px are 8% / 10% of 1080. */
+    width: 100% !important;
+    padding-bottom: 86.4px !important;
+    padding-top: 108px !important;
     background: transparent !important;
   }
 }

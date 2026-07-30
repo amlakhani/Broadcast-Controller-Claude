@@ -3,6 +3,7 @@ import gsap from 'gsap';
 import { useGSAP } from '@gsap/react';
 import { applyAnimationIn, applyAnimationOut } from './AnimationUtils';
 import { LAYER_Z } from './layerZ';
+import { STAGE_WIDTH } from './stage';
 
 const DEFAULT_DESIGN = {
     shapeStyle: 'glass-card',
@@ -329,8 +330,11 @@ export default function LowerThirdsGraphic({ socket, windowMode }) {
     const isFullWidth = isFullBand || isScrim;
     const safePanelWidth = Math.max(360, Math.min(Number(design.panelWidth) || DEFAULT_DESIGN.panelWidth, 1920));
     const panelFrameStyle = {
-        width: isFullWidth ? '100vw' : `${safePanelWidth}px`,
-        maxWidth: isFullWidth ? '100vw' : '1920px',
+        // Full-band/scrim span the whole frame. This has to be an explicit stage width, not
+        // a percentage: the panel's containing block is the shrink-to-fit flex row that holds
+        // the optional logo, so `100%` would resolve to the text width, not the frame.
+        width: isFullWidth ? `${STAGE_WIDTH}px` : `${safePanelWidth}px`,
+        maxWidth: isFullWidth ? `${STAGE_WIDTH}px` : '1920px',
         boxSizing: 'border-box',
         filter: panelShadow
     };
@@ -362,12 +366,12 @@ export default function LowerThirdsGraphic({ socket, windowMode }) {
         zIndex: LAYER_Z.lowerThirds,
         left: isFullWidth ? 0 : `${normalizedX}%`,
         bottom: isFullWidth ? 0 : `${normalizedY}%`,
-        width: isFullWidth ? '100vw' : 'auto',
+        width: isFullWidth ? '100%' : 'auto',
         justifyContent: isFullBand ? 'center' : 'flex-start',
         transform: isFullWidth ? 'none' : `translate(${-normalizedX}%, ${normalizedY}%)`,
         transformOrigin: normalizedX === 0 ? 'left bottom' : normalizedX === 100 ? 'right bottom' : 'center bottom',
-        maxWidth: '100vw',
-        maxHeight: '100vh'
+        maxWidth: '100%',
+        maxHeight: '100%'
     };
     const containerStyle = {
         gap: isBadge ? '0px' : '2rem'

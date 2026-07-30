@@ -77,11 +77,13 @@
     ],
     "asar": true,
     "asarUnpack": [
-      "**/node_modules/@stagetimerio/grandiose/dist/**"
+      "**/node_modules/@stagetimerio/grandiose/dist/**",
+      "**/node_modules/@julusian/freetype2/**"
     ]
   },
   "dependencies": {
     "@stagetimerio/grandiose": "^0.2.0",
+    "atem-connection": "^3.9.0",
     "express": "^4.19.0",
     "microsoft-cognitiveservices-speech-sdk": "^1.50.0",
     "socket.io": "^4.7.0",

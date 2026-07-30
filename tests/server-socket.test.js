@@ -180,6 +180,8 @@ afterEach(async () => {
         whisperModelPath: '',
         chunkSeconds: 5
     });
+    serverModule.saveAtemSettings({ address: '', port: 9910, autoConnect: false });
+    serverModule.saveVideohubSettings({ address: '', port: 9990, autoConnect: false });
 });
 
 after(async () => {
@@ -684,6 +686,172 @@ test('replays cached presentation, output mode, and layer visibility to new clie
     const replayedLayers = await replay.waits.layer_visibility_update;
     assert.equal(replayedLayers.media, false);
     assert.equal(replayedLayers.lyrics, false);
+});
+
+test('ATEM settings persist locally and validate the switcher address', async () => {
+    const local = await connectClient();
+    const saved = await emitWithAck(local, 'atem_settings_save', { address: '192.168.1.240', port: 9910 });
+
+    assert.equal(saved.ok, true);
+    assert.equal(saved.settings.address, '192.168.1.240');
+    assert.equal(path.dirname(serverModule.getAtemSettingsPath()), testDataDir);
+
+    const invalid = serverModule.validateAtemSettings({ address: '' });
+    assert.equal(invalid.ok, false);
+    assert.equal(invalid.errors.length, 1);
+
+    // An out-of-range port is auto-corrected back to 9910 rather than rejected —
+    // same "clamp, don't reject" treatment this file gives chunkSeconds elsewhere.
+    const oddPort = serverModule.validateAtemSettings({ address: '192.168.1.240', port: 99999 });
+    assert.equal(oddPort.ok, true);
+    assert.equal(oddPort.settings.port, 9910);
+
+    const badHost = serverModule.validateAtemSettings({ address: 'not a host!', port: 9910 });
+    assert.equal(badHost.checks.address, false);
+
+    const validHostname = serverModule.validateAtemSettings({ address: 'atem-switcher.local', port: 9910 });
+    assert.equal(validHostname.checks.address, true);
+});
+
+test('a remote operator cannot read or save ATEM settings', async () => {
+    // The switcher address is the LAN location of production hardware — same
+    // sensitivity class as local_ai_settings, which this mirrors.
+    await serverModule.setRemoteAccessEnabled(true);
+    const pair = await pairRemote({ code: serverModule.getRemoteStatus().pairingCode });
+    const remote = await connectRemote(pair.body.remoteToken);
+
+    const readForbidden = await emitWithAck(remote, 'atem_settings_request');
+    assert.equal(readForbidden.ok, false);
+
+    const saveForbidden = await emitWithAck(remote, 'atem_settings_save', { address: '10.0.0.1' });
+    assert.equal(saveForbidden.ok, false);
+});
+
+test('a saved ATEM connections list round-trips alongside the active address', async () => {
+    // connections/activeConnectionId are purely additive on top of the
+    // existing address/port/autoConnect shape — this is what proves it.
+    const local = await connectClient();
+    const withConnections = await emitWithAck(local, 'atem_settings_save', {
+        address: '192.168.1.240',
+        port: 9910,
+        connections: [
+            { id: 'venue-a', name: 'Main Sanctuary', address: '192.168.1.240', port: 9910 },
+            { id: 'venue-b', name: 'Overflow Room', address: '192.168.1.241', port: 9910 },
+        ],
+        activeConnectionId: 'venue-a',
+    });
+
+    assert.equal(withConnections.ok, true);
+    assert.equal(withConnections.settings.connections.length, 2);
+    assert.equal(withConnections.settings.connections[1].name, 'Overflow Room');
+    assert.equal(withConnections.settings.activeConnectionId, 'venue-a');
+
+    // atem_settings_request's handler takes a single (ack) param — like the
+    // real frontend's `socket.emit('atem_settings_request', () => {})`, this
+    // must emit with exactly one argument, not go through emitWithAck's
+    // (payload, ack) shape, or the ack callback lands in the wrong position
+    // and never fires.
+    const reloaded = await new Promise(resolve => local.emit('atem_settings_request', resolve));
+    assert.equal(reloaded.settings.connections.length, 2);
+    assert.equal(reloaded.settings.activeConnectionId, 'venue-a');
+});
+
+test('Videohub settings persist locally and validate the hub address', async () => {
+    const local = await connectClient();
+    const saved = await emitWithAck(local, 'videohub_settings_save', { address: '192.168.1.250', port: 9990 });
+
+    assert.equal(saved.ok, true);
+    assert.equal(saved.settings.address, '192.168.1.250');
+    assert.equal(path.dirname(serverModule.getVideohubSettingsPath()), testDataDir);
+
+    const invalid = serverModule.validateVideohubSettings({ address: '' });
+    assert.equal(invalid.ok, false);
+    assert.equal(invalid.errors.length, 1);
+
+    const oddPort = serverModule.validateVideohubSettings({ address: '192.168.1.250', port: 99999 });
+    assert.equal(oddPort.ok, true);
+    assert.equal(oddPort.settings.port, 9990);
+});
+
+test('a remote operator cannot read or save Videohub settings', async () => {
+    await serverModule.setRemoteAccessEnabled(true);
+    const pair = await pairRemote({ code: serverModule.getRemoteStatus().pairingCode });
+    const remote = await connectRemote(pair.body.remoteToken);
+
+    const readForbidden = await emitWithAck(remote, 'videohub_settings_request');
+    assert.equal(readForbidden.ok, false);
+
+    const saveForbidden = await emitWithAck(remote, 'videohub_settings_save', { address: '10.0.0.1' });
+    assert.equal(saveForbidden.ok, false);
+});
+
+test('NovaStar settings persist locally and validate address + pId', async () => {
+    const local = await connectClient();
+    const saved = await emitWithAck(local, 'novastar_settings_save', { address: '192.168.1.50', port: 80, pId: 'requestor-1', secretKey: 'shh' });
+
+    assert.equal(saved.ok, true);
+    assert.equal(saved.settings.address, '192.168.1.50');
+    assert.equal(saved.settings.pId, 'requestor-1');
+    assert.equal(saved.settings.secretKey, 'shh');
+    assert.equal(path.dirname(serverModule.getNovastarSettingsPath()), testDataDir);
+
+    const invalidAddress = serverModule.validateNovastarSettings({ address: '', pId: 'x' });
+    assert.equal(invalidAddress.ok, false);
+    assert.equal(invalidAddress.checks.pId, true);
+
+    const invalidPid = serverModule.validateNovastarSettings({ address: '192.168.1.50', pId: '' });
+    assert.equal(invalidPid.ok, false);
+    assert.equal(invalidPid.checks.address, true);
+
+    // secretKey is deliberately not required — the documented "disable
+    // encryption" signing mode doesn't use it, and some venues run the H5's
+    // OpenAPI access effectively open on an isolated LAN.
+    const blankSecretKey = serverModule.validateNovastarSettings({ address: '192.168.1.50', pId: 'x', secretKey: '' });
+    assert.equal(blankSecretKey.ok, true);
+
+    const oddPort = serverModule.validateNovastarSettings({ address: '192.168.1.50', pId: 'x', port: 99999 });
+    assert.equal(oddPort.ok, true);
+    assert.equal(oddPort.settings.port, 80);
+});
+
+test('a remote operator cannot read or save NovaStar settings', async () => {
+    await serverModule.setRemoteAccessEnabled(true);
+    const pair = await pairRemote({ code: serverModule.getRemoteStatus().pairingCode });
+    const remote = await connectRemote(pair.body.remoteToken);
+
+    const readForbidden = await emitWithAck(remote, 'novastar_settings_request');
+    assert.equal(readForbidden.ok, false);
+
+    const saveForbidden = await emitWithAck(remote, 'novastar_settings_save', { address: '10.0.0.1', pId: 'x' });
+    assert.equal(saveForbidden.ok, false);
+});
+
+test('a saved NovaStar connections list carries per-connection pId/secretKey/screenId', async () => {
+    const local = await connectClient();
+    const withConnections = await emitWithAck(local, 'novastar_settings_save', {
+        address: '192.168.1.50',
+        port: 80,
+        pId: 'requestor-1',
+        secretKey: 'shh',
+        connections: [
+            { id: 'wall-a', name: 'Main Wall', address: '192.168.1.50', port: 80, pId: 'requestor-1', secretKey: 'shh', screenId: 0 },
+            { id: 'wall-b', name: 'Lobby Wall', address: '192.168.1.51', port: 80, pId: 'requestor-2', secretKey: 'shh2', screenId: 1 },
+        ],
+        activeConnectionId: 'wall-a',
+    });
+
+    assert.equal(withConnections.ok, true);
+    assert.equal(withConnections.settings.connections.length, 2);
+    assert.equal(withConnections.settings.connections[1].name, 'Lobby Wall');
+    assert.equal(withConnections.settings.connections[1].pId, 'requestor-2');
+    assert.equal(withConnections.settings.connections[1].screenId, 1);
+    assert.equal(withConnections.settings.activeConnectionId, 'wall-a');
+
+    // novastar_settings_request's handler takes a single (ack) param — same
+    // ack-shape regression as atem_settings_request above.
+    const reloaded = await new Promise(resolve => local.emit('novastar_settings_request', resolve));
+    assert.equal(reloaded.settings.connections.length, 2);
+    assert.equal(reloaded.settings.connections[0].pId, 'requestor-1');
 });
 
 test('relays media controls and returns full media state on request', async () => {

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo, useReducer, useCallback } from 'react';
 import { io } from 'socket.io-client';
-import { ChevronLeft, ChevronRight, ClipboardList, Command, ExternalLink, Film, Languages, ListVideo, Monitor, MonitorCheck, Moon, Music, PanelLeftClose, PanelLeftOpen, Pause, Play, Presentation, Radio, RotateCcw, Search, Settings, Sun, Timer, Trash2, Type, X, Zap } from 'lucide-react';
+import { ChevronLeft, ChevronRight, ClipboardList, Command, ExternalLink, Film, Languages, LayoutGrid, ListVideo, Monitor, MonitorCheck, MonitorPlay, Moon, Music, PanelLeftClose, PanelLeftOpen, Pause, Play, Presentation, Radio, RotateCcw, Search, Settings, Sliders, Sun, Timer, Trash2, Type, Waypoints, X, Zap } from 'lucide-react';
 import { authUrl, getAuthToken, getRemoteToken, isRemoteEntry, socketOptions } from './auth';
 import { useThrottledCallback } from './utils/performance';
 
@@ -13,6 +13,10 @@ import MediaPanel from './components/MediaPanel';
 import StageDisplayPanel from './components/StageDisplayPanel';
 import TranslationPanel from './components/TranslationPanel';
 import BackstageCueSheetPanel from './components/BackstageCueSheetPanel';
+import SuperSourcePanel from './components/SuperSourcePanel';
+import VideohubPanel from './components/VideohubPanel';
+import AtemSwitcherPanel from './components/AtemSwitcherPanel';
+import NovaStarPanel from './components/NovaStarPanel';
 import RemotePairing from './components/RemotePairing';
 import RemoteQr from './components/RemoteQr';
 
@@ -77,6 +81,18 @@ const TAB_GROUPS = [
     tabs: [
       { id: 'stage', label: 'Confidence Monitor', cue: 'Stage', icon: MonitorCheck },
       { id: 'backstage', label: 'Backstage Monitor', cue: 'Rundown', icon: ClipboardList },
+    ],
+  },
+  {
+    // localOnly: these pages drive physical hardware, so a remote-paired phone
+    // never sees them. The filter lives in visibleTabGroups below.
+    label: 'Device Controls',
+    localOnly: true,
+    tabs: [
+      { id: 'supersource', label: 'SuperSource Designer', cue: 'ATEM PiP', icon: LayoutGrid },
+      { id: 'videohub', label: 'Blackmagic Hub Control', cue: 'Videohub Router', icon: Waypoints },
+      { id: 'atemswitcher', label: 'Constellation Router', cue: 'Program / Preview / Router', icon: Sliders },
+      { id: 'novastar', label: 'NovaStar Processor', cue: 'NovaStar Processor Controller', icon: MonitorPlay },
     ],
   },
 ];
@@ -687,7 +703,9 @@ function App() {
     Object.values(liveState).filter(Boolean).length + (isGraphicsOpen ? 1 : 0) + (isStageOpen ? 1 : 0) + (ndiStatus.enabled ? 1 : 0)
   ), [liveState, isGraphicsOpen, isStageOpen, ndiStatus.enabled]);
 
-  const visibleTabGroups = TAB_GROUPS;
+  const visibleTabGroups = useMemo(() => (
+    isRemoteClient ? TAB_GROUPS.filter(group => !group.localOnly) : TAB_GROUPS
+  ), [isRemoteClient]);
   const visibleTabs = useMemo(() => (
     visibleTabGroups.flatMap(group => group.tabs.map(tab => ({ ...tab, group: group.label })))
   ), [visibleTabGroups]);
@@ -1358,6 +1376,26 @@ function App() {
               />
             </div>
             <div style={{ display: activeTab === 'translation' ? 'block' : 'none' }}><TranslationPanel socket={socket} /></div>
+            {!isRemoteClient && (
+              <div style={{ display: activeTab === 'supersource' ? 'block' : 'none' }}>
+                <SuperSourcePanel socket={socket} isActive={activeTab === 'supersource'} />
+              </div>
+            )}
+            {!isRemoteClient && (
+              <div style={{ display: activeTab === 'videohub' ? 'block' : 'none' }}>
+                <VideohubPanel socket={socket} isActive={activeTab === 'videohub'} />
+              </div>
+            )}
+            {!isRemoteClient && (
+              <div style={{ display: activeTab === 'atemswitcher' ? 'block' : 'none' }}>
+                <AtemSwitcherPanel socket={socket} isActive={activeTab === 'atemswitcher'} />
+              </div>
+            )}
+            {!isRemoteClient && (
+              <div style={{ display: activeTab === 'novastar' ? 'block' : 'none' }}>
+                <NovaStarPanel socket={socket} isActive={activeTab === 'novastar'} />
+              </div>
+            )}
 
             {/* Bottom Preview - ONLY RENDER IF NOT DESKTOP */}
             {!isRemoteClient && !isDesktop && (
