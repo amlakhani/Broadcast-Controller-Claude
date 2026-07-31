@@ -202,12 +202,14 @@ Clicking the **Settings** gear icon unlocks full control over how the system beh
 ![Settings screen](user-guide-assets/10-settings.png)
 
 ### Remote Operator Mode
-Want to control lyrics from a tablet on stage, or have a second person manage lower thirds from a laptop in the crowd?
-1. Enable **Remote Operators** in settings.
-2. The app will generate a **6-digit pairing code** and display a URL (e.g., `http://192.168.1.50:3000/remote`).
-3. Open that URL on the remote device (tablet, phone, or laptop) connected to the same local Wi-Fi network.
-4. Enter the 6-digit code.
-5. Once authorized, the remote device will load a mobile-friendly control interface. You can revoke remote connections or rotate the pairing code at any time for security.
+Want to control lyrics from a tablet on stage, hand a presenter a slide clicker, or give a roaming operator a big-button panel for safety and cues?
+1. Enable **Remote Operators** in settings. The app generates a **6-digit pairing code** that rotates every 30 seconds, plus a QR code and URL for each of three surfaces.
+2. Scan the QR on the device (tablet, phone, or laptop, connected to the same local Wi-Fi network) — it pairs automatically. Or open the URL manually and type in the 6-digit code.
+3. Pick the surface that fits the job:
+   - **Remote Controller** (`/remote`) — the same full workspace as the desktop app, just re-served to a browser.
+   - **Slides Remote** (`/slides`) — a one-handed slide clicker with live/previous/next previews, for a presenter who only needs to advance their own deck.
+   - **Control Pad** (`/pad`) — a configurable grid of large touch buttons: Clear All and Blackout (both require a **press-and-hold** so a pocket bump can't trigger them), slide navigation, the eight layer mutes, media transport, timers and messages, and firing a named cue from the Run of Show by tapping it in a list. Lay the button grid out yourself on the desktop's **Pad Layout** tab — pick an action, a color, an icon, and whether it needs a hold — and every paired pad updates within about a second.
+4. You can revoke remote connections or rotate the pairing code at any time for security.
 
 ### NDI Output
 For streaming operators using OBS Studio, vMix, or Wirecast:

@@ -412,6 +412,7 @@ function getRemoteStatus() {
         pairingCodeExpiresAt: remoteAccessEnabled ? remotePairingCodeIssuedAt + PAIRING_CODE_ROTATE_MS : 0,
         lanUrls: reachable ? [`http://${activeAddress}:${port}/remote`] : [],
         slidesUrls: reachable ? [`http://${activeAddress}:${port}/slides`] : [],
+        padUrls: reachable ? [`http://${activeAddress}:${port}/pad`] : [],
         networks: getNetworkAdapters(),
         selectedNetwork: loadRemoteNetworkSelection(),
         activeAddress,
@@ -1020,6 +1021,14 @@ app.get('/slides', (req, res) => {
 
 app.get('/remote/slides', (req, res) => res.redirect('/slides'));
 
+// Tactile control pad (iPad). Single path segment for the same asset-resolution
+// reason as /slides above.
+app.get('/pad', (req, res) => {
+    sendRemoteHtml(res, 'pad.html');
+});
+
+app.get('/remote/pad', (req, res) => res.redirect('/pad'));
+
 app.get('/api/remote/status', (req, res) => {
     if (isValidAuthToken(getRequestToken(req))) {
         return res.json(getRemoteStatus());
@@ -1522,6 +1531,10 @@ const EMPTY_PRESENTATION_STATE = {
 
 let currentPresState = null;
 let currentPresLibrary = [];
+// Control Pad (/pad): the desktop owns both of these and publishes them; the server
+// only caches them so a tablet that connects later has something to render.
+let currentPadLayout = null;
+let currentPadRundown = [];
 let currentStagePresToggle = false;
 let currentStageTimerState = null;
 let currentStageMessage = null;
@@ -1645,6 +1658,83 @@ function normalizeMediaMessageOverlay(data = {}, existing = currentMediaMessageO
         uppercase: Boolean(data.uppercase),
         backdrop: data.backdrop !== undefined ? Boolean(data.backdrop) : existing.backdrop !== false
     };
+}
+
+// --- Control Pad (/pad) -----------------------------------------------------
+// The pad layout and rundown are authored on the desktop. The server never
+// interprets them — it clamps the structure so a malformed or oversized publish
+// can't be cached or fanned out, and leaves the meaning to padModel.js.
+
+const PAD_COMMAND_TYPES = new Set(['cue_fire', 'cue_status', 'translation_start']);
+const PAD_CUE_STATUSES = new Set(['pending', 'armed', 'fired', 'skipped', 'done']);
+const PAD_COL_CHOICES = [4, 5, 6];
+const MAX_PAD_PAGES = 6;
+const MAX_PAD_BUTTONS = 48;
+const MAX_PAD_CUES = 200;
+
+function padString(value, max, fallback = '') {
+    return typeof value === 'string' ? value.slice(0, max) : fallback;
+}
+
+function normalizePadLayout(data = {}) {
+    const pages = Array.isArray(data?.pages) ? data.pages : [];
+    return {
+        version: 1,
+        updatedAt: Date.now(),
+        pages: pages.slice(0, MAX_PAD_PAGES).map((page, i) => {
+            const source = page && typeof page === 'object' ? page : {};
+            const buttons = Array.isArray(source.buttons) ? source.buttons : [];
+            return {
+                id: padString(source.id, 64) || `page-${i}`,
+                name: padString(source.name, 24) || `Page ${i + 1}`,
+                cols: PAD_COL_CHOICES.includes(Number(source.cols)) ? Number(source.cols) : 5,
+                buttons: buttons.slice(0, MAX_PAD_BUTTONS).map((button, j) => {
+                    const b = button && typeof button === 'object' ? button : {};
+                    const action = b.action && typeof b.action === 'object' ? b.action : {};
+                    return {
+                        id: padString(b.id, 64) || `btn-${i}-${j}`,
+                        label: padString(b.label, 20),
+                        sub: padString(b.sub, 20),
+                        icon: padString(b.icon, 32, 'none'),
+                        color: padString(b.color, 16, 'slate'),
+                        wide: Boolean(b.wide),
+                        hold: Boolean(b.hold),
+                        action: {
+                            kind: ['emit', 'command', 'none'].includes(action.kind) ? action.kind : 'none',
+                            id: padString(action.id, 48),
+                            payload: action.payload && typeof action.payload === 'object' && !Array.isArray(action.payload)
+                                ? action.payload
+                                : {}
+                        }
+                    };
+                })
+            };
+        })
+    };
+}
+
+// Display-only. Cue action payloads are deliberately never mirrored here: they
+// carry local file paths and lyric text, and the pad has no use for them.
+function normalizePadRundown(list) {
+    return (Array.isArray(list) ? list : []).slice(0, MAX_PAD_CUES).map((cue = {}) => {
+        const source = cue && typeof cue === 'object' ? cue : {};
+        return {
+            id: padString(source.id, 64),
+            title: padString(source.title, 80) || 'Cue',
+            status: PAD_CUE_STATUSES.has(source.status) ? source.status : 'pending',
+            types: (Array.isArray(source.types) ? source.types : [])
+                .slice(0, 6)
+                .map(type => padString(String(type), 24))
+        };
+    }).filter(cue => cue.id);
+}
+
+function countLocalSockets() {
+    let count = 0;
+    for (const client of io.sockets.sockets.values()) {
+        if (isLocalSocket(client)) count += 1;
+    }
+    return count;
 }
 
 function getOperatorState() {
@@ -1791,6 +1881,8 @@ function resetServerStateForTests() {
     previousPairingCodeExpiresAt = 0;
     currentPresState = null;
     currentPresLibrary = [];
+    currentPadLayout = null;
+    currentPadRundown = [];
     currentStagePresToggle = false;
     currentStageTimerState = null;
     currentStageMessage = null;
@@ -1970,6 +2062,8 @@ io.on('connection', (socket) => {
     if (currentPresState) socket.emit('pres_update', currentPresState);
     emitPresMeta(socket);
     if (currentPresLibrary.length) socket.emit('pres_library_update', currentPresLibrary);
+    if (currentPadLayout) socket.emit('pad_layout_update', currentPadLayout);
+    if (currentPadRundown.length) socket.emit('pad_rundown_update', currentPadRundown);
     socket.emit('stage_pres_toggle_update', currentStagePresToggle);
     
     if (currentStageTimerState) {
@@ -2488,6 +2582,62 @@ io.on('connection', (socket) => {
     socket.on('pres_library_update', (library) => {
         currentPresLibrary = Array.isArray(library) ? library : [];
         socket.broadcast.emit('pres_library_update', currentPresLibrary);
+    });
+
+    // --- Control Pad (/pad) -------------------------------------------------
+    // Both publishes are local-only. The /remote full controller mounts the same
+    // panels against its *own* localStorage, so without this gate a paired laptop
+    // would overwrite the pad layout and rundown the tablets are working from.
+    onLocalSocket(socket, 'pad_layout_update', (layout, ack) => {
+        currentPadLayout = normalizePadLayout(layout);
+        io.emit('pad_layout_update', currentPadLayout);
+        sendSocketResult(ack, { ok: true });
+    });
+
+    onLocalSocket(socket, 'pad_rundown_update', (cues, ack) => {
+        currentPadRundown = normalizePadRundown(cues);
+        // Fanned out to everyone, unlike pres_library_update: the desktop's own
+        // post-fire status change is exactly what the pad needs to see.
+        io.emit('pad_rundown_update', currentPadRundown);
+        sendSocketResult(ack, { ok: true });
+    });
+
+    // Relay for the few things a tablet cannot do itself. Firing a cue has to run
+    // on the desktop: only it can reach the blackout handler, the renderer's
+    // microphone, and local media paths (normalizeLocalMediaPayload rejects an
+    // unregistered path from a remote socket).
+    socket.on('pad_command', (payload, ack) => {
+        const type = typeof payload?.type === 'string' ? payload.type : '';
+        if (!PAD_COMMAND_TYPES.has(type)) {
+            sendSocketResult(ack, { ok: false, error: 'Unknown pad command.' });
+            return;
+        }
+
+        const body = payload?.payload && typeof payload.payload === 'object' ? payload.payload : {};
+        const cueId = padString(body.cueId, 64);
+
+        if (type === 'cue_status' && !PAD_CUE_STATUSES.has(body.status)) {
+            sendSocketResult(ack, { ok: false, error: 'Unknown cue status.' });
+            return;
+        }
+        // An empty cueId means "fire the next pending cue", which the desktop
+        // resolves. A named cue that is no longer in the rundown is a stale pad.
+        if (cueId && currentPadRundown.length && !currentPadRundown.some(cue => cue.id === cueId)) {
+            sendSocketResult(ack, { ok: false, error: 'That cue no longer exists.' });
+            return;
+        }
+
+        const delivered = countLocalSockets();
+        if (!delivered) {
+            sendSocketResult(ack, { ok: false, error: 'The main controller is not connected.' });
+            return;
+        }
+
+        const relayed = { type, payload: { ...body, cueId } };
+        for (const client of io.sockets.sockets.values()) {
+            if (isLocalSocket(client)) client.emit('pad_command', relayed);
+        }
+        sendSocketResult(ack, { ok: true, delivered });
     });
 
     socket.on('start_translation', (config) => {

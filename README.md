@@ -19,7 +19,7 @@ Broadcast Controller is a cross‑platform desktop app (macOS & Windows) that ac
 - **Real‑time AI translation & captions** — Azure Speech, Soniox, or fully offline Local AI.
 - **Confidence & Backstage monitors** — timers, speaker prompts, rundown, and private backstage messaging.
 - **NDI output** — low‑latency network video (full graphics, or an individual layer) with preserved alpha for downstream keying.
-- **Remote operators** — pair a tablet/phone/laptop over LAN to control layers from the floor.
+- **Remote operators** — pair a tablet/phone/laptop over LAN to control layers from the floor, including a configurable tactile **Control Pad** for roaming operators.
 - **GPU‑accelerated** — opaque, non‑throttled output windows use the hardware video fast path; particle overlays render on the GPU via WebGL2 in an OffscreenCanvas worker.
 - **Collapsible icon sidebar**, command palette (`⌘K`), light/dark themes, and a built‑in Live Preview.
 
@@ -155,7 +155,10 @@ The **Confidence Monitor** shows the speaker timers, prompts, and what's next. T
 ## 🔌 NDI, Remote & Output Modes
 
 - **NDI output** — Settings → enable NDI, choose the source (full Graphics or a single layer). In OBS/vMix, add an **NDI Source** named `Broadcast Controller Graphics`. Alpha is preserved for clean keying.
-- **Remote operators** — Settings → enable Remote Operators to get a pairing code + LAN URL; open it on a device on the same Wi‑Fi and enter the code for a mobile control surface.
+- **Remote operators** — Settings → enable Remote Operators to get a pairing code and a QR for each of three surfaces. Scanning a QR pairs automatically (the code rotates every 30 seconds):
+  - **Remote Controller** (`/remote`) — the full desktop workspace, re-served to a browser.
+  - **Slides Remote** (`/slides`) — a one-handed slide clicker for a presenter, with live/prev/next previews.
+  - **Control Pad** (`/pad`) — a configurable grid of large tactile buttons for a roaming operator: safety (Clear All, Blackout — both hold‑to‑fire), slide navigation, the 8 layer mutes, media transport, timers, messages, and firing Run of Show cues by name. Lay the grid out on desktop under **Pad Layout** (a `localOnly` tab, so remote-paired devices never see the editor); it syncs live to every paired pad.
 - **Output background** — green (chroma key, default), black, or transparent. For a physical projector/HDMI keyer, green is standard; for software/NDI keying use transparent or black.
 
 ---

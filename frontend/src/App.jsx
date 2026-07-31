@@ -1,10 +1,11 @@
 import { useState, useEffect, useRef, useMemo, useReducer, useCallback } from 'react';
 import { io } from 'socket.io-client';
-import { ChevronLeft, ChevronRight, ClipboardList, Command, ExternalLink, Film, Languages, LayoutGrid, ListVideo, Monitor, MonitorCheck, Moon, Music, PanelLeftClose, PanelLeftOpen, Pause, Play, Presentation, Radio, RotateCcw, Search, Settings, Sun, Timer, Trash2, Type, X, Zap } from 'lucide-react';
+import { ChevronLeft, ChevronRight, ClipboardList, Command, ExternalLink, Film, Grid3x3, Languages, LayoutGrid, ListVideo, Monitor, MonitorCheck, Moon, Music, PanelLeftClose, PanelLeftOpen, Pause, Play, Presentation, Radio, RotateCcw, Search, Settings, Sun, Timer, Trash2, Type, X, Zap } from 'lucide-react';
 import { authUrl, getAuthToken, getRemoteToken, isRemoteEntry, socketOptions } from './auth';
 import { useThrottledCallback } from './utils/performance';
 
 import RunOfShowPanel from './components/RunOfShowPanel';
+import PadLayoutPanel from './components/PadLayoutPanel';
 import LowerThirdsPanel from './components/LowerThirdsPanel';
 import LyricsPanel from './components/LyricsPanel';
 import SabhaPanel from './components/SabhaPanel';
@@ -87,6 +88,16 @@ const TAB_GROUPS = [
     localOnly: true,
     tabs: [
       { id: 'supersource', label: 'SuperSource Designer', cue: 'ATEM PiP', icon: LayoutGrid },
+    ],
+  },
+  {
+    // Also localOnly: the server only accepts a pad layout from the main
+    // controller, so showing a remote operator an editor whose saves get
+    // rejected would just be confusing.
+    label: 'Remote Pad',
+    localOnly: true,
+    tabs: [
+      { id: 'pad', label: 'Pad Layout', cue: 'Button Grid', icon: Grid3x3 },
     ],
   },
 ];
@@ -974,6 +985,7 @@ function App() {
                 onNavigate={setActiveTab}
                 onBlackout={handleBlackout}
                 onShowTimer={handleShowTimer}
+                isRemoteClient={isRemoteClient}
               />
             </div>
             <div style={{ display: activeTab === 'settings' ? 'block' : 'none' }}>
@@ -1137,10 +1149,30 @@ function App() {
                               </div>
                             ))}
                           </div>
-                          <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
-                            Scanning pairs automatically. The code changes every 30 seconds.
-                          </p>
                         </>
+                      ) : null}
+                      {remoteAccessStatus?.enabled && remoteAccessStatus?.padUrls?.length ? (
+                        <>
+                          <div className="mt-3 text-[10px] font-bold uppercase tracking-wider text-slate-500">Control Pad (iPad)</div>
+                          <div className="mt-2 space-y-1">
+                            {remoteAccessStatus.padUrls.map(url => (
+                              <div key={url} className="surface flex items-center gap-3 rounded-md px-3 py-2">
+                                <span className="min-w-0 flex-1 break-all text-xs font-bold text-violet-600 dark:text-violet-400">{url}</span>
+                                <RemoteQr
+                                  url={url}
+                                  code={remoteAccessStatus.pairingCode}
+                                  expiresAt={remoteAccessStatus.pairingCodeExpiresAt}
+                                  label="Control Pad"
+                                />
+                              </div>
+                            ))}
+                          </div>
+                        </>
+                      ) : null}
+                      {remoteAccessStatus?.enabled && remoteAccessStatus?.slidesUrls?.length ? (
+                        <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+                          Scanning pairs automatically. The code changes every 30 seconds.
+                        </p>
                       ) : null}
                     </div>
                     <div className="surface-muted rounded-lg p-3 text-center">
@@ -1352,6 +1384,13 @@ function App() {
               </div>
             </div>
 
+            {/* Mounted even when hidden, like every other panel — that is what keeps
+                the layout publishing to paired pads without visiting this tab. */}
+            {!isRemoteClient && (
+              <div style={{ display: activeTab === 'pad' ? 'block' : 'none' }}>
+                <PadLayoutPanel socket={socket} isRemoteClient={isRemoteClient} />
+              </div>
+            )}
             <div style={{ display: activeTab === 'sabha' ? 'block' : 'none' }}><SabhaPanel socket={socket} /></div>
             <div style={{ display: activeTab === 'pres' ? 'block' : 'none' }}><PresentationPanel socket={socket} isActive={activeTab === 'pres'} /></div>
             <div style={{ display: activeTab === 'lyrics' ? 'block' : 'none' }}><LyricsPanel socket={socket} /></div>

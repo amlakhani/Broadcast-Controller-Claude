@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { io as createClient } from '../frontend/node_modules/socket.io-client/build/esm/index.js';
+import { PAD_EMIT_ACTIONS } from '../frontend/src/components/padModel.js';
 
 process.env.BROADCAST_CONTROLLER_AUTOSTART = '0';
 
@@ -1381,4 +1382,238 @@ test('translation worker failure and cancellation emit final error status', asyn
     assert.equal((await canceledSeen).error, 'Network dropped');
     assert.equal((await canceledStatusSeen).state, 'error');
     assert.equal(workers[1].killed, true);
+});
+
+// ---------------------------------------------------------------------------
+// Control Pad (/pad)
+// ---------------------------------------------------------------------------
+
+// Every new pad handler is (payload, ack). A single-param (ack) handler would bind
+// the payload to `ack` and emitWithAck below would hang until the test timeout.
+
+// Enabling remote access rebinds the listener and calls io.disconnectSockets(), so
+// any test that needs a surviving local socket must enable it *before* connecting.
+// Re-enabling when already enabled is a no-op, so this stays safe to call again.
+async function enableRemoteAccess() {
+    await serverModule.setRemoteAccessEnabled(true);
+}
+
+async function pairedRemote() {
+    await enableRemoteAccess();
+    const { body } = await pairRemote({ code: serverModule.getRemoteStatus().pairingCode });
+    return connectRemote(body.remoteToken);
+}
+
+test('the pad route is advertised only while remote access is reachable', async () => {
+    assert.deepEqual(serverModule.getRemoteStatus().padUrls, []);
+
+    await serverModule.setRemoteAccessEnabled(true);
+    const status = serverModule.getRemoteStatus();
+    if (status.activeAddress) {
+        assert.equal(status.padUrls.length, 1);
+        // The pad must stay one path segment deep or the built HTML's relative
+        // "./assets/..." references resolve to the wrong place.
+        assert.equal(new URL(status.padUrls[0]).pathname, '/pad');
+    }
+});
+
+test('remotes cannot publish the pad layout or rundown', async () => {
+    const remote = await pairedRemote();
+
+    const forbidden = waitFor(remote, 'action_forbidden');
+    const layoutAck = await emitWithAck(remote, 'pad_layout_update', { pages: [{ name: 'Hijack', buttons: [] }] });
+    assert.equal(layoutAck.ok, false);
+    assert.match((await forbidden).error, /main controller/i);
+
+    const rundownAck = await emitWithAck(remote, 'pad_rundown_update', [{ id: 'x', title: 'Hijack' }]);
+    assert.equal(rundownAck.ok, false);
+
+    // Nothing was cached, so a later command finds an empty rundown to check against.
+    const local = await connectClient();
+    const relayed = waitFor(local, 'pad_command');
+    const ack = await emitWithAck(remote, 'pad_command', { type: 'cue_fire', payload: { cueId: 'x' } });
+    assert.equal(ack.ok, true, 'an empty cache must not reject cue ids');
+    await relayed;
+});
+
+test('the pad layout is clamped, cached, broadcast and replayed on connect', async () => {
+    const local = await connectClient();
+    const broadcast = waitFor(local, 'pad_layout_update');
+
+    const ack = await emitWithAck(local, 'pad_layout_update', {
+        pages: Array.from({ length: 20 }, () => ({
+            name: 'x'.repeat(200),
+            cols: 99,
+            buttons: Array.from({ length: 200 }, () => ({
+                label: 'y'.repeat(200),
+                sub: 'z'.repeat(200),
+                action: { kind: 'nonsense', id: 'a'.repeat(200), payload: [1, 2] }
+            }))
+        }))
+    });
+    assert.equal(ack.ok, true);
+
+    const layout = await broadcast;
+    assert.equal(layout.pages.length, 6);
+    assert.equal(layout.pages[0].name.length, 24);
+    assert.equal(layout.pages[0].cols, 5);
+    assert.equal(layout.pages[0].buttons.length, 48);
+    assert.equal(layout.pages[0].buttons[0].label.length, 20);
+    assert.equal(layout.pages[0].buttons[0].sub.length, 20);
+    assert.equal(layout.pages[0].buttons[0].action.kind, 'none');
+    assert.equal(layout.pages[0].buttons[0].action.id.length, 48);
+    assert.deepEqual(layout.pages[0].buttons[0].action.payload, {});
+
+    const { waits } = await connectClientWithReplay(['pad_layout_update']);
+    assert.deepEqual(await waits.pad_layout_update, layout);
+});
+
+test('the pad rundown is trimmed, and entries without an id are dropped', async () => {
+    const local = await connectClient();
+    const broadcast = waitFor(local, 'pad_rundown_update');
+
+    await emitWithAck(local, 'pad_rundown_update', [
+        { id: 'cue-1', title: 't'.repeat(200), status: 'fired', types: ['media', 'lyrics', 'a', 'b', 'c', 'd', 'e'] },
+        { id: '', title: 'No id' },
+        { title: 'Also no id' },
+        { id: 'cue-2', status: 'bogus' },
+        ...Array.from({ length: 400 }, (_, i) => ({ id: `bulk-${i}`, title: 'Bulk' }))
+    ]);
+
+    const rundown = await broadcast;
+    assert.equal(rundown[0].id, 'cue-1');
+    assert.equal(rundown[0].title.length, 80);
+    assert.equal(rundown[0].status, 'fired');
+    assert.equal(rundown[0].types.length, 6);
+    assert.equal(rundown[1].id, 'cue-2');
+    assert.equal(rundown[1].title, 'Cue');
+    assert.equal(rundown[1].status, 'pending');
+    // 200 entries are taken first, then the id-less ones dropped — the cap bounds
+    // the work done regardless of how much junk was sent.
+    assert.equal(rundown.length, 198);
+    assert.ok(rundown.every(cue => cue.id), 'entries without an id must be dropped');
+    // Cue action payloads carry local file paths and lyric text; they must never
+    // reach a tablet.
+    assert.ok(rundown.every(cue => !('payload' in cue) && !('actions' in cue)));
+});
+
+test('pad_command relays to the main controller only and never echoes to remotes', async () => {
+    await enableRemoteAccess();
+    const local = await connectClient();
+    await emitWithAck(local, 'pad_rundown_update', [{ id: 'cue-1', title: 'Opening', status: 'pending' }]);
+
+    const remote = await pairedRemote();
+    const other = await pairedRemote();
+
+    const relayed = waitFor(local, 'pad_command');
+    const echoedToSender = waitFor(remote, 'pad_command', { timeout: 250 }).then(() => 'echoed', () => 'silent');
+    const echoedToOther = waitFor(other, 'pad_command', { timeout: 250 }).then(() => 'echoed', () => 'silent');
+
+    const ack = await emitWithAck(remote, 'pad_command', { type: 'cue_fire', payload: { cueId: 'cue-1' } });
+    assert.equal(ack.ok, true);
+    assert.equal(ack.delivered, 1);
+
+    const command = await relayed;
+    assert.equal(command.type, 'cue_fire');
+    assert.equal(command.payload.cueId, 'cue-1');
+
+    assert.equal(await echoedToSender, 'silent');
+    assert.equal(await echoedToOther, 'silent');
+});
+
+test('pad_command with no cue id is relayed so the desktop can fire the next pending cue', async () => {
+    await enableRemoteAccess();
+    const local = await connectClient();
+    await emitWithAck(local, 'pad_rundown_update', [{ id: 'cue-1', title: 'Opening' }]);
+    const remote = await pairedRemote();
+
+    const relayed = waitFor(local, 'pad_command');
+    const ack = await emitWithAck(remote, 'pad_command', { type: 'cue_fire', payload: {} });
+    assert.equal(ack.ok, true);
+    assert.equal((await relayed).payload.cueId, '');
+});
+
+test('pad_command rejects unknown types, unknown statuses and stale cue ids', async () => {
+    await enableRemoteAccess();
+    const local = await connectClient();
+    await emitWithAck(local, 'pad_rundown_update', [{ id: 'cue-1', title: 'Opening' }]);
+    const remote = await pairedRemote();
+
+    const never = waitFor(local, 'pad_command', { timeout: 250 }).then(() => 'relayed', () => 'silent');
+
+    assert.match((await emitWithAck(remote, 'pad_command', { type: 'drop_database' })).error, /unknown pad command/i);
+    assert.match((await emitWithAck(remote, 'pad_command', {})).error, /unknown pad command/i);
+    assert.match(
+        (await emitWithAck(remote, 'pad_command', { type: 'cue_status', payload: { cueId: 'cue-1', status: 'exploded' } })).error,
+        /unknown cue status/i
+    );
+    assert.match(
+        (await emitWithAck(remote, 'pad_command', { type: 'cue_fire', payload: { cueId: 'cue-deleted' } })).error,
+        /no longer exists/i
+    );
+
+    assert.equal(await never, 'silent', 'a rejected command must not reach the controller');
+});
+
+test('pad_command fails cleanly when the main controller is not connected', async () => {
+    const remote = await pairedRemote();
+    const ack = await emitWithAck(remote, 'pad_command', { type: 'cue_fire', payload: {} });
+    assert.equal(ack.ok, false);
+    assert.match(ack.error, /not connected/i);
+});
+
+test('every pad emit action targets an event the server actually handles', async () => {
+    // The regression net for the stop_media/media_stop class of bug: an action
+    // pointing at an outbound broadcast name is a silent no-op at runtime, and
+    // this is the only place that failure becomes visible.
+    await connectClient();
+    const handled = new Set(
+        [...serverModule.io.sockets.sockets.values()].flatMap(socket => socket.eventNames())
+    );
+
+    const events = new Set();
+    for (const def of Object.values(PAD_EMIT_ACTIONS)) {
+        if (def.steps) for (const step of def.steps) events.add(step.event);
+        else events.add(def.event);
+    }
+    assert.ok(events.size > 20, 'the action table should cover a real control surface');
+
+    for (const event of events) {
+        assert.ok(handled.has(event), `the server has no handler for "${event}"`);
+    }
+});
+
+test('a remote can drive the pad control surface end to end', async () => {
+    await enableRemoteAccess();
+    const local = await connectClient();
+    const remote = await pairedRemote();
+
+    // Layer mute.
+    const layers = waitFor(local, 'layer_visibility_update');
+    remote.emit('layer_visibility_update', { lyrics: false });
+    assert.equal((await layers).lyrics, false);
+
+    // Slide navigation, server-authoritative.
+    local.emit('pres_update', {
+        mode: 'url', baseUrl: 'https://example.test/slide=', slideId: 'deck',
+        currentIdx: 0, totalSlides: 3, images: [], isCanva: false, showing: false
+    });
+    const meta = waitFor(remote, 'pres_meta', { predicate: data => data.currentIdx === 1 });
+    remote.emit('pres_goto', { direction: 'next' });
+    assert.equal((await meta).currentIdx, 1);
+
+    // Slides live toggle.
+    const showing = waitFor(remote, 'pres_meta', { predicate: data => data.showing === true });
+    remote.emit('pres_set_showing', true);
+    assert.equal((await showing).showing, true);
+
+    // Media transport reaches the graphics layer.
+    const seek = waitFor(local, 'media_seek');
+    remote.emit('media_seek', 42);
+    assert.equal(await seek, 42);
+
+    // Show safety.
+    const cleared = waitFor(local, 'pres_update', { predicate: data => data.mode === 'none' });
+    remote.emit('clear_all');
+    assert.equal((await cleared).mode, 'none');
 });

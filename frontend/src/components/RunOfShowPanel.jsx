@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDown, ArrowUp, Check, CopyPlus, ExternalLink, Film, Image as ImageIcon, Layers, ListChecks, Play, Plus, RefreshCw, Save, SkipForward, Trash2, Upload } from 'lucide-react';
 import { deferUntilIdle, readLocalStorageArraySafe, readLocalStorageObjectSafe, useDebouncedLocalStorageEffect } from '../utils/performance';
 import { DEFAULT_GUJ_FONT } from '../utils/lyricsFonts';
@@ -111,7 +111,17 @@ function parseMediaItem(value) {
     }
 }
 
-export default function RunOfShowPanel({ socket, onNavigate, onBlackout }) {
+// Display-only projection for the Control Pad. Action payloads are deliberately
+// dropped: they carry local file paths and lyric text, and a tablet has no use for
+// them — it fires cues by id and lets this panel do the work.
+const trimCueForPad = (cue) => ({
+    id: cue.id,
+    title: String(cue.title || '').slice(0, 80),
+    status: cue.status,
+    types: cue.actions.map(action => action.type).slice(0, 6)
+});
+
+export default function RunOfShowPanel({ socket, onNavigate, onBlackout, isRemoteClient = false }) {
     const [cues, setCues] = useState([]);
     const [selectedId, setSelectedId] = useState(() => cues[0]?.id || null);
     const [selectedActionId, setSelectedActionId] = useState(null);
@@ -350,6 +360,53 @@ export default function RunOfShowPanel({ socket, onNavigate, onBlackout }) {
             }
         }
     };
+
+    // --- Control Pad bridge -------------------------------------------------
+    // fireCue and setStatus are rebuilt every render and close over `cues`. A
+    // socket listener registered once would capture the first render's empty cue
+    // list and silently never fire anything, so everything below goes through refs.
+    const cuesRef = useRef(cues);
+    const fireCueRef = useRef(null);
+    const setStatusRef = useRef(null);
+    cuesRef.current = cues;
+    fireCueRef.current = fireCue;
+    setStatusRef.current = setStatus;
+
+    // Publish a display-only copy of the rundown for the pad. Debounced because
+    // `cues` changes on every keystroke in the title and notes fields.
+    useEffect(() => {
+        if (!socket || isRemoteClient) return;
+        const publish = () => socket.emit('pad_rundown_update', cuesRef.current.map(trimCueForPad));
+        const timer = setTimeout(publish, 300);
+        socket.on('connect', publish);
+        return () => {
+            clearTimeout(timer);
+            socket.off('connect', publish);
+        };
+    }, [socket, cues, isRemoteClient]);
+
+    // The server relays pad commands to local sockets only, so this panel is the
+    // one place cues ever fire — reusing fireCue means the pad gets identical
+    // behaviour, including the blackout prop and local media paths that a tablet
+    // could never reach on its own.
+    useEffect(() => {
+        if (!socket || isRemoteClient) return;
+        const onPadCommand = ({ type, payload = {} } = {}) => {
+            if (type === 'cue_fire') {
+                const cue = payload.cueId
+                    ? cuesRef.current.find(item => item.id === payload.cueId)
+                    : cuesRef.current.find(item => !['done', 'skipped', 'fired'].includes(item.status));
+                if (cue) fireCueRef.current?.(cue, { advance: Boolean(payload.advance) });
+            } else if (type === 'cue_status') {
+                const cue = cuesRef.current.find(item => item.id === payload.cueId);
+                if (cue && STATUSES.includes(payload.status)) setStatusRef.current?.(cue, payload.status);
+            } else if (type === 'translation_start') {
+                window.dispatchEvent(new CustomEvent('bc_runshow_start_translation'));
+            }
+        };
+        socket.on('pad_command', onPadCommand);
+        return () => socket.off('pad_command', onPadCommand);
+    }, [socket, isRemoteClient]);
 
     const browseVideo = async (cueId, actionId) => {
         const filePath = await window.broadcastAPI?.selectLocalVideo?.();
