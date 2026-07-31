@@ -33,6 +33,7 @@ export default function PresentationPanel({ socket, isActive }) {
     const [libraryQuery, setLibraryQuery] = useState('');
     const [newName, setNewName] = useState('');
     const [isSaving, setIsSaving] = useState(false);
+    const [saveSource, setSaveSource] = useState('url');
     const [saveWarning, setSaveWarning] = useState('');
     const [renamingId, setRenamingId] = useState(null);
     const [renameValue, setRenameValue] = useState('');
@@ -48,9 +49,15 @@ export default function PresentationPanel({ socket, isActive }) {
     useDebouncedLocalStorageEffect(LIBRARY_KEY, library);
 
     // Publish the saved-deck library so remotes (e.g. the slides remote) can list it.
+    // Image decks carry their full slide images locally/in localStorage, but those are
+    // stripped here — broadcasting them to every connected phone on each save/reconnect
+    // would ship megabytes of base64 over the socket just to render a library row.
     useEffect(() => {
         if (!socket) return;
-        const publish = () => socket.emit('pres_library_update', library);
+        const publish = () => {
+            const lightweight = library.map(({ images: _images, ...rest }) => rest);
+            socket.emit('pres_library_update', lightweight);
+        };
         publish();
         socket.on('connect', publish);
         return () => socket.off('connect', publish);
@@ -58,6 +65,16 @@ export default function PresentationPanel({ socket, isActive }) {
 
     const saveLibrary = (newLib) => {
         setLibrary(newLib);
+    };
+
+    const persistLibrarySafe = (newLib) => {
+        try {
+            localStorage.setItem(LIBRARY_KEY, JSON.stringify(newLib));
+            return true;
+        } catch (err) {
+            console.error('Failed to persist presentation library:', err);
+            return false;
+        }
     };
 
     const emitState = useCallback((newState) => {
@@ -99,14 +116,53 @@ export default function PresentationPanel({ socket, isActive }) {
             return;
         }
         setSaveWarning('');
+        setSaveSource('url');
+        setIsSaving(true);
+        setNewName('');
+    };
+
+    const addStagedToLibrary = () => {
+        if (!stagingImages.length) return;
+        setSaveWarning('');
+        setSaveSource('images');
         setIsSaving(true);
         setNewName('');
     };
 
     const confirmSave = () => {
         const name = newName.trim();
+        if (!name) return;
+
+        if (saveSource === 'images') {
+            if (!stagingImages.length) return;
+            const duplicate = library.find(item => item.name?.trim().toLowerCase() === name.toLowerCase());
+            if (duplicate) {
+                setSaveWarning(`Already saved as "${duplicate.name}".`);
+                return;
+            }
+
+            const newItem = {
+                id: Math.random().toString(36).slice(2, 11),
+                name,
+                type: 'Image Deck',
+                mode: 'images',
+                images: stagingImages.map(img => img.src),
+                totalSlides: stagingImages.length
+            };
+            const newLib = [...library, newItem];
+            if (!persistLibrarySafe(newLib)) {
+                setSaveWarning('Storage is full — delete an old saved presentation or save fewer slides.');
+                return;
+            }
+            saveLibrary(newLib);
+            setIsSaving(false);
+            setNewName('');
+            setSaveWarning('');
+            return;
+        }
+
         const url = urlInput.trim();
-        if (!name || !url) return;
+        if (!url) return;
 
         const normalizedUrl = url.includes('canva.com') ? normalizeCanvaUrl(url) : url;
         const duplicate = library.find(item => (
@@ -127,7 +183,12 @@ export default function PresentationPanel({ socket, isActive }) {
             totalSlides: totalInput,
             type: getDeckType(normalizedUrl)
         };
-        saveLibrary([...library, newItem]);
+        const newLib = [...library, newItem];
+        if (!persistLibrarySafe(newLib)) {
+            setSaveWarning('Storage is full — delete an old saved presentation and try again.');
+            return;
+        }
+        saveLibrary(newLib);
         setIsSaving(false);
         setNewName('');
         setSaveWarning('');
@@ -165,6 +226,24 @@ export default function PresentationPanel({ socket, isActive }) {
     };
 
     const loadFromLibrary = (item) => {
+        if (item.mode === 'images' || item.type === 'Image Deck') {
+            setIsStaging(false);
+            setStagingImages([]);
+            setSelectedStagedIdx(0);
+            setJumpInput('1');
+            const nextState = {
+                ...EMPTY_PRESENTATION,
+                images: item.images || [],
+                mode: 'images',
+                currentIdx: 0,
+                totalSlides: (item.images || []).length
+            };
+            setStatus(`Image deck loaded (${nextState.totalSlides} slides) from library. Preview is ready.`);
+            setPresState(nextState);
+            emitState(nextState);
+            return;
+        }
+
         const url = item.url?.includes('canva.com') ? normalizeCanvaUrl(item.url) : item.url;
         setUrlInput(url || '');
         setTotalInput(String(item.totalSlides || '20'));
@@ -527,7 +606,7 @@ export default function PresentationPanel({ socket, isActive }) {
                             </div>
                         </div>
 
-                        {isSaving && (
+                        {isSaving && saveSource === 'url' && (
                             <div className="space-y-2 border-b section-rule pb-3 pt-2">
                                 <label className="block text-[10px] font-bold text-indigo-400 uppercase tracking-widest">Name your presentation</label>
                                 <div className="flex gap-2">
@@ -744,11 +823,44 @@ export default function PresentationPanel({ socket, isActive }) {
                         </div>
                         <div className="flex items-center gap-3">
                             <button onClick={cancelStaging} className="text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white text-sm font-medium transition">Cancel</button>
+                            <button onClick={addStagedToLibrary} disabled={!stagingImages.length || isProcessing} className="control-button-muted px-4 py-2 font-medium active:scale-95 disabled:opacity-40" title="Save to Library">
+                                Save
+                            </button>
                             <button onClick={commitStagedImages} disabled={!stagingImages.length || isProcessing} className="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-2 rounded-lg font-bold transition shadow-lg shadow-emerald-600/20 disabled:opacity-40 flex items-center gap-2">
                                 <Upload size={16} /> Preview Loaded ({stagingImages.length})
                             </button>
                         </div>
                     </div>
+
+                    {isSaving && saveSource === 'images' && (
+                        <div className="surface space-y-2 rounded-lg p-3">
+                            <label className="block text-[10px] font-bold text-indigo-400 uppercase tracking-widest">Name your presentation</label>
+                            <div className="flex gap-2">
+                                <input
+                                    type="text"
+                                    autoFocus
+                                    value={newName}
+                                    onChange={e => {
+                                        setNewName(e.target.value);
+                                        setSaveWarning('');
+                                    }}
+                                    placeholder="e.g. Morning Service Deck"
+                                    className="control-field flex-1 border-indigo-500/50 px-3 py-1.5 text-sm focus:ring-1 focus:ring-indigo-500"
+                                    onKeyDown={e => {
+                                        if (e.key === 'Enter') confirmSave();
+                                        if (e.key === 'Escape') cancelSave();
+                                    }}
+                                />
+                                <button onClick={confirmSave} className="bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 rounded-lg text-xs font-bold transition" title="Confirm save">
+                                    <Check size={15} />
+                                </button>
+                                <button onClick={cancelSave} className="text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 px-2 transition" title="Cancel save">
+                                    <X size={15} />
+                                </button>
+                            </div>
+                            {saveWarning && <div className="text-[10px] text-amber-500 font-medium">{saveWarning}</div>}
+                        </div>
+                    )}
 
                     <div className="grid grid-cols-1 xl:grid-cols-[minmax(280px,0.85fr)_minmax(420px,1.4fr)] gap-4">
                         <div className="surface rounded-lg p-3">

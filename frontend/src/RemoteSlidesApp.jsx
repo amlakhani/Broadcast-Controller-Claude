@@ -187,9 +187,9 @@ export default function RemoteSlidesApp() {
     const navButton = 'flex items-center justify-center rounded-xl font-bold transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-30';
 
     return (
-        <div className="app-bg flex min-h-screen flex-col text-slate-900 dark:text-white" style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}>
+        <div className="app-bg mx-auto flex h-dvh max-w-md flex-col overflow-y-auto text-slate-900 dark:text-white landscape:max-w-[1400px]" style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}>
             {/* Header */}
-            <header className="surface-raised flex items-center justify-between gap-3 px-4 py-3">
+            <header className="surface-raised sticky top-0 z-10 flex shrink-0 items-center justify-between gap-3 px-4 py-3">
                 <div className="min-w-0">
                     <div className="truncate text-sm font-bold">{deckType}</div>
                     <div className="text-[11px] font-semibold text-slate-500">
@@ -207,73 +207,77 @@ export default function RemoteSlidesApp() {
                 </div>
             </header>
 
-            {/* Previews */}
-            <div className="space-y-2 p-3" onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
-                <div className="relative aspect-video overflow-hidden rounded-xl border-2 border-emerald-500 bg-black">
-                    <SlideTile meta={meta} index={meta.currentIdx} label="Live slide" />
-                </div>
-                <div className="grid grid-cols-2 gap-2">
-                    {[['Previous', meta.currentIdx - 1], ['Next', meta.currentIdx + 1]].map(([label, idx]) => (
-                        <div key={label}>
-                            <div className="mb-1 text-[10px] font-bold uppercase tracking-widest text-slate-500">{label}</div>
-                            <div className="relative aspect-video overflow-hidden rounded-lg border border-slate-300 bg-black dark:border-slate-700">
-                                <SlideTile meta={meta} index={idx} label={label} />
+            {/* Previews + navigation: stacked in portrait, side-by-side in landscape so a
+                wide-but-short tablet screen never forces vertical scrolling to reach controls. */}
+            <div className="flex flex-1 flex-col landscape:flex-row landscape:overflow-hidden">
+                {/* Previews */}
+                <div className="space-y-2 p-3 landscape:flex landscape:flex-1 landscape:flex-col landscape:justify-center landscape:overflow-y-auto" onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
+                    <div className="relative aspect-video overflow-hidden rounded-xl border-2 border-emerald-500 bg-black">
+                        <SlideTile meta={meta} index={meta.currentIdx} label="Live slide" />
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                        {[['Previous', meta.currentIdx - 1], ['Next', meta.currentIdx + 1]].map(([label, idx]) => (
+                            <div key={label}>
+                                <div className="mb-1 text-[10px] font-bold uppercase tracking-widest text-slate-500">{label}</div>
+                                <div className="relative aspect-video overflow-hidden rounded-lg border border-slate-300 bg-black dark:border-slate-700">
+                                    <SlideTile meta={meta} index={idx} label={label} />
+                                </div>
                             </div>
-                        </div>
-                    ))}
+                        ))}
+                    </div>
                 </div>
-            </div>
 
-            {/* Navigation */}
-            <div className="mt-auto space-y-2 p-3">
-                <div className="flex gap-2">
+                {/* Navigation */}
+                <div className="mt-auto space-y-2 p-3 landscape:mt-0 landscape:w-72 landscape:shrink-0 landscape:self-stretch landscape:overflow-y-auto landscape:border-l landscape:border-slate-500/20 landscape:flex landscape:flex-col landscape:justify-center">
+                    <div className="flex gap-2">
+                        <button
+                            onClick={() => go({ direction: 'prev' })}
+                            disabled={!canNavigate || meta.currentIdx <= 0}
+                            className={`${navButton} h-20 flex-1 bg-slate-500/15 text-lg active:bg-slate-500/25`}
+                        >
+                            <ChevronLeft className="h-8 w-8" />
+                        </button>
+                        <button
+                            onClick={() => go({ direction: 'next' })}
+                            disabled={!canNavigate || meta.currentIdx >= meta.totalSlides - 1}
+                            className={`${navButton} h-20 flex-[2] bg-blue-600 text-white active:bg-blue-500`}
+                        >
+                            <ChevronRight className="h-9 w-9" />
+                        </button>
+                    </div>
+
+                    <div className="grid grid-cols-4 gap-2">
+                        <button onClick={() => go({ direction: 'first' })} disabled={!canNavigate || meta.currentIdx <= 0}
+                            className={`${navButton} h-12 bg-slate-500/10 text-xs`}>
+                            <ChevronsLeft className="h-4 w-4" />
+                        </button>
+                        <button onClick={() => go({ direction: 'last' })} disabled={!canNavigate || meta.currentIdx >= meta.totalSlides - 1}
+                            className={`${navButton} h-12 bg-slate-500/10 text-xs`}>
+                            <ChevronsRight className="h-4 w-4" />
+                        </button>
+                        <button onClick={() => setPanel(panel === 'grid' ? null : 'grid')} disabled={!hasSlides}
+                            className={`${navButton} h-12 text-xs ${panel === 'grid' ? 'bg-amber-500 text-white' : 'bg-slate-500/10'}`}>
+                            <Grid3x3 className="h-4 w-4" />
+                        </button>
+                        <button onClick={() => setPanel(panel === 'library' ? null : 'library')}
+                            className={`${navButton} h-12 text-xs ${panel === 'library' ? 'bg-amber-500 text-white' : 'bg-slate-500/10'}`}>
+                            <Library className="h-4 w-4" />
+                        </button>
+                    </div>
+
                     <button
-                        onClick={() => go({ direction: 'prev' })}
-                        disabled={!canNavigate || meta.currentIdx <= 0}
-                        className={`${navButton} h-20 flex-1 bg-slate-500/15 text-lg active:bg-slate-500/25`}
+                        onClick={() => setShowing(!meta.showing)}
+                        disabled={!hasSlides}
+                        className={`${navButton} h-14 w-full text-sm uppercase tracking-wider text-white ${meta.showing ? 'bg-red-600 active:bg-red-500' : 'bg-emerald-600 active:bg-emerald-500'}`}
                     >
-                        <ChevronLeft className="h-8 w-8" />
-                    </button>
-                    <button
-                        onClick={() => go({ direction: 'next' })}
-                        disabled={!canNavigate || meta.currentIdx >= meta.totalSlides - 1}
-                        className={`${navButton} h-20 flex-[2] bg-blue-600 text-white active:bg-blue-500`}
-                    >
-                        <ChevronRight className="h-9 w-9" />
+                        {meta.showing ? <><MonitorOff className="mr-2 h-5 w-5" /> Take Down</> : <><Monitor className="mr-2 h-5 w-5" /> Go Live</>}
                     </button>
                 </div>
-
-                <div className="grid grid-cols-4 gap-2">
-                    <button onClick={() => go({ direction: 'first' })} disabled={!canNavigate || meta.currentIdx <= 0}
-                        className={`${navButton} h-12 bg-slate-500/10 text-xs`}>
-                        <ChevronsLeft className="h-4 w-4" />
-                    </button>
-                    <button onClick={() => go({ direction: 'last' })} disabled={!canNavigate || meta.currentIdx >= meta.totalSlides - 1}
-                        className={`${navButton} h-12 bg-slate-500/10 text-xs`}>
-                        <ChevronsRight className="h-4 w-4" />
-                    </button>
-                    <button onClick={() => setPanel(panel === 'grid' ? null : 'grid')} disabled={!hasSlides}
-                        className={`${navButton} h-12 text-xs ${panel === 'grid' ? 'bg-amber-500 text-white' : 'bg-slate-500/10'}`}>
-                        <Grid3x3 className="h-4 w-4" />
-                    </button>
-                    <button onClick={() => setPanel(panel === 'library' ? null : 'library')}
-                        className={`${navButton} h-12 text-xs ${panel === 'library' ? 'bg-amber-500 text-white' : 'bg-slate-500/10'}`}>
-                        <Library className="h-4 w-4" />
-                    </button>
-                </div>
-
-                <button
-                    onClick={() => setShowing(!meta.showing)}
-                    disabled={!hasSlides}
-                    className={`${navButton} h-14 w-full text-sm uppercase tracking-wider text-white ${meta.showing ? 'bg-red-600 active:bg-red-500' : 'bg-emerald-600 active:bg-emerald-500'}`}
-                >
-                    {meta.showing ? <><MonitorOff className="mr-2 h-5 w-5" /> Take Down</> : <><Monitor className="mr-2 h-5 w-5" /> Go Live</>}
-                </button>
             </div>
 
             {/* All slides grid */}
             {panel === 'grid' && (
-                <div className="surface-raised max-h-[55vh] overflow-y-auto border-t border-slate-500/20 p-3">
+                <div className="surface-raised max-h-[55vh] shrink-0 overflow-y-auto border-t border-slate-500/20 p-3">
                     <div className="mb-2 text-xs font-bold uppercase tracking-wider text-slate-500">All Slides</div>
                     <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
                         {slideNumbers.map(i => (
@@ -291,22 +295,26 @@ export default function RemoteSlidesApp() {
 
             {/* Deck library */}
             {panel === 'library' && (
-                <div className="surface-raised max-h-[55vh] overflow-y-auto border-t border-slate-500/20 p-3">
+                <div className="surface-raised max-h-[55vh] shrink-0 overflow-y-auto border-t border-slate-500/20 p-3">
                     <div className="mb-2 text-xs font-bold uppercase tracking-wider text-slate-500">Deck Library</div>
                     {library.length === 0 ? (
                         <p className="text-xs text-slate-500">No saved decks. Save a deck on the main controller's Slides tab.</p>
                     ) : (
                         <div className="space-y-1.5">
-                            {library.map(item => (
-                                <button key={item.id} onClick={() => loadDeck(item)}
-                                    className="flex w-full items-center justify-between gap-3 rounded-lg bg-slate-500/10 px-3 py-3 text-left transition active:bg-slate-500/20">
-                                    <div className="min-w-0">
-                                        <div className="truncate text-sm font-semibold">{item.name}</div>
-                                        <div className="text-[10px] text-slate-500">{getDeckType(item)} · {item.totalSlides || 1} slides</div>
-                                    </div>
-                                    <ChevronRight className="h-4 w-4 shrink-0 text-slate-500" />
-                                </button>
-                            ))}
+                            {library.map(item => {
+                                const isImageDeck = item.mode === 'images' || item.type === 'Image Deck';
+                                return (
+                                    <button key={item.id} onClick={() => !isImageDeck && loadDeck(item)} disabled={isImageDeck}
+                                        title={isImageDeck ? 'Image decks can only be loaded from the main controller' : undefined}
+                                        className={`flex w-full items-center justify-between gap-3 rounded-lg px-3 py-3 text-left transition ${isImageDeck ? 'cursor-not-allowed bg-slate-500/5 opacity-50' : 'bg-slate-500/10 active:bg-slate-500/20'}`}>
+                                        <div className="min-w-0">
+                                            <div className="truncate text-sm font-semibold">{item.name}</div>
+                                            <div className="text-[10px] text-slate-500">{getDeckType(item)} · {item.totalSlides || 1} slides{isImageDeck ? ' · controller only' : ''}</div>
+                                        </div>
+                                        <ChevronRight className="h-4 w-4 shrink-0 text-slate-500" />
+                                    </button>
+                                );
+                            })}
                         </div>
                     )}
                 </div>
