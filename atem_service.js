@@ -94,15 +94,6 @@ export class AtemService {
         this.isFlushing = false;
         this.lastSent = new Map();
         this.pushSentAt = null;
-
-        // Generic coalescer for everything that isn't a SuperSource box: transition
-        // T-bar drags, USK/DSK setting sliders. Same shape as the box coalescer above,
-        // but each queued entry carries its own `apply` so one queue can serve several
-        // unrelated ATEM commands without them stepping on each other's lastSent cache.
-        this.patchQueue = new Map();
-        this.patchLastSent = new Map();
-        this.patchFlushTimer = null;
-        this.isFlushingPatches = false;
     }
 
     getStatus() {
@@ -212,7 +203,6 @@ export class AtemService {
             // down, so our record of "what it last saw" is not trustworthy anymore —
             // forget it so the next push sends every field instead of just deltas.
             this.lastSent.clear();
-            this.patchLastSent.clear();
         }));
 
         atem.on('disconnected', guard(() => {
@@ -389,11 +379,8 @@ export class AtemService {
         this.clearTimer('watchdogTimer');
         this.clearTimer('flushTimer');
         this.clearTimer('statusTimer');
-        this.clearTimer('patchFlushTimer');
         this.pending.clear();
         this.lastSent.clear();
-        this.patchQueue.clear();
-        this.patchLastSent.clear();
 
         const atem = this.atem;
         this.atem = null;
@@ -509,195 +496,4 @@ export class AtemService {
         return boxes.map(box => ({ ...box }));
     }
 
-    // --- Switcher: discrete actions ----------------------------------------
-    // One-shot commands (button presses, dropdown picks) — fired directly rather
-    // than through the coalescer, since there's no drag/flood risk to guard against.
-
-    async _guardedCall(fn) {
-        if (!this.status.armed) return { ok: false, error: 'Push to ATEM is not armed.' };
-        if (!this.atem || this.status.connectionState !== 'connected') {
-            return { ok: false, error: 'Not connected.' };
-        }
-        try {
-            await fn();
-            return { ok: true };
-        } catch (err) {
-            return { ok: false, error: err?.message || String(err) };
-        }
-    }
-
-    // Same shape as _guardedCall but without the arm requirement — for actions
-    // that are discrete and immediately visible rather than a continuous/risky
-    // push, the same trust level VideohubService's takeRoutes already uses (no
-    // arm concept there at all). Aux/router switching is the one command here
-    // that fits that bar; everything else stays behind the arm gate.
-    async _connectedCall(fn) {
-        if (!this.atem || this.status.connectionState !== 'connected') {
-            return { ok: false, error: 'Not connected.' };
-        }
-        try {
-            await fn();
-            return { ok: true };
-        } catch (err) {
-            return { ok: false, error: err?.message || String(err) };
-        }
-    }
-
-    cut(me = 0) { return this._guardedCall(() => this.atem.cut(me)); }
-    autoTransition(me = 0) { return this._guardedCall(() => this.atem.autoTransition(me)); }
-    fadeToBlack(me = 0) { return this._guardedCall(() => this.atem.fadeToBlack(me)); }
-
-    setProgramInput(input, me = 0) { return this._guardedCall(() => this.atem.changeProgramInput(input, me)); }
-    setPreviewInput(input, me = 0) { return this._guardedCall(() => this.atem.changePreviewInput(input, me)); }
-    setAuxSource(source, bus = 0) { return this._connectedCall(() => this.atem.setAuxSource(source, bus)); }
-    setTransitionStyle(props = {}, me = 0) { return this._guardedCall(() => this.atem.setTransitionStyle(props, me)); }
-
-    setUpstreamKeyerOnAir(onAir, me = 0, keyer = 0) {
-        return this._guardedCall(() => this.atem.setUpstreamKeyerOnAir(onAir, me, keyer));
-    }
-    setUpstreamKeyerType(props = {}, me = 0, keyer = 0) {
-        return this._guardedCall(() => this.atem.setUpstreamKeyerType(props, me, keyer));
-    }
-    setUpstreamKeyerSources(fillSource, cutSource, me = 0, keyer = 0) {
-        return this._guardedCall(async () => {
-            await this.atem.setUpstreamKeyerFillSource(fillSource, me, keyer);
-            await this.atem.setUpstreamKeyerCutSource(cutSource, me, keyer);
-        });
-    }
-
-    setDownstreamKeyOnAir(onAir, key = 0) { return this._guardedCall(() => this.atem.setDownstreamKeyOnAir(onAir, key)); }
-    setDownstreamKeyTie(tie, key = 0) { return this._guardedCall(() => this.atem.setDownstreamKeyTie(tie, key)); }
-    autoDownstreamKey(key = 0, isTowardsOnAir) {
-        return this._guardedCall(() => this.atem.autoDownstreamKey(key, isTowardsOnAir));
-    }
-    setDownstreamKeySources(fillSource, cutSource, key = 0) {
-        return this._guardedCall(async () => {
-            await this.atem.setDownstreamKeyFillSource(fillSource, key);
-            await this.atem.setDownstreamKeyCutSource(cutSource, key);
-        });
-    }
-
-    // --- Switcher: coalesced patches ----------------------------------------
-    // Generic version of the box coalescer above, for continuous drags (T-bar,
-    // keyer/DSK setting sliders) that aren't SuperSource box geometry. `key`
-    // identifies the target (e.g. `keyer:luma:0:1`); `apply` is called with only
-    // the fields that changed since the last successfully-sent value for that key.
-
-    pushPatch(key, props, apply) {
-        if (!this.status.armed) return { ok: false, error: 'Push to ATEM is not armed.' };
-        if (this.status.connectionState !== 'connected') return { ok: false, error: 'Not connected.' };
-
-        const existing = this.patchQueue.get(key);
-        this.patchQueue.set(key, { props: { ...(existing?.props || {}), ...props }, apply });
-
-        if (!this.patchFlushTimer) {
-            this.patchFlushTimer = setTimeout(() => this.flushPatches(), FLUSH_INTERVAL_MS);
-        }
-        return { ok: true, queued: this.patchQueue.size };
-    }
-
-    async flushPatches() {
-        this.patchFlushTimer = null;
-        if (this.isFlushingPatches || !this.atem || this.status.connectionState !== 'connected') return;
-        if (this.patchQueue.size === 0) return;
-
-        this.isFlushingPatches = true;
-        const batch = new Map(this.patchQueue);
-        this.patchQueue.clear();
-
-        for (const [key, entry] of batch) {
-            const previous = this.patchLastSent.get(key) || {};
-            const delta = {};
-            for (const [field, value] of Object.entries(entry.props)) {
-                if (previous[field] !== value) delta[field] = value;
-            }
-            if (Object.keys(delta).length === 0) continue;
-
-            try {
-                await entry.apply(delta);
-                this.patchLastSent.set(key, { ...previous, ...delta });
-            } catch {
-                // Left out of patchLastSent so the next flush retries this delta in full,
-                // same "drop, don't queue up" philosophy as the box coalescer's flush().
-            }
-        }
-
-        this.isFlushingPatches = false;
-        if (this.patchQueue.size > 0 && !this.patchFlushTimer) {
-            this.patchFlushTimer = setTimeout(() => this.flushPatches(), FLUSH_INTERVAL_MS);
-        }
-    }
-
-    pushTransitionPosition(position, me = 0) {
-        return this.pushPatch(`transitionPosition:${me}`, { position }, async (delta) => {
-            if (delta.position !== undefined) await this.atem.setTransitionPosition(delta.position, me);
-        });
-    }
-
-    // `kind` selects which transition-style settings block this patch targets.
-    pushTransitionSettings(kind, props = {}, me = 0) {
-        return this.pushPatch(`transitionSettings:${kind}:${me}`, props, (delta) => {
-            switch (kind) {
-                case 'mix': return this.atem.setMixTransitionSettings(delta, me);
-                case 'dip': return this.atem.setDipTransitionSettings(delta, me);
-                case 'wipe': return this.atem.setWipeTransitionSettings(delta, me);
-                case 'DVE': return this.atem.setDVETransitionSettings(delta, me);
-                case 'stinger': return this.atem.setStingerTransitionSettings(delta, me);
-                default: throw new Error(`Unknown transition kind: ${kind}`);
-            }
-        });
-    }
-
-    // `kind` selects which upstream-keyer settings block this patch targets.
-    pushKeyerSettings(kind, props = {}, me = 0, keyer = 0) {
-        return this.pushPatch(`keyer:${kind}:${me}:${keyer}`, props, (delta) => {
-            switch (kind) {
-                case 'chroma': return this.atem.setUpstreamKeyerChromaSettings(delta, me, keyer);
-                case 'advancedChroma': return this.atem.setUpstreamKeyerAdvancedChromaProperties(delta, me, keyer);
-                case 'luma': return this.atem.setUpstreamKeyerLumaSettings(delta, me, keyer);
-                case 'pattern': return this.atem.setUpstreamKeyerPatternSettings(delta, me, keyer);
-                case 'dve': return this.atem.setUpstreamKeyerDVESettings(delta, me, keyer);
-                case 'mask': return this.atem.setUpstreamKeyerMaskSettings(delta, me, keyer);
-                default: throw new Error(`Unknown keyer settings kind: ${kind}`);
-            }
-        });
-    }
-
-    // `kind` selects which downstream-keyer settings block this patch targets.
-    pushDskSettings(kind, props = {}, key = 0) {
-        return this.pushPatch(`dsk:${kind}:${key}`, props, (delta) => {
-            switch (kind) {
-                case 'general': return this.atem.setDownstreamKeyGeneralProperties(delta, key);
-                case 'mask': return this.atem.setDownstreamKeyMaskSettings(delta, key);
-                case 'rate': return this.atem.setDownstreamKeyRate(delta.rate, key);
-                default: throw new Error(`Unknown DSK settings kind: ${kind}`);
-            }
-        });
-    }
-
-    // --- Switcher: pull-backs -------------------------------------------------
-    // Mirror pullBoxes: read straight off the live device state, no armed gate
-    // (these are reads, not writes), null if the unit doesn't exist on this model.
-
-    pullMixEffectState(me = 0) {
-        const meState = this.atem?.state?.video?.mixEffects?.[me];
-        if (!meState) return null;
-        return {
-            programInput: meState.programInput,
-            previewInput: meState.previewInput,
-            transitionPosition: meState.transitionPosition ? { ...meState.transitionPosition } : null,
-            transitionProperties: meState.transitionProperties ? { ...meState.transitionProperties } : null,
-            transitionSettings: meState.transitionSettings ? { ...meState.transitionSettings } : null,
-        };
-    }
-
-    pullKeyerState(me = 0, keyer = 0) {
-        const keyerState = this.atem?.state?.video?.mixEffects?.[me]?.upstreamKeyers?.[keyer];
-        return keyerState ? { ...keyerState } : null;
-    }
-
-    pullDskState(key = 0) {
-        const dskState = this.atem?.state?.video?.downstreamKeyers?.[key];
-        return dskState ? { ...dskState } : null;
-    }
 }

@@ -4,7 +4,7 @@ import { Save, Trash2 } from 'lucide-react';
 const compactInputClass = 'control-field px-2.5 py-1.5 text-xs';
 
 // Quick-switch list of named address/port profiles for a hardware connection
-// card (ATEM, Videohub). Visually modeled on the "Layout Presets" rail in
+// card (ATEM). Visually modeled on the "Layout Presets" rail in
 // SuperSourcePanel.jsx — a row of chips with delete-on-hover, plus a
 // "save current as…" input. Selecting a chip is the caller's job to wire up
 // to "load these fields and connect" — that's the point of "quick switch".

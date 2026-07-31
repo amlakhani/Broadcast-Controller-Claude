@@ -13,7 +13,6 @@ class FakeAtem extends EventEmitter {
         this.disconnectCalls = 0;
         this.boxCommands = [];
         this.propertyCommands = [];
-        this.calls = []; // generic log for switcher/keyer/router commands — see _log
         this.failNextConnect = false;
         this.state = {
             info: {
@@ -94,43 +93,7 @@ class FakeAtem extends EventEmitter {
     async setSuperSourceProperties(props, ssrcId) {
         this.propertyCommands.push({ props, ssrcId });
     }
-
-    _log(name, ...args) { this.calls.push({ name, args }); }
-
-    async cut(me) { this._log('cut', me); }
-    async autoTransition(me) { this._log('autoTransition', me); }
-    async fadeToBlack(me) { this._log('fadeToBlack', me); }
-    async changeProgramInput(input, me) { this._log('changeProgramInput', input, me); }
-    async changePreviewInput(input, me) { this._log('changePreviewInput', input, me); }
-    async setAuxSource(source, bus) { this._log('setAuxSource', source, bus); }
-    async setTransitionStyle(props, me) { this._log('setTransitionStyle', props, me); }
-    async setTransitionPosition(position, me) { this._log('setTransitionPosition', position, me); }
-    async setMixTransitionSettings(props, me) { this._log('setMixTransitionSettings', props, me); }
-    async setDipTransitionSettings(props, me) { this._log('setDipTransitionSettings', props, me); }
-    async setWipeTransitionSettings(props, me) { this._log('setWipeTransitionSettings', props, me); }
-    async setDVETransitionSettings(props, me) { this._log('setDVETransitionSettings', props, me); }
-    async setStingerTransitionSettings(props, me) { this._log('setStingerTransitionSettings', props, me); }
-    async setUpstreamKeyerOnAir(onAir, me, keyer) { this._log('setUpstreamKeyerOnAir', onAir, me, keyer); }
-    async setUpstreamKeyerType(props, me, keyer) { this._log('setUpstreamKeyerType', props, me, keyer); }
-    async setUpstreamKeyerFillSource(fillSource, me, keyer) { this._log('setUpstreamKeyerFillSource', fillSource, me, keyer); }
-    async setUpstreamKeyerCutSource(cutSource, me, keyer) { this._log('setUpstreamKeyerCutSource', cutSource, me, keyer); }
-    async setUpstreamKeyerChromaSettings(props, me, keyer) { this._log('setUpstreamKeyerChromaSettings', props, me, keyer); }
-    async setUpstreamKeyerAdvancedChromaProperties(props, me, keyer) { this._log('setUpstreamKeyerAdvancedChromaProperties', props, me, keyer); }
-    async setUpstreamKeyerLumaSettings(props, me, keyer) { this._log('setUpstreamKeyerLumaSettings', props, me, keyer); }
-    async setUpstreamKeyerPatternSettings(props, me, keyer) { this._log('setUpstreamKeyerPatternSettings', props, me, keyer); }
-    async setUpstreamKeyerDVESettings(props, me, keyer) { this._log('setUpstreamKeyerDVESettings', props, me, keyer); }
-    async setUpstreamKeyerMaskSettings(props, me, keyer) { this._log('setUpstreamKeyerMaskSettings', props, me, keyer); }
-    async setDownstreamKeyOnAir(onAir, key) { this._log('setDownstreamKeyOnAir', onAir, key); }
-    async setDownstreamKeyTie(tie, key) { this._log('setDownstreamKeyTie', tie, key); }
-    async setDownstreamKeyFillSource(fillSource, key) { this._log('setDownstreamKeyFillSource', fillSource, key); }
-    async setDownstreamKeyCutSource(cutSource, key) { this._log('setDownstreamKeyCutSource', cutSource, key); }
-    async setDownstreamKeyGeneralProperties(props, key) { this._log('setDownstreamKeyGeneralProperties', props, key); }
-    async setDownstreamKeyMaskSettings(props, key) { this._log('setDownstreamKeyMaskSettings', props, key); }
-    async setDownstreamKeyRate(rate, key) { this._log('setDownstreamKeyRate', rate, key); }
-    async autoDownstreamKey(key, isTowardsOnAir) { this._log('autoDownstreamKey', key, isTowardsOnAir); }
 }
-
-const callsNamed = (fake, name) => fake.calls.filter(c => c.name === name);
 
 const tick = (ms = 0) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -372,7 +335,11 @@ test('pullBoxes reads the switcher geometry back', async () => {
     await service.disconnect();
 });
 
-// --- Switcher: capabilities, discrete actions, coalesced patches -----------
+// --- Switcher: capabilities ------------------------------------------------
+// These fields (meCount, auxSources, auxBusNames, etc.) have no UI consumer
+// since AtemSwitcherPanel was removed, but readDeviceState() still populates
+// them as part of the live SuperSource connect/status path, so the coverage
+// stays.
 
 test('connecting reads ME/DSK/aux capabilities off the device', async () => {
     const { service } = await connectedService();
@@ -411,174 +378,3 @@ test('auxBusNames reads the device-reported, renameable name per bus, matched by
     await service.disconnect();
 });
 
-test('discrete switcher actions require armed + connected, same as box pushes', async () => {
-    const { fake, service } = await connectedService();
-
-    const cutResult = await service.cut(0);
-    assert.equal(cutResult.ok, false);
-    assert.match(cutResult.error, /not armed/i);
-    assert.equal(callsNamed(fake, 'cut').length, 0);
-
-    service.setArmed(true);
-    const armedCut = await service.cut(0);
-    assert.equal(armedCut.ok, true);
-    assert.equal(callsNamed(fake, 'cut').length, 1);
-
-    await service.disconnect();
-});
-
-test('program/preview/aux/transition-style actions reach the switcher once armed', async () => {
-    const { fake, service } = await connectedService();
-    service.setArmed(true);
-
-    await service.setProgramInput(3, 0);
-    await service.setPreviewInput(4, 0);
-    await service.setAuxSource(2, 1);
-    await service.setTransitionStyle({ nextStyle: 1 }, 0);
-    await service.autoTransition(0);
-    await service.fadeToBlack(0);
-
-    assert.deepEqual(callsNamed(fake, 'changeProgramInput')[0].args, [3, 0]);
-    assert.deepEqual(callsNamed(fake, 'changePreviewInput')[0].args, [4, 0]);
-    assert.deepEqual(callsNamed(fake, 'setAuxSource')[0].args, [2, 1]);
-    assert.equal(callsNamed(fake, 'setTransitionStyle').length, 1);
-    assert.equal(callsNamed(fake, 'autoTransition').length, 1);
-    assert.equal(callsNamed(fake, 'fadeToBlack').length, 1);
-
-    await service.disconnect();
-});
-
-test('setAuxSource works without arming — regression for router Take silently no-op-ing unarmed', async () => {
-    // Unlike the SuperSource/keyer pushes, Aux/router switching is a discrete,
-    // immediately-visible action (same trust level as VideohubService's ungated
-    // takeRoutes) — it must not require the "armed" toggle at all.
-    const { fake, service } = await connectedService();
-
-    const result = await service.setAuxSource(2, 1);
-    assert.equal(result.ok, true);
-    assert.deepEqual(callsNamed(fake, 'setAuxSource')[0].args, [2, 1]);
-
-    await service.disconnect();
-});
-
-test('setAuxSource still requires a connection', async () => {
-    const fake = new FakeAtem();
-    const service = new AtemService({ createAtem: () => fake });
-
-    const result = await service.setAuxSource(2, 1);
-    assert.equal(result.ok, false);
-    assert.match(result.error, /not connected/i);
-    assert.equal(fake.calls.length, 0);
-});
-
-test('a burst of transition-position pushes collapses into one command with the final value', async () => {
-    const { fake, service } = await connectedService();
-    service.setArmed(true);
-
-    for (let x = 0; x < 20; x += 1) {
-        service.pushTransitionPosition(x * 500, 0);
-    }
-    await tick(80);
-
-    const positionCalls = callsNamed(fake, 'setTransitionPosition');
-    assert.equal(positionCalls.length, 1, `expected 1 command, got ${positionCalls.length}`);
-    assert.deepEqual(positionCalls[0].args, [9500, 0]);
-
-    await service.disconnect();
-});
-
-test('keyer settings coalesce independently per keyer, and suppress unchanged values', async () => {
-    const { fake, service } = await connectedService();
-    service.setArmed(true);
-
-    service.pushKeyerSettings('luma', { clip: 100 }, 0, 0);
-    service.pushKeyerSettings('chroma', { hue: 45 }, 0, 1);
-    await tick(80);
-
-    assert.equal(callsNamed(fake, 'setUpstreamKeyerLumaSettings').length, 1);
-    assert.equal(callsNamed(fake, 'setUpstreamKeyerChromaSettings').length, 1);
-
-    service.pushKeyerSettings('luma', { clip: 100 }, 0, 0);
-    await tick(80);
-    assert.equal(callsNamed(fake, 'setUpstreamKeyerLumaSettings').length, 1, 'an identical value should not hit the wire twice');
-
-    service.pushKeyerSettings('luma', { clip: 150 }, 0, 0);
-    await tick(80);
-    assert.equal(callsNamed(fake, 'setUpstreamKeyerLumaSettings').length, 2);
-
-    await service.disconnect();
-});
-
-test('DSK settings coalesce the same way as keyer settings', async () => {
-    const { fake, service } = await connectedService();
-    service.setArmed(true);
-
-    service.pushDskSettings('general', { clip: 50 }, 0);
-    service.pushDskSettings('general', { clip: 60 }, 0);
-    await tick(80);
-
-    const generalCalls = callsNamed(fake, 'setDownstreamKeyGeneralProperties');
-    assert.equal(generalCalls.length, 1, 'a burst should collapse into one command carrying the final value');
-    assert.deepEqual(generalCalls[0].args[0], { clip: 60 });
-
-    await service.disconnect();
-});
-
-test('DSK and keyer on-air/tie/source actions require armed + connected', async () => {
-    const { fake, service } = await connectedService();
-
-    const blocked = await service.setDownstreamKeyOnAir(true, 0);
-    assert.equal(blocked.ok, false);
-    assert.equal(callsNamed(fake, 'setDownstreamKeyOnAir').length, 0);
-
-    service.setArmed(true);
-    await service.setDownstreamKeyOnAir(true, 0);
-    await service.setDownstreamKeyTie(true, 0);
-    await service.setDownstreamKeySources(3, 4, 0);
-    await service.setUpstreamKeyerOnAir(true, 0, 0);
-    await service.setUpstreamKeyerSources(3, 4, 0, 0);
-
-    assert.equal(callsNamed(fake, 'setDownstreamKeyOnAir').length, 1);
-    assert.equal(callsNamed(fake, 'setDownstreamKeyTie').length, 1);
-    assert.equal(callsNamed(fake, 'setDownstreamKeyFillSource').length, 1);
-    assert.equal(callsNamed(fake, 'setDownstreamKeyCutSource').length, 1);
-    assert.equal(callsNamed(fake, 'setUpstreamKeyerOnAir').length, 1);
-    assert.equal(callsNamed(fake, 'setUpstreamKeyerFillSource').length, 1);
-    assert.equal(callsNamed(fake, 'setUpstreamKeyerCutSource').length, 1);
-
-    await service.disconnect();
-});
-
-test('pushes while disconnected are dropped for the generic patch coalescer too', async () => {
-    const { fake, service } = await connectedService();
-    service.setArmed(true);
-
-    fake.emit('disconnected');
-    await tick();
-
-    const dropped = service.pushTransitionPosition(1000, 0);
-    assert.equal(dropped.ok, false);
-    await tick(80);
-    assert.equal(callsNamed(fake, 'setTransitionPosition').length, 0);
-
-    await service.disconnect();
-});
-
-test('pullMixEffectState/pullKeyerState/pullDskState read the live device state back', async () => {
-    const { service } = await connectedService();
-
-    const me = service.pullMixEffectState(0);
-    assert.equal(me.programInput, 1);
-    assert.equal(me.previewInput, 2);
-    assert.equal(service.pullMixEffectState(9), null, 'an M/E that does not exist reads as null');
-
-    const keyer = service.pullKeyerState(0, 1);
-    assert.equal(keyer.fillSource, 1);
-    assert.equal(service.pullKeyerState(0, 9), null, 'a keyer that does not exist reads as null');
-
-    const dsk = service.pullDskState(0);
-    assert.equal(dsk.sources.fillSource, 1);
-    assert.equal(service.pullDskState(9), null, 'a DSK that does not exist reads as null');
-
-    await service.disconnect();
-});
