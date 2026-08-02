@@ -82,6 +82,25 @@ function hardenWindowNavigation(win) {
     });
 }
 
+function reloadWindowGracefully(browserWindow, forceReload) {
+    if (!browserWindow || browserWindow.isDestroyed()) return;
+
+    const doReload = () => {
+        if (browserWindow.isDestroyed()) return;
+        if (forceReload) browserWindow.webContents.reloadIgnoringCache();
+        else browserWindow.webContents.reload();
+    };
+
+    if (browserWindow === controlWindow) {
+        // Give the control window a chance to clear all outputs before it
+        // tears down, so Preview/Output don't end up desynced after reload.
+        browserWindow.webContents.send('before-reload');
+        setTimeout(doReload, 300);
+    } else {
+        doReload();
+    }
+}
+
 function setAppMenu() {
     const template = [
         {
@@ -105,8 +124,16 @@ function setAppMenu() {
         {
             label: 'View',
             submenu: [
-                { role: 'reload' },
-                { role: 'forceReload' },
+                {
+                    label: 'Reload',
+                    accelerator: 'CmdOrCtrl+R',
+                    click: (menuItem, browserWindow) => reloadWindowGracefully(browserWindow, false)
+                },
+                {
+                    label: 'Force Reload',
+                    accelerator: 'CmdOrCtrl+Shift+R',
+                    click: (menuItem, browserWindow) => reloadWindowGracefully(browserWindow, true)
+                },
                 { role: 'toggleDevTools' },
                 { type: 'separator' },
                 { role: 'resetZoom' },

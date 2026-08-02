@@ -46,6 +46,7 @@ export default function LyricsPanel({ socket }) {
     const [isFetching, setIsFetching] = useState(false);
     const [armedVerseIndex, setArmedVerseIndex] = useState(null);
     const [liveVerseIndex, setLiveVerseIndex] = useState(null);
+    const [liveLyricsContent, setLiveLyricsContent] = useState(null);
     const [cueMode, setCueMode] = useState(() => localStorage.getItem(CUE_MODE_KEY) || CUE_MODES.FAST_TAKE);
     const [linesPerSlide, setLinesPerSlide] = useState(() => normalizeLinesPerSlide(localStorage.getItem(LINES_PER_SLIDE_KEY)));
     const [errorMessage, setErrorMessage] = useState('');
@@ -189,6 +190,48 @@ export default function LyricsPanel({ socket }) {
         if (!socket) return;
         socket.emit('update_lyrics_style', getStyle());
     }, [socket, getStyle]);
+
+    // Reflect real on-air state regardless of what triggered it (this panel, another
+    // remote, or the main app window) — matches the pattern used by MediaPanel/PresentationPanel.
+    useEffect(() => {
+        if (!socket) return undefined;
+
+        const applyLive = (content) => {
+            setLiveLyricsContent(content);
+            if (!content) {
+                setLiveVerseIndex(null);
+                return;
+            }
+            const matchIndex = slides.findIndex(v => v.eng === content.engText && v.guj === content.gujText);
+            setLiveVerseIndex(matchIndex >= 0 ? matchIndex : null);
+        };
+
+        const handlePlayLyrics = (data) => applyLive({ engText: data?.engText || '', gujText: data?.gujText || '' });
+        const handleStopLyrics = () => applyLive(null);
+        const handleOperatorState = (state) => {
+            setLiveLyricsContent(prev => {
+                if (prev) return prev;
+                const current = state?.current?.lyrics;
+                if (!current) return prev;
+                const content = { engText: current.engText || '', gujText: current.gujText || '' };
+                const matchIndex = slides.findIndex(v => v.eng === content.engText && v.guj === content.gujText);
+                setLiveVerseIndex(matchIndex >= 0 ? matchIndex : null);
+                return content;
+            });
+        };
+
+        socket.on('play_lyrics', handlePlayLyrics);
+        socket.on('stop_lyrics', handleStopLyrics);
+        socket.on('stop_graphic', handleStopLyrics);
+        socket.on('operator_state_update', handleOperatorState);
+
+        return () => {
+            socket.off('play_lyrics', handlePlayLyrics);
+            socket.off('stop_lyrics', handleStopLyrics);
+            socket.off('stop_graphic', handleStopLyrics);
+            socket.off('operator_state_update', handleOperatorState);
+        };
+    }, [socket, slides]);
 
     // Preview the chosen face using the operator's own lyric where available.
     const gujSampleText = (lyricGu.trim() || parsedVerses[0]?.guj || '').trim();
@@ -580,7 +623,7 @@ export default function LyricsPanel({ socket }) {
                                 Armed {armedVerseIndex !== null ? armedVerseIndex + 1 : '--'}
                             </span>
                             <span className="rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider">
-                                Live {liveVerseIndex !== null ? liveVerseIndex + 1 : '--'}
+                                {liveVerseIndex !== null ? `Live ${liveVerseIndex + 1}` : liveLyricsContent ? 'Live (other song)' : 'Live --'}
                             </span>
                         </div>
                     </div>
@@ -649,7 +692,9 @@ export default function LyricsPanel({ socket }) {
                                 </div>
                                 <div className="rounded-lg bg-emerald-500/10 border border-emerald-500/20 px-3 py-2 min-h-[72px]">
                                     <div className="text-[10px] font-bold uppercase tracking-wider text-emerald-600 dark:text-emerald-400 mb-1">On Air</div>
-                                    <div className="text-xs text-slate-700 dark:text-slate-300 line-clamp-2 font-guj">{liveVerse?.guj || liveVerse?.eng || 'Nothing live'}</div>
+                                    <div className="text-xs text-slate-700 dark:text-slate-300 line-clamp-2 font-guj">
+                                        {liveVerse?.guj || liveVerse?.eng || liveLyricsContent?.gujText || liveLyricsContent?.engText || 'Nothing live'}
+                                    </div>
                                 </div>
                             </div>
                         </>

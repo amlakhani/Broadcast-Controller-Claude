@@ -8,5 +8,10 @@ contextBridge.exposeInMainWorld('broadcastAPI', {
     getPathForFile: (file) => {
         if (webUtils?.getPathForFile) return webUtils.getPathForFile(file);
         return file?.path || '';
+    },
+    onBeforeReload: (callback) => {
+        const listener = () => callback();
+        ipcRenderer.on('before-reload', listener);
+        return () => ipcRenderer.removeListener('before-reload', listener);
     }
 });

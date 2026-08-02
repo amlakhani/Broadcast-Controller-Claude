@@ -12,6 +12,7 @@ export default function MediaGraphic({ socket, windowMode }) {
 
     const containerRef = useRef(null);
     const ytPlayerRef = useRef(null);
+    const ytRetryTimerRef = useRef(null);
     const localVideoRef = useRef(null);
     const mediaIntervalRef = useRef(null);
     const audioContextRef = useRef(null);
@@ -279,18 +280,28 @@ export default function MediaGraphic({ socket, windowMode }) {
         }
 
         const isPreview = isPassiveOutput;
+        let cancelled = false;
 
         if (mediaData.type === 'youtube') {
-            // Wait for DOM to render the container
-            setTimeout(() => {
-                const container = document.getElementById('yt-player-container');
-                if (!container) return; // Not ready yet
+            const MAX_ATTEMPTS = 40; // ~2s at 50ms between attempts
 
-                if (!window.YT || !window.YT.Player) {
-                    console.error("YouTube API not loaded");
+            const tryInitYouTubePlayer = (attempt = 0) => {
+                if (cancelled) return;
+
+                const container = document.getElementById('yt-player-container');
+                const apiReady = window.YT && window.YT.Player;
+
+                if (!container || !apiReady) {
+                    if (attempt >= MAX_ATTEMPTS) {
+                        console.error(!container
+                            ? "YouTube player container never mounted; giving up"
+                            : "YouTube iframe API never became ready; giving up");
+                        return;
+                    }
+                    ytRetryTimerRef.current = setTimeout(() => tryInitYouTubePlayer(attempt + 1), 50);
                     return;
                 }
-                
+
                 // If player already exists, check if it's still healthy
                 if (ytPlayerRef.current && ytPlayerRef.current.getIframe) {
                     const iframe = ytPlayerRef.current.getIframe();
@@ -313,13 +324,13 @@ export default function MediaGraphic({ socket, windowMode }) {
 
                 ytPlayerRef.current = new window.YT.Player('yt-player-container', {
                     videoId: mediaData.id,
-                    playerVars: { 
-                        autoplay: 1, 
-                        controls: 0, 
-                        rel: 0, 
-                        modestbranding: 1, 
-                        enablejsapi: 1, 
-                        mute: (isPreview || muted) ? 1 : 0 
+                    playerVars: {
+                        autoplay: 1,
+                        controls: 0,
+                        rel: 0,
+                        modestbranding: 1,
+                        enablejsapi: 1,
+                        mute: (isPreview || muted) ? 1 : 0
                     },
                     events: {
                         onReady: (event) => {
@@ -332,10 +343,15 @@ export default function MediaGraphic({ socket, windowMode }) {
                             if (event.data === 0) {
                                 handleMediaEnd();
                             }
+                        },
+                        onError: (event) => {
+                            console.error("YouTube player error, code:", event.data);
                         }
                     }
                 });
-            }, 50);
+            };
+
+            tryInitYouTubePlayer();
         } else if (mediaData.type === 'local') {
             // Give local video a moment to mount
             setTimeout(() => {
@@ -345,6 +361,11 @@ export default function MediaGraphic({ socket, windowMode }) {
         }
 
         return () => {
+            cancelled = true;
+            if (ytRetryTimerRef.current) {
+                clearTimeout(ytRetryTimerRef.current);
+                ytRetryTimerRef.current = null;
+            }
             stopMediaTracking();
             stopAudioLevelTracking();
         };
@@ -352,8 +373,15 @@ export default function MediaGraphic({ socket, windowMode }) {
 
     useEffect(() => {
         if (mediaData?.type === 'youtube' && ytPlayerRef.current) {
-            if (muted) ytPlayerRef.current.mute();
-            else ytPlayerRef.current.unMute();
+            // A freshly-constructed YT.Player can land in this same effect
+            // flush before its postMessage handshake with the embedded
+            // iframe completes, so mute/unMute may not exist yet. onReady
+            // already applies the correct initial mute state, so it's safe
+            // to just skip until the API is actually there.
+            try {
+                if (muted) ytPlayerRef.current.mute?.();
+                else ytPlayerRef.current.unMute?.();
+            } catch (e) {}
         }
     }, [muted, mediaData]);
 

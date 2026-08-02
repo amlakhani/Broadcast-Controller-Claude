@@ -227,12 +227,18 @@
 
   .lyrics-glass-panel {
     background: rgba(15, 23, 42, 0.85);
-    box-shadow: 0 25px 60px rgba(0,0,0,0.9); 
+    box-shadow: 0 25px 60px rgba(0,0,0,0.9);
     border-radius: 24px;
     text-align: center;
     max-width: 85%;
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
+    /* No live backdrop-filter here: the panel sits over the video layer, and
+       continuously re-blurring the video every composited frame stalls the
+       Electron paint pipeline that NDI output reads from, showing up as the
+       video freezing on every lyrics line change. Panel is already 85%+
+       opaque so the blur added little visually. Frosted theme re-enables its
+       own blur below since that look actually depends on it. */
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
     border: 1px solid rgba(255, 255, 255, 0.1);
     transition: background 0.4s ease, box-shadow 0.4s ease, border-color 0.4s ease;
   }

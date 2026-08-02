@@ -638,6 +638,14 @@ function App() {
     if (clearUndoTimerRef.current) clearTimeout(clearUndoTimerRef.current);
   }, [socket]);
 
+  // Clear all outputs before the main process reloads this window, so
+  // Preview and Output don't end up desynced (e.g. preview restarting a
+  // clip from 0 while the untouched output window keeps playing it).
+  useEffect(() => {
+    if (!window.broadcastAPI?.onBeforeReload) return undefined;
+    return window.broadcastAPI.onBeforeReload(() => handleClearAll());
+  }, [handleClearAll]);
+
   const handleClearCache = () => {
     if (window.confirm("WARNING: Are you sure you want to clear all saved data (playlists, library, presets, themes)? This cannot be undone.")) {
       localStorage.clear();

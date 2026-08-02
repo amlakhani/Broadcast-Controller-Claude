@@ -125,6 +125,7 @@ export default function LowerThirdsPanel({ socket }) {
     const [activeCueIndex, setActiveCueIndex] = useState(0);
     const [templateNameInput, setTemplateNameInput] = useState('');
     const [templateSaveState, setTemplateSaveState] = useState('idle');
+    const [liveLowerThird, setLiveLowerThird] = useState(null);
 
     const titleInputRef = useRef(null);
     const crossSyncTimerRef = useRef(null);
@@ -171,6 +172,31 @@ export default function LowerThirdsPanel({ socket }) {
         if (!socket) return;
         socket.emit('update_lt_design', currentDesign);
     }, [socket, currentDesign]);
+
+    // Reflect real on-air state regardless of what triggered it (this panel, another
+    // remote, or the main app window) — matches the pattern used by MediaPanel/PresentationPanel.
+    useEffect(() => {
+        if (!socket) return undefined;
+
+        const handlePlayGraphic = (data) => setLiveLowerThird(data || null);
+        const handleStopGraphic = () => setLiveLowerThird(null);
+        const handleOperatorState = (state) => {
+            const current = state?.current?.lowerThird;
+            setLiveLowerThird(prev => (prev ? prev : (current || null)));
+        };
+
+        socket.on('play_graphic', handlePlayGraphic);
+        socket.on('stop_graphic', handleStopGraphic);
+        socket.on('stop_lower_third', handleStopGraphic);
+        socket.on('operator_state_update', handleOperatorState);
+
+        return () => {
+            socket.off('play_graphic', handlePlayGraphic);
+            socket.off('stop_graphic', handleStopGraphic);
+            socket.off('stop_lower_third', handleStopGraphic);
+            socket.off('operator_state_update', handleOperatorState);
+        };
+    }, [socket]);
 
     const attachTransliteration = useCallback((el) => {
         if (!el) return;
@@ -378,6 +404,12 @@ export default function LowerThirdsPanel({ socket }) {
                         detail="Build the next lower third here. Design presets below keep layout, motion, and content untouched."
                         action={(
                             <div className="flex items-center gap-2">
+                                {liveLowerThird && (
+                                    <span className="inline-flex items-center gap-1.5 text-[10px] font-bold text-emerald-600 dark:text-emerald-400 uppercase tracking-wider bg-emerald-500/10 border border-emerald-500/30 rounded-lg px-2 py-1">
+                                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                                        On Air
+                                    </span>
+                                )}
                                 <span className="hidden md:inline-flex text-[10px] font-bold text-slate-500 uppercase tracking-wider border section-rule rounded-lg px-2 py-1">
                                     {selectedShape?.label || appearance.shapeStyle}
                                 </span>
@@ -387,6 +419,18 @@ export default function LowerThirdsPanel({ socket }) {
                             </div>
                         )}
                     />
+
+                    {liveLowerThird && (
+                        <div className="rounded-lg bg-emerald-500/10 border border-emerald-500/20 px-3 py-2">
+                            <div className="text-[10px] font-bold uppercase tracking-wider text-emerald-600 dark:text-emerald-400 mb-1">Currently Live</div>
+                            <div className="text-xs text-slate-700 dark:text-slate-300 truncate">
+                                {liveLowerThird.name || liveLowerThird.title || 'Untitled lower third'}
+                                {liveLowerThird.title && liveLowerThird.name && (
+                                    <span className="font-guj"> — {liveLowerThird.title}</span>
+                                )}
+                            </div>
+                        </div>
+                    )}
 
                     <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_250px] gap-3">
                         <div className="space-y-3">
@@ -436,8 +480,8 @@ export default function LowerThirdsPanel({ socket }) {
                             </div>
 
                             <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-                                <button onClick={handleShow} className="col-span-2 bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-3 rounded-xl font-bold shadow-lg shadow-emerald-600/20 transition active:scale-95">
-                                    TAKE LIVE
+                                <button onClick={handleShow} className={`col-span-2 text-white px-4 py-3 rounded-xl font-bold shadow-lg transition active:scale-95 ${liveLowerThird ? 'bg-amber-600 hover:bg-amber-500 shadow-amber-600/20' : 'bg-emerald-600 hover:bg-emerald-500 shadow-emerald-600/20'}`}>
+                                    {liveLowerThird ? 'UPDATE LIVE' : 'TAKE LIVE'}
                                 </button>
                                 <button onClick={addCurrentToCueQueue} className="control-button-muted text-slate-700 dark:text-slate-200 px-3 py-3 rounded-lg font-bold text-xs active:scale-95">
                                     ADD TO QUEUE
