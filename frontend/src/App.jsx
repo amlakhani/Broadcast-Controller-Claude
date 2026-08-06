@@ -280,6 +280,9 @@ function App() {
   const [outputMode, setOutputMode] = useState(() => {
     return localStorage.getItem('bc-output-background-mode') || 'green';
   });
+  const [fitMode, setFitMode] = useState(() => {
+    return localStorage.getItem('bc-output-fit-mode') === 'fill' ? 'fill' : 'fit';
+  });
   const [layerVisibility, setLayerVisibility] = useState(() => ({
     ...DEFAULT_LAYER_VISIBILITY,
     ...parseJsonSetting('bc-layer-visibility', {})
@@ -399,6 +402,18 @@ function App() {
     };
   }, [socket, throttledSetOperatorState, isRemoteClient, clearRemoteSession]);
 
+  // Forwards a clicker keypress captured globally in the main process (registered once at
+  // startup — see main.js's registerClickerShortcuts) to the same server-authoritative
+  // pres_nav path every other slide-navigation source already uses. `window.broadcastAPI`
+  // only exists inside the Electron control window (see preload.cjs) — a /remote session
+  // opened in a plain phone browser has no such bridge.
+  useEffect(() => {
+    if (!socket || !window.broadcastAPI?.onPresentationClickerNav) return undefined;
+    return window.broadcastAPI.onPresentationClickerNav((direction) => {
+      socket.emit('pres_nav', direction);
+    });
+  }, [socket]);
+
   useEffect(() => {
     if (!socket) return undefined;
     const handleNdiStatus = (status) => throttledSetNdiStatus(status);
@@ -485,6 +500,7 @@ function App() {
     if (!socket) return undefined;
     const handleOutputMode = (data) => {
       if (data?.backgroundMode) setOutputMode(data.backgroundMode);
+      if (data?.fitMode) setFitMode(data.fitMode);
     };
     const handleLayerVisibility = (data) => {
       if (data) setLayerVisibility(prev => ({ ...prev, ...data }));
@@ -516,6 +532,13 @@ function App() {
       socket.emit('output_mode_update', { backgroundMode: outputMode });
     }
   }, [outputMode, socket]);
+
+  useEffect(() => {
+    localStorage.setItem('bc-output-fit-mode', fitMode);
+    if (socket) {
+      socket.emit('output_mode_update', { fitMode });
+    }
+  }, [fitMode, socket]);
 
   useEffect(() => {
     localStorage.setItem('bc-layer-visibility', JSON.stringify(layerVisibility));
@@ -1327,6 +1350,28 @@ function App() {
                           {mode.label}
                         </button>
                       ))}
+                    </div>
+
+                    <div>
+                      <div className="flex items-center justify-between gap-2">
+                        <div>
+                          <div className="text-xs font-bold text-slate-700 dark:text-slate-300">Fill Display</div>
+                          <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                            Crop to fill a non-16:9 or non-1080p display instead of showing key-colour bars.
+                            Only use this when there's no downstream switcher/keyer relying on the bars.
+                          </p>
+                        </div>
+                        <button
+                          onClick={() => setFitMode(prev => prev === 'fill' ? 'fit' : 'fill')}
+                          className={`shrink-0 px-3 py-2 rounded-lg text-xs font-bold transition active:scale-95 ${
+                            fitMode === 'fill'
+                              ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/20'
+                              : 'control-button-muted text-slate-600 dark:text-slate-300'
+                          }`}
+                        >
+                          {fitMode === 'fill' ? 'On' : 'Off'}
+                        </button>
+                      </div>
                     </div>
 
                     <div className="grid grid-cols-2 md:grid-cols-3 gap-2">

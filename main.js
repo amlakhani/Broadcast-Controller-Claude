@@ -1,4 +1,4 @@
-import { app, BrowserWindow, screen, ipcMain, dialog, session, Menu, shell } from 'electron';
+import { app, BrowserWindow, screen, ipcMain, dialog, session, Menu, shell, globalShortcut } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
@@ -27,6 +27,34 @@ let backstageWindow;
 let serverPort = null;
 let ndiOutputService = null;
 let atemService = null;
+
+// System-wide presentation-clicker capture, active for the app's whole lifetime (registered
+// once, unregistered at quit). Covers every key mapping in common use across clicker models —
+// PageDown/PageUp is the most common standard, but plenty of models send plain arrow keys
+// instead, and some (mainly combo laser-pointer/media-remote units) send the media-transport
+// keys instead of either. Space is deliberately excluded from the global set even though the
+// local in-window handler (PresentationGraphic.jsx) treats it as "next" too — hijacking the
+// spacebar system-wide (not just while presenting) would eat spaces typed into every other
+// running application, a much bigger footprint than arrow/page/media keys.
+const CLICKER_NEXT_KEYS = ['PageDown', 'Right', 'Down', 'MediaNextTrack'];
+const CLICKER_PREV_KEYS = ['PageUp', 'Left', 'Up', 'MediaPreviousTrack'];
+
+function registerClickerShortcuts() {
+    const sendNav = (direction) => () => {
+        console.log(`[clicker] nav "${direction}" triggered`);
+        controlWindow?.webContents.send('presentation-clicker-nav', direction);
+    };
+    const results = [];
+    for (const key of [...CLICKER_NEXT_KEYS, ...CLICKER_PREV_KEYS]) {
+        const direction = CLICKER_NEXT_KEYS.includes(key) ? 'next' : 'prev';
+        const ok = globalShortcut.register(key, sendNav(direction));
+        results.push(`${key}=${ok ? 'ok' : 'FAILED'}`);
+        if (!ok) {
+            console.warn(`[clicker] Failed to register global shortcut "${key}" — it may already be in use by another application. Presentation clicker navigation mapped to this key will not work.`);
+        }
+    }
+    console.log(`[clicker] global shortcut registration: ${results.join(', ')}`);
+}
 
 function localAppUrl(pathname = '/', params = {}) {
     const url = new URL(`http://127.0.0.1:${serverPort}${pathname}`);
@@ -195,7 +223,12 @@ function createWindows() {
             preload: path.join(__dirname, 'preload.cjs'),
             nodeIntegration: false,
             contextIsolation: true,
-            sandbox: false
+            sandbox: false,
+            // Same reasoning as the graphics/stage/backstage windows below: an operator
+            // routinely leaves this window unfocused while looking at the output display,
+            // and Chromium throttling its nested frames (e.g. the Live Preview iframe)
+            // while unfocused reads as "the preview stopped updating".
+            backgroundThrottling: false
         }
     });
 
@@ -469,6 +502,7 @@ async function logGpuStatus() {
 app.whenReady().then(() => {
     setAppMenu();
     logGpuStatus();
+    registerClickerShortcuts();
     setTranslationGlossaryDir(app.getPath('userData'));
     ndiOutputService = new NdiOutputService({
         preloadPath: path.join(__dirname, 'preload.cjs'),
@@ -733,7 +767,6 @@ app.whenReady().then(() => {
         return !result.canceled && result.filePaths.length > 0 ? result.filePaths[0] : null;
     });
 
-
     // Handle display plugin/unplug updates dynamically
     screen.on('display-added', broadcastDisplays);
     screen.on('display-removed', (event, oldDisplay) => {
@@ -777,6 +810,7 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+    globalShortcut.unregisterAll();
     ndiOutputService?.stop().catch(err => {
         console.error('Error stopping NDI output:', err);
     });

@@ -17,7 +17,7 @@ import {
     X
 } from 'lucide-react';
 import { deferUntilIdle, readLocalStorageArraySafe, useDebouncedLocalStorageEffect } from '../utils/performance';
-import { EMPTY_PRESENTATION, getDeckType, normalizeCanvaUrl, parseSourceUrl } from '../utils/presentation';
+import { EMPTY_PRESENTATION, getDeckType, normalizeCanvaUrl, parseSourceUrl, slideImageUrl } from '../utils/presentation';
 
 const LIBRARY_KEY = 'bc_pres_library_v1';
 
@@ -77,18 +77,15 @@ export default function PresentationPanel({ socket, isActive }) {
         }
     };
 
+    // Emits a *deck change* (new source, cleared, staged deck committed). Navigation
+    // and show/hide go through pres_goto/pres_set_showing instead — see `navigate`,
+    // `jumpToSlide`, `handleGoLive`/`handleTakeDown` below — so `pres_update` only
+    // fires when the deck itself changes. That distinction is what lets the server
+    // hand out a stable deck id and strip images from the payload sent to remotes.
     const emitState = useCallback((newState) => {
         if (!socket) return;
         socket.emit('pres_update', newState);
     }, [socket]);
-
-    const updateStateAndEmit = useCallback((updates) => {
-        setPresState(prev => {
-            const next = { ...prev, ...updates };
-            emitState(next);
-            return next;
-        });
-    }, [emitState]);
 
     const handleLoadUrlWithData = useCallback((url, total) => {
         const parsed = parseSourceUrl(url, total);
@@ -147,6 +144,7 @@ export default function PresentationPanel({ socket, isActive }) {
                 type: 'Image Deck',
                 mode: 'images',
                 images: stagingImages.map(img => img.src),
+                thumbs: stagingImages.map(img => img.thumb || img.src),
                 totalSlides: stagingImages.length
             };
             const newLib = [...library, newItem];
@@ -234,6 +232,9 @@ export default function PresentationPanel({ socket, isActive }) {
             const nextState = {
                 ...EMPTY_PRESENTATION,
                 images: item.images || [],
+                // Decks saved before thumbnails existed have no `thumbs` — the slide
+                // endpoint already falls back to the full image when one is missing.
+                thumbs: item.thumbs || [],
                 mode: 'images',
                 currentIdx: 0,
                 totalSlides: (item.images || []).length
@@ -278,6 +279,47 @@ export default function PresentationPanel({ socket, isActive }) {
         if (fileInputRef.current) fileInputRef.current.value = '';
     };
 
+    const THUMB_MAX_WIDTH = 320;
+
+    // Downscaled JPEG for the "All Slides" grid on the remote, generated once at
+    // ingest so a 40-slide deck doesn't mean pulling ~12MB of full-resolution
+    // slides just to render ~120px tiles. Reuses the canvas already produced by
+    // PDF rendering below; sharp/jimp aren't dependencies of this project and
+    // pulling one in for a background-thumbnail pass isn't worth the native-module
+    // build story it drags along (see rebuild:ndi:* in package.json).
+    const canvasThumbnail = (sourceCanvas, maxWidth = THUMB_MAX_WIDTH) => {
+        if (sourceCanvas.width <= maxWidth) return sourceCanvas.toDataURL('image/jpeg', 0.7);
+        const scale = maxWidth / sourceCanvas.width;
+        const thumbCanvas = document.createElement('canvas');
+        thumbCanvas.width = maxWidth;
+        thumbCanvas.height = Math.round(sourceCanvas.height * scale);
+        thumbCanvas.getContext('2d').drawImage(sourceCanvas, 0, 0, thumbCanvas.width, thumbCanvas.height);
+        return thumbCanvas.toDataURL('image/jpeg', 0.6);
+    };
+
+    // Same idea for uploaded images, which only exist as a data URL (no canvas yet)
+    // until this decodes one to draw the scaled-down version.
+    const imageThumbnail = (dataUrl, maxWidth = THUMB_MAX_WIDTH) => new Promise((resolve) => {
+        const img = new Image();
+        img.onload = () => {
+            try {
+                resolve(canvasThumbnail(imageToCanvas(img), maxWidth));
+            } catch {
+                resolve(dataUrl); // last resort: never smaller a fallback than the source itself
+            }
+        };
+        img.onerror = () => resolve(dataUrl);
+        img.src = dataUrl;
+    });
+
+    const imageToCanvas = (img) => {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.naturalWidth || img.width;
+        canvas.height = img.naturalHeight || img.height;
+        canvas.getContext('2d').drawImage(img, 0, 0);
+        return canvas;
+    };
+
     const handleFileUpload = async (e) => {
         const files = Array.from(e.target.files || []);
         if (!files.length) return;
@@ -314,6 +356,7 @@ export default function PresentationPanel({ socket, isActive }) {
                     newStaging.push({
                         id: Math.random().toString(36).slice(2),
                         src: canvas.toDataURL('image/jpeg', 0.82),
+                        thumb: canvasThumbnail(canvas),
                         name: `${file.name} page ${i}`
                     });
                     setStatus(`Rendering PDF page ${i}/${pdf.numPages}...`);
@@ -349,11 +392,15 @@ export default function PresentationPanel({ socket, isActive }) {
 
             const loaded = await Promise.all(imageFiles.map(fileToRead => new Promise((resolve, reject) => {
                 const reader = new FileReader();
-                reader.onload = (evt) => resolve({
-                    id: Math.random().toString(36).slice(2),
-                    src: evt.target.result,
-                    name: fileToRead.name
-                });
+                reader.onload = async (evt) => {
+                    const src = evt.target.result;
+                    resolve({
+                        id: Math.random().toString(36).slice(2),
+                        src,
+                        thumb: await imageThumbnail(src),
+                        name: fileToRead.name
+                    });
+                };
                 reader.onerror = reject;
                 reader.readAsDataURL(fileToRead);
             })));
@@ -382,6 +429,7 @@ export default function PresentationPanel({ socket, isActive }) {
         const nextState = {
             ...EMPTY_PRESENTATION,
             images: srcs,
+            thumbs: stagingImages.map(img => img.thumb || img.src),
             mode: 'images',
             currentIdx: 0,
             totalSlides: srcs.length
@@ -442,7 +490,11 @@ export default function PresentationPanel({ socket, isActive }) {
         resetFileInput();
     };
 
+    // Navigation is server-authoritative: emit an absolute index via pres_goto and
+    // let the pres_update echo (below) reconcile state, same as the slides remote.
+    // The local setPresState here is purely optimistic, for zero-latency button feel.
     const navigate = useCallback((direction) => {
+        if (!socket) return;
         setPresState(prev => {
             if (prev.totalSlides === 0) return prev;
             let newIdx = prev.currentIdx;
@@ -456,26 +508,25 @@ export default function PresentationPanel({ socket, isActive }) {
             newIdx = Math.max(0, Math.min(newIdx, prev.totalSlides - 1));
             if (newIdx === prev.currentIdx) return prev;
 
-            const next = { ...prev, currentIdx: newIdx };
-            emitState(next);
+            socket.emit('pres_goto', { index: newIdx });
             setJumpInput(String(newIdx + 1));
-            return next;
+            return { ...prev, currentIdx: newIdx };
         });
-    }, [emitState]);
+    }, [socket]);
 
     const jumpToSlide = () => {
+        if (!socket) return;
         const target = parseInt(jumpInput, 10);
         if (!Number.isFinite(target) || !presState.totalSlides) return;
         const targetIdx = Math.max(0, Math.min(target - 1, presState.totalSlides - 1));
-        updateStateAndEmit({ currentIdx: targetIdx });
+        setPresState(prev => ({ ...prev, currentIdx: targetIdx }));
+        socket.emit('pres_goto', { index: targetIdx });
         setJumpInput(String(targetIdx + 1));
     };
 
-    useEffect(() => {
-        if (!socket) return;
-        socket.on('pres_nav', navigate);
-        return () => socket.off('pres_nav', navigate);
-    }, [socket, navigate]);
+    // pres_nav (from the graphics window's own keyboard handler) is now applied
+    // server-side and comes back through the pres_update listener below, same as
+    // any other client's navigation — no local listener needed.
 
     useEffect(() => {
         if (!socket) return;
@@ -520,13 +571,16 @@ export default function PresentationPanel({ socket, isActive }) {
     }, [isActive, navigate]);
 
     const handleGoLive = () => {
-        if (!presState.totalSlides) return;
-        updateStateAndEmit({ showing: true });
+        if (!presState.totalSlides || !socket) return;
+        setPresState(prev => ({ ...prev, showing: true }));
+        socket.emit('pres_set_showing', true);
         setStatus('Presentation is live on graphics output.');
     };
 
     const handleTakeDown = () => {
-        updateStateAndEmit({ showing: false });
+        if (!socket) return;
+        setPresState(prev => ({ ...prev, showing: false }));
+        socket.emit('pres_set_showing', false);
         setStatus('Presentation taken down. Deck remains loaded.');
     };
 
@@ -550,10 +604,16 @@ export default function PresentationPanel({ socket, isActive }) {
         return presState.baseUrl + (targetIdx + 1);
     };
 
+    // Prefers the cacheable HTTP endpoint over the inline images array. This is
+    // required, not just a nicety: this panel also renders on /remote, where the
+    // server now sends a stripped `images: []` (see the room split in server.js),
+    // so falling back to `presState.images` there would leave every preview
+    // blank. On the desktop it's a bonus — one fewer multi-MB base64 decode.
     const getImageSrc = (offset) => {
         if (presState.mode !== 'images' || !hasSlides) return '';
         const targetIdx = presState.currentIdx + offset;
         if (targetIdx < 0 || targetIdx >= presState.totalSlides) return '';
+        if (presState.deckId) return slideImageUrl(targetIdx, presState.deckId);
         return presState.images[targetIdx] || '';
     };
 
@@ -566,7 +626,7 @@ export default function PresentationPanel({ socket, isActive }) {
             <div className="space-y-2">
                 <span className="text-[10px] font-bold text-slate-500 dark:text-slate-500 uppercase tracking-widest">{label}</span>
                 <div className={`aspect-video bg-black rounded-lg overflow-hidden relative ${isPrimary ? 'border-2 border-emerald-500' : 'border border-slate-300 dark:border-slate-700'}`}>
-                    {presState.mode === 'images' && imageSrc && <img src={imageSrc} alt={label} className="w-full h-full object-contain" />}
+                    {presState.mode === 'images' && imageSrc && <img src={imageSrc} alt={label} decoding="async" className="w-full h-full object-contain" />}
                     {presState.mode === 'url' && iframeSrc && <iframe src={iframeSrc} className="absolute top-0 left-0 w-[1000%] h-[1000%] origin-top-left scale-[0.1] pointer-events-none border-none" title={label}></iframe>}
                     {unavailable && (
                         <div className="absolute inset-0 flex items-center justify-center text-slate-700 dark:text-slate-600 text-[10px] uppercase font-bold tracking-widest">

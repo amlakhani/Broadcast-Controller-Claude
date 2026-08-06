@@ -151,6 +151,27 @@
     box-shadow: 0 10px 24px rgba(8, 11, 16, 0.08);
   }
 
+  /* Slides remote's nav rail: opaque + shadowed while sticky-pinned in portrait
+     (so scrolled preview content doesn't show through it), transparent and static
+     once it becomes the fixed landscape sidebar instead. Deliberately its own
+     class rather than reusing `.surface-raised` — that class's plain `border`
+     shorthand would beat the `landscape:border-l` Tailwind utility in the
+     compiled stylesheet (both land in the same cascade layer, and the shorthand
+     rule happens to come later), putting an unwanted border on all four sides in
+     landscape instead of just the left one. Self-contained media query avoids
+     that fight entirely. */
+  .remote-nav-sticky {
+    background: var(--bc-surface-raised);
+    box-shadow: 0 -6px 16px rgba(8, 11, 16, 0.1);
+  }
+
+  @media (orientation: landscape) {
+    .remote-nav-sticky {
+      background: transparent;
+      box-shadow: none;
+    }
+  }
+
   .control-field {
     width: 100%;
     border-radius: 0.5rem;

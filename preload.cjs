@@ -13,5 +13,10 @@ contextBridge.exposeInMainWorld('broadcastAPI', {
         const listener = () => callback();
         ipcRenderer.on('before-reload', listener);
         return () => ipcRenderer.removeListener('before-reload', listener);
+    },
+    onPresentationClickerNav: (callback) => {
+        const listener = (event, direction) => callback(direction);
+        ipcRenderer.on('presentation-clicker-nav', listener);
+        return () => ipcRenderer.removeListener('presentation-clicker-nav', listener);
     }
 });

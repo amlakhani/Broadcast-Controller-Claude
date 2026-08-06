@@ -517,10 +517,15 @@ test('pres_goto navigates authoritatively and clamps at both ends', async () => 
     operator.emit('pres_goto', { direction: 'last' });
     assert.equal((await last).currentIdx, 2);
 
-    // Already on the last slide: 'next' must be a silent no-op.
+    // Already on the last slide: 'next' must not broadcast pres_update to anyone
+    // -- but the caller still gets a pres_meta acknowledging the clamp, so its UI
+    // doesn't look frozen with no response at all.
     let extra = 0;
     operator.on('pres_update', () => { extra += 1; });
+    const clampAck = waitFor(operator, 'pres_meta');
     operator.emit('pres_goto', { direction: 'next' });
+    const ack = await clampAck;
+    assert.equal(ack.currentIdx, 2, 'the no-op ack should reflect the clamped (unchanged) index');
     await new Promise(resolve => setTimeout(resolve, 80));
     assert.equal(extra, 0, 'pres_goto past the end should not broadcast');
 
@@ -628,20 +633,218 @@ test('serves a single deck slide over HTTP for lightweight remotes', async () =>
     assert.equal(unauthorized.status, 403);
 });
 
+test('deckId is stable across navigation and show/hide, and changes on a new deck', async () => {
+    const operator = await connectClient();
+    operator.emit('pres_update', {
+        mode: 'images', baseUrl: '', slideId: '', currentIdx: 0,
+        totalSlides: 3, images: ['a', 'b', 'c'], isCanva: false, showing: false
+    });
+    const first = await waitFor(operator, 'pres_update');
+    assert.ok(first.deckId, 'a loaded deck must carry a deckId');
+
+    const afterGoto = waitFor(operator, 'pres_update');
+    operator.emit('pres_goto', { direction: 'next' });
+    assert.equal((await afterGoto).deckId, first.deckId, 'navigation must not change the deck id');
+
+    const afterShowing = waitFor(operator, 'pres_update');
+    operator.emit('pres_set_showing', true);
+    assert.equal((await afterShowing).deckId, first.deckId, 'show/hide must not change the deck id');
+
+    operator.emit('pres_update', {
+        mode: 'images', baseUrl: '', slideId: '', currentIdx: 0,
+        totalSlides: 2, images: ['x', 'y'], isCanva: false, showing: false
+    });
+    const second = await waitFor(operator, 'pres_update');
+    assert.ok(second.deckId);
+    assert.notEqual(second.deckId, first.deckId, 'a new deck must get a new id');
+});
+
+test('remotes receive presentation state with images stripped; local sockets do not', async () => {
+    await serverModule.setRemoteAccessEnabled(true);
+    const paired = await pairRemote({ code: serverModule.getRemoteStatus().pairingCode });
+    const remote = await connectRemote(paired.body.remoteToken);
+    const local = await connectClient();
+
+    const localSeen = waitFor(local, 'pres_update');
+    const remoteSeen = waitFor(remote, 'pres_update');
+    local.emit('pres_update', {
+        mode: 'images', baseUrl: '', slideId: '', currentIdx: 0,
+        totalSlides: 2, images: ['a', 'b'], isCanva: false, showing: true
+    });
+
+    const [localState, remoteState] = await Promise.all([localSeen, remoteSeen]);
+    assert.deepEqual(localState.images, ['a', 'b']);
+    assert.deepEqual(remoteState.images, [], 'a remote must never receive the images array over the socket');
+    assert.deepEqual(remoteState.thumbs, [], 'a remote must never receive the thumbs array over the socket either');
+    assert.equal(remoteState.currentIdx, 0);
+    assert.equal(remoteState.totalSlides, 2);
+    assert.equal(remoteState.deckId, localState.deckId, 'both rooms must agree on the deck id');
+});
+
+test('connect replay gives local sockets full presentation state and remotes the stripped version', async () => {
+    const local = await connectClient();
+    local.emit('pres_update', {
+        mode: 'images', baseUrl: '', slideId: '', currentIdx: 0,
+        totalSlides: 1, images: ['solo'], isCanva: false, showing: true
+    });
+    await waitFor(local, 'pres_update');
+
+    await serverModule.setRemoteAccessEnabled(true);
+    const paired = await pairRemote({ code: serverModule.getRemoteStatus().pairingCode });
+
+    const lateLocal = await connectClientWithReplay(['pres_update']);
+    const lateLocalState = await lateLocal.waits.pres_update;
+    assert.deepEqual(lateLocalState.images, ['solo']);
+
+    const remoteSocket = createClient(baseUrl, {
+        autoConnect: false, forceNew: true, reconnection: false,
+        transports: ['websocket'], auth: { remoteToken: paired.body.remoteToken }
+    });
+    openSockets.push(remoteSocket);
+    const remoteReplay = waitFor(remoteSocket, 'pres_update');
+    const remoteConnected = waitFor(remoteSocket, 'connect');
+    remoteSocket.connect();
+    await remoteConnected;
+    const remoteState = await remoteReplay;
+    assert.deepEqual(remoteState.images, [], 'a freshly paired remote must not receive images on replay either');
+});
+
+test('slide endpoint caches immutably only with a matching deckId, and rejects a stale one', async () => {
+    const operator = await connectClient();
+    // 1x1 transparent GIF.
+    const gif = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+    operator.emit('pres_update', {
+        mode: 'images', baseUrl: '', slideId: '', currentIdx: 0,
+        totalSlides: 1, images: [gif], isCanva: false, showing: false
+    });
+    const state = await waitFor(operator, 'pres_update');
+    const deckId = state.deckId;
+    assert.ok(deckId);
+
+    const token = serverModule.getAuthToken();
+
+    // No ?v=: back-compat behaviour, the original always-revalidate response.
+    const noVersion = await fetchWithRetry(`${baseUrl}/api/presentation/slide/0?auth=${token}`);
+    assert.equal(noVersion.status, 200);
+    assert.equal(noVersion.headers.get('cache-control'), 'no-cache');
+
+    // Correct ?v=: immutable, indefinite caching, with an ETag.
+    const versioned = await fetchWithRetry(`${baseUrl}/api/presentation/slide/0?auth=${token}&v=${deckId}`);
+    assert.equal(versioned.status, 200);
+    assert.equal(versioned.headers.get('cache-control'), 'public, max-age=31536000, immutable');
+    const etag = versioned.headers.get('etag');
+    assert.ok(etag);
+
+    // A conditional request carrying that ETag gets a 304. Node's fetch
+    // auto-injects `Cache-Control: no-cache` whenever If-None-Match is present
+    // (undici mimicking a forced end-to-end reload), which Express's `fresh`
+    // check honours by design (RFC 2616 §14.9.4) and always treats as stale --
+    // a real browser's <img> revalidation doesn't send that header, so this
+    // override just keeps the test representative of production traffic.
+    const conditional = await fetchWithRetry(`${baseUrl}/api/presentation/slide/0?auth=${token}&v=${deckId}`, {
+        headers: { 'If-None-Match': etag, 'Cache-Control': 'max-age=0' }
+    });
+    assert.equal(conditional.status, 304);
+
+    // A stale ?v= (a prefetch that raced a deck swap) must never be answered with
+    // the current deck's pixels -- that would poison an immutable cache entry.
+    const stale = await fetchWithRetry(`${baseUrl}/api/presentation/slide/0?auth=${token}&v=not-the-real-deck-id`);
+    assert.equal(stale.status, 409);
+    assert.equal(stale.headers.get('cache-control'), 'no-store');
+});
+
+test('slide endpoint falls back to the full slide when ?w= is requested but no thumbnail exists', async () => {
+    const operator = await connectClient();
+    const gif = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+    // No `thumbs` field at all -- decks saved before thumbnails existed.
+    operator.emit('pres_update', {
+        mode: 'images', baseUrl: '', slideId: '', currentIdx: 0,
+        totalSlides: 1, images: [gif], isCanva: false, showing: false
+    });
+    await waitFor(operator, 'pres_update');
+
+    const token = serverModule.getAuthToken();
+    const res = await fetchWithRetry(`${baseUrl}/api/presentation/slide/0?auth=${token}&w=320`);
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('content-type'), 'image/gif');
+    assert.ok((await res.arrayBuffer()).byteLength > 0);
+});
+
+test('pres_nav moves the deck server-side, same as pres_goto, and clamps silently past the end', async () => {
+    const graphics = await connectClient();
+    const other = await connectClient();
+    graphics.emit('pres_update', {
+        mode: 'images', baseUrl: '', slideId: '', currentIdx: 0,
+        totalSlides: 2, images: ['a', 'b'], isCanva: false, showing: true
+    });
+    await waitFor(graphics, 'pres_update');
+
+    const advanced = waitFor(other, 'pres_update', { predicate: data => data?.currentIdx === 1 });
+    graphics.emit('pres_nav', 'next');
+    assert.equal((await advanced).currentIdx, 1);
+
+    // Already on the last slide: no pres_update should reach anyone else...
+    let otherBroadcasts = 0;
+    other.on('pres_update', () => { otherBroadcasts += 1; });
+    // ...but the caller itself gets a pres_meta acknowledging the clamp.
+    const ackMeta = waitFor(graphics, 'pres_meta');
+    graphics.emit('pres_nav', 'next');
+    const meta = await ackMeta;
+    assert.equal(meta.currentIdx, 1);
+    await new Promise(resolve => setTimeout(resolve, 80));
+    assert.equal(otherBroadcasts, 0, 'pres_nav past the end should not broadcast pres_update');
+});
+
+test('request_pres_state replies directly to the requesting socket, not the whole room', async () => {
+    const operator = await connectClient();
+    const other = await connectClient();
+    operator.emit('pres_update', {
+        mode: 'images', baseUrl: '', slideId: '', currentIdx: 1,
+        totalSlides: 3, images: ['a', 'b', 'c'], isCanva: false, showing: true
+    });
+    await waitFor(operator, 'pres_update');
+    await waitFor(other, 'pres_update');
+
+    // A resync request from `other` must not cause a second broadcast to `operator`.
+    let operatorExtraUpdates = 0;
+    operator.on('pres_update', () => { operatorExtraUpdates += 1; });
+
+    const resynced = waitFor(other, 'pres_update');
+    other.emit('request_pres_state');
+    const resyncedState = await resynced;
+    assert.equal(resyncedState.currentIdx, 1);
+    assert.equal(resyncedState.mode, 'images');
+
+    await new Promise(resolve => setTimeout(resolve, 80));
+    assert.equal(operatorExtraUpdates, 0, 'request_pres_state must reply only to the requester');
+});
+
 test('replays cached presentation, output mode, and layer visibility to new clients', async () => {
     const operator = await connectClient();
 
+    // Every genuine pres_update now gets a server-stamped deckId (see
+    // bumpPresDeckId), so these compare field-by-field rather than a full
+    // deep-equal against a hand-built object that can't predict that id.
     const presState = { mode: 'images', currentIdx: 2, totalSlides: 5, images: ['a', 'b', 'c'], showing: true };
     const presEcho = waitFor(operator, 'pres_update');
     operator.emit('pres_update', presState);
-    assert.deepEqual(await presEcho, presState);
+    const echoed = await presEcho;
+    assert.equal(echoed.mode, presState.mode);
+    assert.equal(echoed.currentIdx, presState.currentIdx);
+    assert.equal(echoed.totalSlides, presState.totalSlides);
+    assert.deepEqual(echoed.images, presState.images);
+    assert.equal(echoed.showing, presState.showing);
+    assert.ok(echoed.deckId, 'a loaded deck must carry a deckId');
 
     const hiddenPresState = { ...presState, showing: false };
     const hiddenPresEcho = waitFor(operator, 'pres_update', {
         predicate: data => data?.showing === false
     });
     operator.emit('pres_update', hiddenPresState);
-    assert.deepEqual(await hiddenPresEcho, hiddenPresState);
+    const hiddenEchoed = await hiddenPresEcho;
+    assert.equal(hiddenEchoed.showing, false);
+    assert.equal(hiddenEchoed.currentIdx, hiddenPresState.currentIdx);
+    assert.ok(hiddenEchoed.deckId);
 
     const clearedPresState = {
         mode: 'none',
@@ -657,13 +860,20 @@ test('replays cached presentation, output mode, and layer visibility to new clie
         predicate: data => data?.mode === 'none'
     });
     operator.emit('pres_update', clearedPresState);
-    assert.deepEqual(await clearedPresEcho, clearedPresState);
+    const clearedEchoed = await clearedPresEcho;
+    assert.equal(clearedEchoed.mode, 'none');
+    assert.equal(clearedEchoed.totalSlides, 0);
+    assert.deepEqual(clearedEchoed.images, []);
 
     const outputEcho = waitFor(operator, 'output_mode_update', {
         predicate: data => data?.backgroundMode === 'transparent'
     });
     operator.emit('output_mode_update', { backgroundMode: 'transparent' });
-    assert.deepEqual(await outputEcho, { backgroundMode: 'transparent' });
+    const outputEchoed = await outputEcho;
+    assert.equal(outputEchoed.backgroundMode, 'transparent');
+    // fitMode wasn't part of this update -- must be preserved (defaulting to 'fit'),
+    // not reset, so an unrelated field's change never silently flips Fill Display.
+    assert.equal(outputEchoed.fitMode, 'fit');
 
     const visibilityPatch = { media: false, lyrics: false, particles: true };
     const layerEcho = waitFor(operator, 'layer_visibility_update', {
@@ -681,11 +891,40 @@ test('replays cached presentation, output mode, and layer visibility to new clie
         'layer_visibility_update'
     ]);
 
-    assert.deepEqual(await replay.waits.pres_update, clearedPresState);
-    assert.deepEqual(await replay.waits.output_mode_update, { backgroundMode: 'transparent' });
+    const replayedPres = await replay.waits.pres_update;
+    assert.equal(replayedPres.mode, 'none');
+    assert.equal(replayedPres.totalSlides, 0);
+    const replayedOutputMode = await replay.waits.output_mode_update;
+    assert.equal(replayedOutputMode.backgroundMode, 'transparent');
+    assert.equal(replayedOutputMode.fitMode, 'fit');
     const replayedLayers = await replay.waits.layer_visibility_update;
     assert.equal(replayedLayers.media, false);
     assert.equal(replayedLayers.lyrics, false);
+});
+
+test('output_mode_update sets fitMode independently and rejects invalid values', async () => {
+    const operator = await connectClient();
+
+    const filled = waitFor(operator, 'output_mode_update', { predicate: data => data?.fitMode === 'fill' });
+    operator.emit('output_mode_update', { fitMode: 'fill' });
+    const filledState = await filled;
+    assert.equal(filledState.fitMode, 'fill');
+    // Setting fitMode alone must not disturb backgroundMode, which the client never sent here.
+    assert.equal(filledState.backgroundMode, 'green');
+
+    // A follow-up update for the *other* field must not undo the fitMode just set.
+    const recoloured = waitFor(operator, 'output_mode_update', { predicate: data => data?.backgroundMode === 'black' });
+    operator.emit('output_mode_update', { backgroundMode: 'black' });
+    const recolouredState = await recoloured;
+    assert.equal(recolouredState.backgroundMode, 'black');
+    assert.equal(recolouredState.fitMode, 'fill', 'an unrelated field update must not reset fitMode');
+
+    // An invalid fitMode is ignored -- preserves whatever was already set rather than
+    // silently reverting to the hardcoded default.
+    const afterInvalid = waitFor(operator, 'output_mode_update');
+    operator.emit('output_mode_update', { fitMode: 'stretch' });
+    const afterInvalidState = await afterInvalid;
+    assert.equal(afterInvalidState.fitMode, 'fill', 'an invalid fitMode must not overwrite the previously valid one');
 });
 
 test('ATEM settings persist locally and validate the switcher address', async () => {
@@ -908,13 +1147,23 @@ test('replays current presentation when confidence monitor requests stage state'
         predicate: data => data?.currentIdx === 4
     });
     operator.emit('pres_update', presState);
-    assert.deepEqual(await presEcho, presState);
+    // Field-by-field: a genuine pres_update now carries a server-stamped deckId
+    // (see bumpPresDeckId) that this hand-built expected object can't predict.
+    const echoed = await presEcho;
+    assert.equal(echoed.mode, presState.mode);
+    assert.equal(echoed.currentIdx, presState.currentIdx);
+    assert.equal(echoed.baseUrl, presState.baseUrl);
+    assert.ok(echoed.deckId);
 
     const replaySeen = waitFor(stage, 'pres_update', {
         predicate: data => data?.currentIdx === 4
     });
     stage.emit('request_stage_state');
-    assert.deepEqual(await replaySeen, presState);
+    const replayed = await replaySeen;
+    assert.equal(replayed.mode, presState.mode);
+    assert.equal(replayed.currentIdx, presState.currentIdx);
+    assert.equal(replayed.baseUrl, presState.baseUrl);
+    assert.equal(replayed.deckId, echoed.deckId, 'the stage replay must carry the same deck id, not a new one');
 });
 
 test('starts, relays, caches, stops, and clears translation worker lifecycle', async () => {
@@ -991,7 +1240,15 @@ test('starts, relays, caches, stops, and clears translation worker lifecycle', a
         predicate: data => data?.mode === 'images' && data?.showing === true
     });
     operator.emit('pres_update', presState);
-    assert.deepEqual(await presEcho, presState);
+    // Field-by-field: a genuine pres_update now carries a server-stamped deckId
+    // (see bumpPresDeckId) that this hand-built expected object can't predict.
+    const echoed = await presEcho;
+    assert.equal(echoed.mode, presState.mode);
+    assert.equal(echoed.currentIdx, presState.currentIdx);
+    assert.equal(echoed.totalSlides, presState.totalSlides);
+    assert.deepEqual(echoed.images, presState.images);
+    assert.equal(echoed.showing, presState.showing);
+    assert.ok(echoed.deckId);
 
     const clearHideSeen = waitFor(graphics, 'hide_translation');
     const presClearSeen = waitFor(graphics, 'pres_update', {

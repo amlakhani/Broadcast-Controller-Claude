@@ -1498,8 +1498,17 @@ app.get('/stream-video', requireAuth, (req, res) => {
     streamLocalFile(req, res, resolveMediaRequest(req, STREAM_EXTENSIONS), 'Media not found');
 });
 
-// Single slide image for image/PDF decks. Lets the slides remote render
-// previews and thumbnails without ever receiving the whole `images` array.
+// Single slide image for image/PDF decks. Lets the slides remote (and, since the
+// pres_update payload split, every output window too) render slides without ever
+// receiving the whole `images` array over the socket.
+//
+// `?v=<deckId>` opts into immutable, indefinite caching: the deck id changes
+// whenever the deck itself changes (see bumpPresDeckId), so index 3 under one id
+// can never mean a different picture later. A request that names a *stale* id
+// (a prefetch that raced a deck swap) gets a 409 rather than the new deck's
+// pixels — answering it would poison the requester's immutable cache entry for
+// that URL forever. Omitting `?v=` keeps the original always-revalidate behaviour,
+// so an older cached frontend bundle still works unchanged.
 app.get('/api/presentation/slide/:index', requireAuth, (req, res) => {
     const images = currentPresState?.images;
     if (currentPresState?.mode !== 'images' || !Array.isArray(images)) {
@@ -1509,12 +1518,45 @@ app.get('/api/presentation/slide/:index', requireAuth, (req, res) => {
     if (!Number.isInteger(index) || index < 0 || index >= images.length) {
         return res.status(404).send('Slide not found');
     }
-    const match = /^data:([\w/+.-]+);base64,(.*)$/s.exec(images[index] || '');
-    if (!match) return res.status(404).send('Slide not available');
 
-    res.set('Content-Type', match[1]);
-    res.set('Cache-Control', 'no-cache');
-    res.send(Buffer.from(match[2], 'base64'));
+    const requestedVersion = typeof req.query.v === 'string' ? req.query.v : '';
+    if (requestedVersion && requestedVersion !== currentPresDeckId) {
+        res.set('Cache-Control', 'no-store');
+        return res.status(409).send('Deck changed');
+    }
+
+    // `?w=` asks for the pre-generated grid thumbnail (see PresentationPanel's
+    // canvasThumbnail/imageThumbnail, generated client-side at ingest — there is
+    // only one thumbnail size, this isn't an arbitrary resize service) instead of
+    // the full-resolution slide. Falls back to the full slide when the deck
+    // predates thumbnails or has none at this index.
+    const wantsThumb = Boolean(req.query.w);
+    const thumbs = currentPresState?.thumbs;
+    const useThumb = wantsThumb && Array.isArray(thumbs) && Boolean(thumbs[index]);
+    const sourceUrl = useThumb ? thumbs[index] : images[index];
+
+    const cacheKey = `${currentPresDeckId}:${index}:${useThumb ? 't' : 'f'}`;
+    let entry = presSlideBufferCache.get(cacheKey);
+    if (!entry) {
+        const match = /^data:([\w/+.-]+);base64,(.*)$/s.exec(sourceUrl || '');
+        if (!match) return res.status(404).send('Slide not available');
+        entry = { type: match[1], buffer: Buffer.from(match[2], 'base64') };
+        presSlideBufferCache.set(cacheKey, entry);
+        if (presSlideBufferCache.size > PRES_SLIDE_CACHE_MAX) {
+            // Evict whichever entry was cached longest ago (Map preserves insertion
+            // order) rather than tracking per-slide distance-from-current — good
+            // enough given the cap only guards a runaway 100+ slide deck.
+            const oldestKey = presSlideBufferCache.keys().next().value;
+            presSlideBufferCache.delete(oldestKey);
+        }
+    }
+
+    res.set('Content-Type', entry.type);
+    res.set('ETag', `"${cacheKey}"`);
+    res.set('Cache-Control', requestedVersion
+        ? 'public, max-age=31536000, immutable'
+        : 'no-cache');
+    res.send(entry.buffer);
 });
 
 
@@ -1525,11 +1567,42 @@ const EMPTY_PRESENTATION_STATE = {
     currentIdx: 0,
     totalSlides: 0,
     images: [],
+    thumbs: [],
     isCanva: false,
     showing: false
 };
 
 let currentPresState = null;
+// Identifies the currently loaded deck so slide image URLs can be cached
+// immutably (see the /api/presentation/slide/:index handler below). Bumped
+// whenever the deck itself changes, never on navigation or show/hide. Prefixed
+// with a per-process random value (not just a counter) so a phone holding a
+// year-long `immutable` cache entry for an old id can never collide with a
+// deck loaded after a server restart, when the counter would otherwise reset.
+const PRES_DECK_ID_PREFIX = crypto.randomBytes(4).toString('hex');
+let presDeckSeq = 0;
+let currentPresDeckId = '';
+// Decoded slide bytes, keyed by `${deckId}:${index}:${full-or-thumb}`. Every
+// output window (graphics/stage/NDI/control preview) plus every paired remote
+// hits the same slide URLs, so decoding each base64 slide once here avoids
+// repeating that work per request. Capped and pruned on each request so a large
+// deck can't pin unbounded memory. Sized for ~15 slides' worth of full+thumb
+// pairs, since the grid and the live/prev/next tiles cache separately now.
+const presSlideBufferCache = new Map();
+const PRES_SLIDE_CACHE_MAX = 60;
+
+function bumpPresDeckId() {
+    presDeckSeq += 1;
+    currentPresDeckId = `${PRES_DECK_ID_PREFIX}${presDeckSeq}`;
+    presSlideBufferCache.clear();
+    // Stamp it onto the state object too, not just the module-level variable —
+    // the 'local' room's pres_update carries currentPresState as-is (see
+    // broadcastPresState), so without this, local windows (desktop panel,
+    // graphics, stage, NDI) would never actually see a deckId even though
+    // getPresMeta()/getPresStateLite() report one correctly for remotes.
+    if (currentPresState) currentPresState = { ...currentPresState, deckId: currentPresDeckId };
+    return currentPresDeckId;
+}
 let currentPresLibrary = [];
 // Control Pad (/pad): the desktop owns both of these and publishes them; the server
 // only caches them so a tablet that connects later has something to render.
@@ -1548,7 +1621,7 @@ let currentMediaPlaying = false;
 let currentMediaLoop = false;
 let currentMediaAutoNext = false;
 let currentMediaMuted = false;
-let currentOutputMode = { backgroundMode: 'green' };
+let currentOutputMode = { backgroundMode: 'green', fitMode: 'fit' };
 let currentLayerVisibility = {
     presentation: true,
     media: true,
@@ -1803,12 +1876,79 @@ function getPresMeta() {
         currentIdx: state.currentIdx || 0,
         totalSlides: state.totalSlides || 0,
         isCanva: Boolean(state.isCanva),
-        showing: Boolean(state.showing)
+        showing: Boolean(state.showing),
+        deckId: currentPresDeckId
     };
 }
 
 function emitPresMeta(target = io) {
     target.emit('pres_meta', getPresMeta());
+}
+
+// Full presentation state, but with `images` stripped. Sent to the 'remote' room
+// (phones/tablets) in place of `currentPresState`. Kept as `images: []` rather than
+// omitted so `{...EMPTY_PRESENTATION, ...state}` spreads on the client behave the
+// same as they do for the full state. `/remote` (the full desktop app served over
+// pairing) relies on the other fields here for its preview strip and status text;
+// its own image previews come from the HTTP slide endpoint (see getPresImageUrl-style
+// usage in PresentationPanel), not from this payload.
+function getPresStateLite() {
+    const base = currentPresState || EMPTY_PRESENTATION_STATE;
+    // Thumbnails are far smaller than full slides, but they're still base64
+    // images-shaped data a remote never needs inline — it fetches them (full or
+    // thumbnail) over the cacheable HTTP endpoint via deckId instead.
+    return { ...base, images: [], thumbs: [], deckId: currentPresDeckId };
+}
+
+// Broadcasts the current presentation state after a genuine change (new deck,
+// navigation, or show/hide). Local sockets (desktop, graphics, stage, NDI) get the
+// full state including `images`; remote sockets (phones/tablets paired over /remote
+// or /slides) get the lite version. Splitting here — rather than only stripping
+// images from the slides remote's own listener — is what keeps socket.io from
+// spending the phone's bandwidth and head-of-line ordering on megabytes of base64
+// it was always going to ignore.
+function broadcastPresState() {
+    io.to('local').emit('pres_update', currentPresState);
+    io.to('remote').emit('pres_update', getPresStateLite());
+    emitPresMeta();
+    emitOperatorState();
+}
+
+function sendPresStateTo(socket) {
+    if (!currentPresState) return;
+    socket.emit('pres_update', isLocalSocket(socket) ? currentPresState : getPresStateLite());
+}
+
+// Server-authoritative navigation, shared by pres_goto (remotes/desktop moving the
+// deck via absolute index) and pres_nav (the graphics window's own keyboard
+// shortcuts, previously a blind client-side relay). Routing both through one
+// function means there is exactly one place that computes the next index and
+// exactly one broadcast per navigation.
+function applyPresGoto(payload, originSocket) {
+    if (!currentPresState || currentPresState.mode === 'none') return;
+    const total = currentPresState.totalSlides || 0;
+    if (total <= 0) return;
+
+    const current = currentPresState.currentIdx || 0;
+    let next = current;
+    const direction = payload?.direction;
+    if (direction === 'next') next = current + 1;
+    else if (direction === 'prev') next = current - 1;
+    else if (direction === 'first') next = 0;
+    else if (direction === 'last') next = total - 1;
+    else if (Number.isInteger(payload?.index)) next = payload.index;
+    else return;
+
+    next = Math.max(0, Math.min(next, total - 1));
+    if (next === current) {
+        // Clamped no-op: re-assert truth to the caller so a drifted remote
+        // un-freezes instead of sitting on a dead button with no response.
+        if (originSocket) originSocket.emit('pres_meta', getPresMeta());
+        return;
+    }
+
+    currentPresState = { ...currentPresState, currentIdx: next };
+    broadcastPresState();
 }
 
 function validateTranslationConfig(config) {
@@ -1880,6 +2020,9 @@ function resetServerStateForTests() {
     previousPairingCode = '';
     previousPairingCodeExpiresAt = 0;
     currentPresState = null;
+    currentPresDeckId = '';
+    presDeckSeq = 0;
+    presSlideBufferCache.clear();
     currentPresLibrary = [];
     currentPadLayout = null;
     currentPadRundown = [];
@@ -1896,7 +2039,7 @@ function resetServerStateForTests() {
     currentMediaLoop = false;
     currentMediaAutoNext = false;
     currentMediaMuted = false;
-    currentOutputMode = { backgroundMode: 'green' };
+    currentOutputMode = { backgroundMode: 'green', fitMode: 'fit' };
     currentLayerVisibility = {
         presentation: true,
         media: true,
@@ -2053,13 +2196,16 @@ async function testLocalAiSettings(settings = loadLocalAiSettings()) {
 
 io.on('connection', (socket) => {
     console.log('A client connected');
+    // Local (desktop/graphics/stage/NDI) vs remote (phone/tablet) determines whether
+    // this socket receives full presentation state (with images) or the lite version.
+    socket.join(isLocalSocket(socket) ? 'local' : 'remote');
     if (socket.data.remoteSession) {
         socket.data.remoteSession.connected = true;
         emitRemoteAccessStatus();
     }
 
     // Send cached state to the new client
-    if (currentPresState) socket.emit('pres_update', currentPresState);
+    sendPresStateTo(socket);
     emitPresMeta(socket);
     if (currentPresLibrary.length) socket.emit('pres_library_update', currentPresLibrary);
     if (currentPadLayout) socket.emit('pad_layout_update', currentPadLayout);
@@ -2230,6 +2376,7 @@ io.on('connection', (socket) => {
         currentPhotoData = null;
         currentMediaMessageOverlay = { ...DEFAULT_MEDIA_MESSAGE_OVERLAY };
         currentPresState = { ...EMPTY_PRESENTATION_STATE };
+        currentPresDeckId = '';
         currentTranslationState = null;
         currentSabhaState = { ...currentSabhaState, showing: false };
         currentLowerThirdState = null;
@@ -2238,11 +2385,9 @@ io.on('connection', (socket) => {
         io.emit('media_stop');
         io.emit('photo_stop');
         io.emit('media_message_overlay_update', currentMediaMessageOverlay);
-        io.emit('pres_update', currentPresState);
-        emitPresMeta();
+        broadcastPresState();
         io.emit('stop_sabha');
         io.emit('hide_translation');
-        emitOperatorState();
     });
 
     socket.on('restore_recent_clear', () => {
@@ -2267,8 +2412,11 @@ io.on('connection', (socket) => {
         }
         if (lastClearSnapshot.presentationState) {
             currentPresState = lastClearSnapshot.presentationState;
-            io.emit('pres_update', currentPresState);
-            emitPresMeta();
+            // A restore is a deck change as far as caching is concerned: the
+            // restored `images` array may not match whatever the retired deck id's
+            // cached slide buffers held, so it needs a fresh id, not the old one.
+            bumpPresDeckId();
+            broadcastPresState();
         }
         if (lastClearSnapshot.sabhaState) {
             currentSabhaState = { ...lastClearSnapshot.sabhaState, showing: true };
@@ -2327,9 +2475,20 @@ io.on('connection', (socket) => {
     socket.on('update_lyrics_layout', (layout) => io.emit('update_lyrics_layout', layout));
 
     socket.on('output_mode_update', (data) => {
+        // The client emits one field at a time (background-mode buttons and the Fill
+        // Display toggle are independent controls, see App.jsx), so an update must
+        // preserve whichever field it doesn't name rather than resetting it to a
+        // hardcoded default -- otherwise, e.g., toggling the key colour would silently
+        // flip Fill Display back to Fit every time.
         const allowedModes = new Set(['green', 'black', 'transparent']);
-        const backgroundMode = allowedModes.has(data?.backgroundMode) ? data.backgroundMode : 'green';
-        currentOutputMode = { backgroundMode };
+        const allowedFitModes = new Set(['fit', 'fill']);
+        const backgroundMode = allowedModes.has(data?.backgroundMode)
+            ? data.backgroundMode
+            : (currentOutputMode.backgroundMode || 'green');
+        const fitMode = allowedFitModes.has(data?.fitMode)
+            ? data.fitMode
+            : (currentOutputMode.fitMode || 'fit');
+        currentOutputMode = { backgroundMode, fitMode };
         io.emit('output_mode_update', currentOutputMode);
         emitOperatorState();
     });
@@ -2389,7 +2548,7 @@ io.on('connection', (socket) => {
 
     socket.on('request_stage_state', () => {
         socket.emit('stage_pres_toggle_update', currentStagePresToggle);
-        if (currentPresState) socket.emit('pres_update', currentPresState);
+        sendPresStateTo(socket);
         socket.emit('stage_neg_flash_update', currentStageNegFlash);
         socket.emit('stage_neg_white_update', currentStageNegWhite);
         if (currentStageMessage) socket.emit('stage_message_update', currentStageMessage);
@@ -2537,46 +2696,32 @@ io.on('connection', (socket) => {
 
     socket.on('pres_update', (data) => {
         currentPresState = data;
-        io.emit('pres_update', data);
-        emitPresMeta();
-        emitOperatorState();
+        bumpPresDeckId();
+        broadcastPresState();
     });
 
-    socket.on('pres_nav', (data) => io.emit('pres_nav', data));
+    // The graphics window's own keyboard shortcuts (ArrowRight/Left/Home/End) used
+    // to be a blind io.emit relay, trusting the desktop panel to compute the next
+    // index. Now it goes through the same authoritative path as every other client.
+    socket.on('pres_nav', (data) => applyPresGoto({ direction: data }, socket));
 
     // Server-authoritative navigation. Lets lightweight clients (the slides
     // remote) move the deck without echoing the whole state object back.
-    socket.on('pres_goto', (payload) => {
-        if (!currentPresState || currentPresState.mode === 'none') return;
-        const total = currentPresState.totalSlides || 0;
-        if (total <= 0) return;
-
-        const current = currentPresState.currentIdx || 0;
-        let next = current;
-        const direction = payload?.direction;
-        if (direction === 'next') next = current + 1;
-        else if (direction === 'prev') next = current - 1;
-        else if (direction === 'first') next = 0;
-        else if (direction === 'last') next = total - 1;
-        else if (Number.isInteger(payload?.index)) next = payload.index;
-        else return;
-
-        next = Math.max(0, Math.min(next, total - 1));
-        if (next === current) return;
-
-        currentPresState = { ...currentPresState, currentIdx: next };
-        io.emit('pres_update', currentPresState);
-        emitPresMeta();
-        emitOperatorState();
-    });
+    socket.on('pres_goto', (payload) => applyPresGoto(payload, socket));
 
     socket.on('pres_set_showing', (showing) => {
         if (!currentPresState || currentPresState.mode === 'none') return;
         currentPresState = { ...currentPresState, showing: Boolean(showing) };
-        io.emit('pres_update', currentPresState);
-        emitPresMeta();
-        emitOperatorState();
+        broadcastPresState();
     });
+
+    // Self-healing resync: lets a client that suspects its cached presentation state has
+    // drifted (e.g. a nested-iframe socket that connected fine but somehow missed a later
+    // pres_update — the Live Preview's presentation layer watches for exactly this) pull a
+    // fresh copy directly, rather than waiting on a future broadcast that might have the
+    // same delivery problem. Replies straight to the requesting socket instead of a room
+    // broadcast, so it recovers even from a socket that's silently fallen out of its room.
+    socket.on('request_pres_state', () => sendPresStateTo(socket));
 
     // The desktop panel owns the saved-deck library; cache it so remotes can list it.
     socket.on('pres_library_update', (library) => {

@@ -35,7 +35,14 @@ export default function GraphicsApp() {
         const params = new URLSearchParams(window.location.search);
         return params.get('backgroundMode') || 'green';
     });
+    const [fitMode, setFitMode] = useState(() => {
+        const params = new URLSearchParams(window.location.search);
+        return params.get('fitMode') === 'fill' ? 'fill' : 'fit';
+    });
     const [layerVisibility, setLayerVisibility] = useState(DEFAULT_LAYER_VISIBILITY);
+    // Set once at mount, same as backgroundMode above -- only the control window's
+    // in-app "Live Preview" iframe sends this, so this never changes for a window's lifetime.
+    const [isPreview] = useState(() => new URLSearchParams(window.location.search).get('preview') === 'true');
 
     // Force CSS reset on mount to eliminate any white border
     useEffect(() => {
@@ -69,6 +76,7 @@ export default function GraphicsApp() {
         };
         const handleOutputModeUpdate = (data) => {
             if (data?.backgroundMode) setBackgroundMode(data.backgroundMode);
+            if (data?.fitMode) setFitMode(data.fitMode);
         };
         const handleLayerVisibilityUpdate = (data) => {
             if (data) setLayerVisibility(prev => ({ ...prev, ...data }));
@@ -116,8 +124,8 @@ export default function GraphicsApp() {
             {mode === 'stage' ? (
                 <StageDisplayGraphic socket={socket} windowMode={mode} />
             ) : (
-                <StageCanvas>
-                    <div style={layerStyle('presentation')}><PresentationGraphic socket={socket} windowMode={mode} /></div>
+                <StageCanvas fitMode={fitMode}>
+                    <div style={layerStyle('presentation')}><PresentationGraphic socket={socket} windowMode={mode} isPreview={isPreview} /></div>
                     <div style={layerStyle('translation')}><TranslationGraphic socket={socket} windowMode={mode} /></div>
                     <div style={layerStyle('lowerThirds')}><LowerThirdsGraphic socket={socket} windowMode={mode} /></div>
                     <div style={layerStyle('lyrics')}><LyricsGraphic socket={socket} windowMode={mode} /></div>

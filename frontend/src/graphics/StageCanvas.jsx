@@ -1,10 +1,10 @@
 import { useLayoutEffect, useRef, useState } from 'react';
-import { STAGE_WIDTH, STAGE_HEIGHT, StageContext, fitScaleFor } from './stage';
+import { STAGE_WIDTH, STAGE_HEIGHT, StageContext, fitScaleFor, fillScaleFor } from './stage';
 
 // Renders the fixed 1920x1080 program frame and scales it to fill the output window,
-// letterboxing into the key colour when the window is not 16:9. See stage.js for why the
-// frame is fixed.
-export default function StageCanvas({ children }) {
+// letterboxing into the key colour when the window is not 16:9 (or cropping to fill edge-to-edge
+// instead, when fitMode is 'fill' — see stage.js). See stage.js for why the frame is fixed.
+export default function StageCanvas({ children, fitMode = 'fit' }) {
     const containerRef = useRef(null);
     // Identity until measured. Deriving the seed from window dimensions looks tempting but
     // an output window that mounts hidden reports 0x0, which yields a large negative offset
@@ -28,7 +28,7 @@ export default function StageCanvas({ children }) {
                 retryFrame = requestAnimationFrame(measure);
                 return;
             }
-            const scale = fitScaleFor(width, height);
+            const scale = (fitMode === 'fill' ? fillScaleFor : fitScaleFor)(width, height);
             setLayout(prev => {
                 const next = {
                     scale,
@@ -54,7 +54,7 @@ export default function StageCanvas({ children }) {
             observer.disconnect();
             window.removeEventListener('resize', measure);
         };
-    }, []);
+    }, [fitMode]);
 
     const { scale, offsetX, offsetY } = layout;
     // A 1920x1080 output (the NDI renderer, the Live Preview iframe, a 1080p projector) is

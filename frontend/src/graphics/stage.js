@@ -21,8 +21,18 @@ export const StageContext = createContext({
 export const useStage = () => useContext(StageContext);
 
 // Fit, never fill: cropping a lower third off the frame edge is never the right answer, so a
-// non-16:9 output letterboxes/pillarboxes into the key colour instead.
+// non-16:9 output letterboxes/pillarboxes into the key colour instead. This is the default —
+// see fillScaleFor below for the opt-in alternative.
 export const fitScaleFor = (containerWidth, containerHeight) => {
     if (!containerWidth || !containerHeight) return 1;
     return Math.min(containerWidth / STAGE_WIDTH, containerHeight / STAGE_HEIGHT);
+};
+
+// Fill instead: for a direct-to-monitor/projector setup with no downstream keyer, where
+// chroma-key letterbox bars would just be unwanted colour on screen rather than something a
+// switcher keys out. Crops whichever axis overflows — StageCanvas's container already clips
+// via overflow:hidden, so no separate crop logic is needed here.
+export const fillScaleFor = (containerWidth, containerHeight) => {
+    if (!containerWidth || !containerHeight) return 1;
+    return Math.max(containerWidth / STAGE_WIDTH, containerHeight / STAGE_HEIGHT);
 };

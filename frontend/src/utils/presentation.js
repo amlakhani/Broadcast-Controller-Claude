@@ -1,6 +1,24 @@
 // Shared presentation deck helpers, used by the desktop Slides panel and the
 // touch slides remote so both build deck state with the same parser.
 
+import { authImageUrl } from '../auth';
+
+// Builds the versioned, cacheable slide-image URL for image/PDF decks. The `v`
+// query param is the deck id (see server.js's bumpPresDeckId / the
+// /api/presentation/slide/:index handler) — including it is what turns the
+// response into something the browser can cache immutably instead of
+// re-fetching on every navigation. Shared by the slides remote's live/prev/next
+// tiles, its prefetch warm-cache, the "All Slides" grid, and the desktop panel's
+// own previews, so a prefetch anywhere is a cache hit everywhere it matters:
+// they all need to build byte-identical URLs for a given (index, deckId) pair.
+// `opts.w` asks the server for the pre-generated grid thumbnail instead of the
+// full-resolution slide (falls back to full-res if the deck predates thumbnails).
+export const slideImageUrl = (index, deckId, opts = {}) =>
+    authImageUrl(`/api/presentation/slide/${index}`, {
+        ...(deckId ? { v: deckId } : {}),
+        ...(opts.w ? { w: opts.w } : {})
+    });
+
 export const EMPTY_PRESENTATION = {
     mode: 'none',
     baseUrl: '',
@@ -8,8 +26,10 @@ export const EMPTY_PRESENTATION = {
     currentIdx: 0,
     totalSlides: 0,
     images: [],
+    thumbs: [],
     isCanva: false,
-    showing: false
+    showing: false,
+    deckId: ''
 };
 
 export const getDeckType = (itemOrUrl = {}) => {
