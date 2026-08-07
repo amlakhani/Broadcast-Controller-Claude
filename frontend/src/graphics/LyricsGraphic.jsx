@@ -48,7 +48,6 @@ export default function LyricsGraphic({ socket, windowMode }) {
                              newData.bgStyle === 'cinematic-gradient';
 
         const startAnimationList = () => {
-            const prevAnim = currentAnimationRef.current;
             currentAnimationRef.current = newData.animation || 'fade';
             setData(newData);
             if (newData.style) setStyle(newData.style);
@@ -112,14 +111,23 @@ export default function LyricsGraphic({ socket, windowMode }) {
         }
     });
 
+    // contextSafe() hands back a fresh function on every render, so depending on animateIn /
+    // animateOut directly made this effect tear down and re-attach all five listeners on every
+    // render — and a verse change causes several. Refs keep the handlers current without making
+    // the subscription churn. Same pattern as LowerThirdsGraphic.
+    const animateInRef = useRef(animateIn);
+    animateInRef.current = animateIn;
+    const animateOutRef = useRef(animateOut);
+    animateOutRef.current = animateOut;
+
     useEffect(() => {
         if (!socket) return;
 
         const handlePlayLyrics = (d) => {
-            animateIn(d);
+            animateInRef.current(d);
         };
         const handleStopGraphic = () => {
-            animateOut();
+            animateOutRef.current();
         };
         const handleLyricsStyleUpdate = (s) => {
             if (isShowingRef.current) {
@@ -145,7 +153,7 @@ export default function LyricsGraphic({ socket, windowMode }) {
             socket.off('update_lyrics_style', handleLyricsStyleUpdate);
             socket.off('update_lyrics_layout', handleLyricsLayoutUpdate);
         };
-    }, [socket, animateIn, animateOut]);
+    }, [socket]);
 
     const getLangVisibility = (lang) => {
         const langOpt = data?.langOpt || 'both';

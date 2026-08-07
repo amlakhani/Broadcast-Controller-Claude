@@ -137,10 +137,34 @@ async function closeServer() {
     await new Promise(resolve => serverModule.io.close(resolve));
 }
 
-function emitWithAck(socket, event, payload) {
-    return new Promise(resolve => {
-        socket.emit(event, payload, resolve);
+// Races the ack so a handler that never calls back fails fast with a useful message instead of
+// hanging until the runner's timeout. The classic cause is an (ack) handler being emitted to
+// with (payload, ack): the payload binds to `ack` and the real callback lands in slot 2, so it
+// is never invoked. Emit manually with exactly one argument for those handlers.
+function emitWithAck(socket, event, payload, { timeout = 2000 } = {}) {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            reject(new Error(
+                `No ack for "${event}" within ${timeout}ms. Either the handler never acks, or it takes a single (ack) param and this helper's (payload, ack) shape put the callback in the wrong position.`
+            ));
+        }, timeout);
+        socket.emit(event, payload, (result) => {
+            clearTimeout(timer);
+            resolve(result);
+        });
     });
+}
+
+// validateExecutablePath requires a .exe/.cmd/.bat extension on win32 and the executable bit
+// elsewhere, so a fixture named plain "whisper-cli" is only valid on POSIX. Build the name the
+// host platform will actually accept.
+function writeFakeExecutable(baseName) {
+    const filePath = path.join(testDataDir, process.platform === 'win32' ? `${baseName}.exe` : baseName);
+    fs.writeFileSync(filePath, 'fake executable');
+    if (process.platform !== 'win32') {
+        fs.chmodSync(filePath, 0o755);
+    }
+    return filePath;
 }
 
 async function fetchWithRetry(url, options, attempts = 2) {
@@ -171,6 +195,10 @@ afterEach(async () => {
     }
     await serverModule.setRemoteAccessEnabled(false);
     serverModule.setTranslationWorkerFactoryForTests(null);
+    // Must be reset here, not at the end of the test that sets it: a failing assertion would
+    // otherwise leave a resolver installed and silently change the next test's behaviour.
+    serverModule.setTranslationSecretResolver(null);
+    serverModule.setPresentationLiveListener(null);
     serverModule.saveRemoteNetworkSelection('auto');
     serverModule.resetServerStateForTests();
     serverModule.saveTranslationGlossary([]);
@@ -305,6 +333,33 @@ test('remote logout revokes only the current remote session', async () => {
     await errorSeen;
 });
 
+test('a multi-byte auth token is rejected without crashing the server', async () => {
+    // 64 chars, 128 bytes. A string-length comparison would let this reach timingSafeEqual,
+    // which throws RangeError on a byte-length mismatch — fatal inside the io.use middleware.
+    const multiByteToken = 'é'.repeat(serverModule.getAuthToken().length);
+
+    const rejected = createClient(baseUrl, {
+        autoConnect: false,
+        forceNew: true,
+        reconnection: false,
+        transports: ['websocket'],
+        auth: { token: multiByteToken }
+    });
+    openSockets.push(rejected);
+    const errorSeen = waitFor(rejected, 'connect_error');
+    rejected.connect();
+    await errorSeen;
+
+    // Over HTTP too, and the server must still be serving afterwards.
+    const httpDenied = await fetchWithRetry(`${baseUrl}/?auth=${encodeURIComponent(multiByteToken)}`, {
+        headers: { connection: 'close' }
+    });
+    assert.equal(httpDenied.status, 403);
+
+    const survivor = await connectClient();
+    assert.equal(survivor.connected, true);
+});
+
 test('remote pairing sets a cookie that can authorize protected requests without query tokens', async () => {
     await serverModule.setRemoteAccessEnabled(true);
     const paired = await pairRemote({ code: serverModule.getRemoteStatus().pairingCode });
@@ -317,6 +372,38 @@ test('remote pairing sets a cookie that can authorize protected requests without
     assert.equal(status.status, 200);
     const body = await status.json();
     assert.equal(body.session.deviceName, 'Remote Test');
+});
+
+test('a paired remote is never served a page carrying the local auth token', async () => {
+    await serverModule.setRemoteAccessEnabled(true);
+    const paired = await pairRemote({ code: serverModule.getRemoteStatus().pairingCode });
+    const cookie = paired.response.headers.get('set-cookie');
+
+    // The desktop surfaces embed AUTH_TOKEN, so a remote must be refused outright.
+    for (const route of ['/', '/index.html', '/graphics', '/graphics.html', '/backstage', '/backstage.html']) {
+        const denied = await fetchWithRetry(`${baseUrl}${route}`, {
+            headers: { cookie, connection: 'close' }
+        });
+        assert.equal(denied.status, 403, `${route} must not be served to a paired remote`);
+    }
+
+    // The remote surfaces are fine to serve, but must never leak the token in their HTML.
+    for (const route of ['/remote', '/slides', '/pad']) {
+        const allowed = await fetchWithRetry(`${baseUrl}${route}`, {
+            headers: { cookie, connection: 'close' }
+        });
+        assert.equal(allowed.status, 200, `${route} should remain reachable`);
+        const html = await allowed.text();
+        assert.equal(html.includes('__BC_AUTH_TOKEN__'), false, `${route} must not embed the local token`);
+        assert.equal(html.includes(serverModule.getAuthToken()), false, `${route} must not contain the token value`);
+    }
+
+    // The desktop itself must still work.
+    const local = await fetchWithRetry(`${baseUrl}/?auth=${serverModule.getAuthToken()}`, {
+        headers: { connection: 'close' }
+    });
+    assert.equal(local.status, 200);
+    assert.match(await local.text(), /__BC_AUTH_TOKEN__/);
 });
 
 test('remote clients cannot stream unregistered local media paths', async () => {
@@ -346,6 +433,192 @@ test('remote clients cannot stream unregistered local media paths', async () => 
         headers: { cookie, connection: 'close' }
     });
     assert.equal(allowed.status, 200);
+});
+
+test('even the local token cannot read arbitrary files by path', async () => {
+    const mediaPath = path.join(testDataDir, 'operator-private.mp4');
+    fs.writeFileSync(mediaPath, 'not really a video');
+    const token = serverModule.getAuthToken();
+
+    // The ?path= fallback was an unrestricted filesystem read for any local-token holder.
+    for (const route of ['/stream-video', '/local-video', '/local-image']) {
+        const denied = await fetchWithRetry(
+            `${baseUrl}${route}?path=${encodeURIComponent(mediaPath)}&auth=${token}`,
+            { headers: { connection: 'close' } }
+        );
+        assert.equal(denied.status, 404, `${route} must not resolve a raw path`);
+    }
+
+    // The registered-id route still works.
+    const registered = await fetch(`${baseUrl}/api/local-media/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-bc-auth-token': token },
+        body: JSON.stringify({ path: mediaPath, type: 'local' })
+    });
+    const { media } = await registered.json();
+    const allowed = await fetchWithRetry(
+        `${baseUrl}/stream-video?mediaId=${encodeURIComponent(media.mediaId)}&auth=${token}`,
+        { headers: { connection: 'close' } }
+    );
+    assert.equal(allowed.status, 200);
+});
+
+test('pres_update is shape-checked, and inline image decks are local-only', async () => {
+    const local = await connectClient();
+
+    // Garbage shape is rejected outright rather than becoming server state.
+    assert.equal((await emitWithAck(local, 'pres_update', 'not-an-object')).ok, false);
+
+    // Unknown modes fall back rather than being stored verbatim.
+    assert.equal((await emitWithAck(local, 'pres_update', { mode: 'evil', currentIdx: -5 })).ok, true);
+    assert.equal(serverModule.getPresStateForTests().mode, 'none');
+    assert.equal(serverModule.getPresStateForTests().currentIdx, 0);
+
+    // Too many slides is refused. (The byte cap is covered directly below, rather than by
+    // pushing tens of megabytes through a socket.)
+    const tooManySlides = { mode: 'images', images: Array.from({ length: 501 }, () => 'x') };
+    assert.equal((await emitWithAck(local, 'pres_update', tooManySlides)).ok, false);
+
+    // A local client may load a real image deck.
+    const deck = { mode: 'images', images: ['data:image/jpeg;base64,AAAA'], totalSlides: 1 };
+    assert.equal((await emitWithAck(local, 'pres_update', deck)).ok, true);
+    assert.equal(serverModule.getPresStateForTests().images.length, 1);
+
+    // A paired remote may load a URL deck but not one carrying inline images.
+    await serverModule.setRemoteAccessEnabled(true);
+    const paired = await pairRemote({ code: serverModule.getRemoteStatus().pairingCode });
+    const remote = await connectRemote(paired.body.remoteToken);
+
+    assert.equal((await emitWithAck(remote, 'pres_update', deck)).ok, false);
+    const urlDeck = { mode: 'url', baseUrl: 'https://docs.google.com/presentation/d/x/embed?slide=', totalSlides: 12 };
+    assert.equal((await emitWithAck(remote, 'pres_update', urlDeck)).ok, true);
+    assert.equal(serverModule.getPresStateForTests().totalSlides, 12);
+});
+
+test('normalizePresState enforces the deck byte budget', () => {
+    const underBudget = { mode: 'images', images: ['x'.repeat(1024)] };
+    assert.equal(serverModule.normalizePresState(underBudget).ok, true);
+
+    // 65 MB of slide data against a 64 MB cap.
+    const overBudget = { mode: 'images', images: Array.from({ length: 65 }, () => 'x'.repeat(1024 * 1024)) };
+    const rejected = serverModule.normalizePresState(overBudget);
+    assert.equal(rejected.ok, false);
+    assert.match(rejected.error, /too large/i);
+
+    // Null clears the deck rather than being treated as malformed.
+    assert.deepEqual(serverModule.normalizePresState(null), { ok: true, state: null });
+});
+
+test('backstage rows are bounded without losing real cue-sheet content', async () => {
+    const author = await connectClient();
+    const viewer = await connectClient();
+    const seen = waitFor(viewer, 'backstage_state_update');
+
+    author.emit('backstage_state_update', {
+        title: 'Sunday Service',
+        rows: [{
+            id: 'cue-0-01',
+            index: 0,
+            cueNo: '01',
+            segment: 'Welcome',
+            durationSeconds: 300,
+            customFields: [{ label: 'Camera', value: 'Cam 2', index: 9 }],
+            oversized: 'y'.repeat(5000)
+        }]
+    });
+
+    const state = await seen;
+    const row = state.rows[0];
+    assert.equal(state.title, 'Sunday Service');
+    assert.equal(row.segment, 'Welcome');
+    assert.equal(row.durationSeconds, 300);
+    // Custom spreadsheet columns must survive the sanitizer.
+    assert.deepEqual(row.customFields, [{ label: 'Camera', value: 'Cam 2', index: 9 }]);
+    // Runaway cell content is truncated, not passed through.
+    assert.equal(row.oversized.length, 2000);
+});
+
+test('the translation key is resolved server-side instead of coming from the client', async () => {
+    const resolved = [];
+    serverModule.setTranslationSecretResolver((engine) => {
+        resolved.push(engine);
+        return engine === 'azure' ? 'resolved-azure-key' : '';
+    });
+
+    const workers = [];
+    serverModule.setTranslationWorkerFactoryForTests(() => {
+        const worker = new FakeWorker();
+        workers.push(worker);
+        return worker;
+    });
+
+    const local = await connectClient();
+
+    // Note: no `key` field. The old client sent the operator's paid API key on every start.
+    local.emit('start_translation', {
+        engine: 'azure',
+        region: 'eastus',
+        targetLang: 'en',
+        sourceLanguages: ['gu-IN']
+    });
+
+    await waitUntil(() => workers.length === 1, { message: 'Translation worker was not spawned' });
+    assert.deepEqual(resolved, ['azure']);
+    const config = workers[0].sent.find(msg => msg.type === 'start')?.config;
+    assert.equal(config.key, 'resolved-azure-key');
+});
+
+test('an auto-clear started on one client can be cancelled from another', async () => {
+    const desktop = await connectClient();
+    const tablet = await connectClient();
+    const watcher = await connectClient();
+
+    // Only the auto-clear path emits stop_graphic; an explicit hide emits stop_lower_third.
+    // That makes stop_graphic an exact probe for "the timer fired".
+    let autoCleared = false;
+    watcher.on('stop_graphic', () => { autoCleared = true; });
+
+    // Shown from the desktop with a short auto-clear...
+    const shown = waitFor(watcher, 'play_graphic');
+    desktop.emit('show_lower_third', { name: 'Speaker', title: 'Katha', autoClear: 0.3 });
+    await shown;
+
+    // ...and hidden from a different client before it elapses. The timer used to be a
+    // per-socket closure, so this hide could not reach it and the phantom auto-clear still
+    // fired afterwards, blanking output that had already been cleared.
+    const hidden = waitFor(watcher, 'stop_lower_third');
+    tablet.emit('hide_lower_third');
+    await hidden;
+
+    await new Promise(resolve => setTimeout(resolve, 450));
+    assert.equal(autoCleared, false, 'a cancelled auto-clear must not fire later');
+});
+
+test('presentation-live transitions are reported once per change', async () => {
+    // main.js holds the system-wide clicker shortcuts only while this is true, so a missed or
+    // duplicated transition means the arrow keys stay hijacked across the whole machine.
+    const seen = [];
+    serverModule.setPresentationLiveListener((live) => seen.push(live));
+
+    const local = await connectClient();
+
+    await emitWithAck(local, 'pres_update', { mode: 'images', images: ['a', 'b'], totalSlides: 2, showing: false });
+    assert.deepEqual(seen, [], 'a loaded but hidden deck is not live');
+
+    local.emit('pres_set_showing', true);
+    await waitUntil(() => seen.length === 1, { message: 'showing a deck should report live' });
+    assert.deepEqual(seen, [true]);
+
+    // Navigation is not a visibility change and must not re-report.
+    local.emit('pres_goto', { index: 1 });
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.deepEqual(seen, [true], 'navigation must not repeat the transition');
+
+    local.emit('pres_set_showing', false);
+    await waitUntil(() => seen.length === 2, { message: 'hiding a deck should report not-live' });
+    assert.deepEqual(seen, [true, false]);
+
+    serverModule.setPresentationLiveListener(null);
 });
 
 test('remote sessions can control show operations but not local admin actions', async () => {
@@ -1299,10 +1572,8 @@ test('translation glossary persists locally and applies exact multilingual corre
 });
 
 test('local AI settings persist locally and validate required user-installed tools', async () => {
-    const whisperExe = path.join(testDataDir, 'whisper-cli');
+    const whisperExe = writeFakeExecutable('whisper-cli');
     const whisperModel = path.join(testDataDir, 'ggml-base.bin');
-    fs.writeFileSync(whisperExe, 'fake executable');
-    fs.chmodSync(whisperExe, 0o755);
     fs.writeFileSync(whisperModel, 'fake model');
 
     const saved = serverModule.saveLocalAiSettings({
@@ -1330,10 +1601,8 @@ test('local AI settings persist locally and validate required user-installed too
 });
 
 test('starts local AI translation worker and applies glossary to local output', async () => {
-    const whisperExe = path.join(testDataDir, 'whisper-cli-local');
+    const whisperExe = writeFakeExecutable('whisper-cli-local');
     const whisperModel = path.join(testDataDir, 'ggml-local.bin');
-    fs.writeFileSync(whisperExe, 'fake executable');
-    fs.chmodSync(whisperExe, 0o755);
     fs.writeFileSync(whisperModel, 'fake model');
     serverModule.saveLocalAiSettings({
         ollamaBaseUrl: 'http://localhost:11434',

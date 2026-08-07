@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { Video, Play, Film, Trash2, GripVertical, Image as ImageIcon, Layout, Monitor, Trash, Grid, List, Globe, Folder, Upload, Type, X, Clock } from 'lucide-react';
-import { authFetch, authUrl } from '../auth';
+import { authUrl } from '../auth';
+import { ensureMediaIds, registerLocalMedia } from '../utils/localMedia';
 import { deferUntilIdle, readLocalStorageArraySafe, useDebouncedLocalStorageEffect, useThrottledCallback } from '../utils/performance';
 import { scheduleTick, localDateKey, formatCountdown, formatClock12, formatDays } from '../utils/schedule';
 
@@ -99,11 +100,23 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
         if (!seekDraggingRef.current) setCurrentTime(data.currentTime || 0);
     }, 200);
 
+    // mediaIds are per-app-run, so every restored playlist needs fresh ones before its items
+    // can be streamed or thumbnailed. Set the saved list first so the UI paints immediately,
+    // then swap in the registered version.
     useEffect(() => deferUntilIdle(() => {
-        setPlaylist(readLocalStorageArraySafe(MEDIA_PLAYLIST_KEY));
-        setPhotoPlaylist(readLocalStorageArraySafe(PHOTO_PLAYLIST_KEY));
+        const savedPlaylist = readLocalStorageArraySafe(MEDIA_PLAYLIST_KEY);
+        const savedPhotos = readLocalStorageArraySafe(PHOTO_PLAYLIST_KEY);
+        setPlaylist(savedPlaylist);
+        setPhotoPlaylist(savedPhotos);
         setMediaFolders(readLocalStorageArraySafe(MEDIA_FOLDERS_KEY, DEFAULT_FOLDERS));
         setScheduledPlays(readLocalStorageArraySafe(SCHEDULED_PLAYS_KEY));
+
+        ensureMediaIds(savedPlaylist)
+            .then(next => { if (next !== savedPlaylist) setPlaylist(next); })
+            .catch(err => console.error('Could not re-register saved media:', err));
+        ensureMediaIds(savedPhotos)
+            .then(next => { if (next !== savedPhotos) setPhotoPlaylist(next); })
+            .catch(err => console.error('Could not re-register saved photos:', err));
     }), []);
     useDebouncedLocalStorageEffect(SCHEDULED_PLAYS_KEY, scheduledPlays);
 
@@ -191,22 +204,27 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
         socket.on('media_set_muted', handleMuteState);
         socket.on('media_set_loop', handleLoopState);
         socket.on('media_set_auto_next', handleAutoNextState);
-        socket.on('media_next', () => {
-             // We'll use a functional state update to access the latest playlist
-             document.dispatchEvent(new CustomEvent('bc_media_trigger_next'));
-        });
+        // Reads the latest handler through a ref instead of bouncing the event through a
+        // synthetic DOM CustomEvent to dodge a stale closure. The old indirection also made the
+        // listener effect re-subscribe on every playlist change (every drag-reorder, every
+        // thumbnail hydration).
+        const handleMediaNext = () => playNextRef.current?.();
+        socket.on('media_next', handleMediaNext);
 
         socket.emit('request_media_state');
 
         return () => {
             socket.off('media_time_update', handleTimeUpdate);
             socket.off('media_stop', handleMediaStop);
+            // photo_stop was registered but never removed, so it accumulated a duplicate
+            // handler on every remount (and immediately under StrictMode in dev).
+            socket.off('photo_stop', handlePhotoStop);
             socket.off('media_play', handleMediaPlay);
             socket.off('media_toggle_play', handleTogglePlay);
             socket.off('media_set_muted', handleMuteState);
             socket.off('media_set_loop', handleLoopState);
             socket.off('media_set_auto_next', handleAutoNextState);
-            socket.off('media_next');
+            socket.off('media_next', handleMediaNext);
         };
 
     }, [socket, throttledMediaTimeUpdate]);
@@ -224,14 +242,9 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
         };
     }, []);
 
-    // Track next video logic via event listener to avoid stale closure
-    useEffect(() => {
-        const triggerNext = () => {
-            handlePlayNext();
-        };
-        document.addEventListener('bc_media_trigger_next', triggerNext);
-        return () => document.removeEventListener('bc_media_trigger_next', triggerNext);
-    }, [playlist, mediaData]);
+    // Kept current so the media_next socket handler above always calls the latest closure
+    // without having to re-subscribe when the playlist changes.
+    const playNextRef = useRef(null);
 
     const handlePlayNext = () => {
         if (playlist.length === 0) return;
@@ -240,6 +253,8 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
         const nextIndex = (currentIndex + 1) % playlist.length;
         playPlaylistItem(playlist[nextIndex]);
     };
+
+    playNextRef.current = handlePlayNext;
 
     const formatMediaTime = (seconds) => {
         if (!seconds || isNaN(seconds)) return "0:00";
@@ -289,7 +304,8 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
         video.preload = 'metadata';
         video.muted = true;
         video.crossOrigin = 'anonymous';
-        video.src = authUrl('/stream-video', item.mediaId ? { mediaId: item.mediaId } : { path: item.path });
+        if (!item.mediaId) return finish();
+        video.src = authUrl('/stream-video', { mediaId: item.mediaId });
         video.onloadedmetadata = () => {
             const detectedDuration = Number.isFinite(video.duration) ? video.duration : item.duration;
             const captureAt = Math.min(Math.max((detectedDuration || 1) * 0.1, 0.15), 2);
@@ -316,19 +332,6 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
             folderId
         };
         return hydrateLocalVideoItem(item);
-    };
-
-    const registerLocalMedia = async (filePath, type = 'local') => {
-        const response = await authFetch('/api/local-media/register', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ path: filePath, type })
-        });
-        if (!response.ok) {
-            throw new Error('Could not register local media file.');
-        }
-        const result = await response.json();
-        return result.media;
     };
 
     const updatePlaylistItem = (index, patch) => {
@@ -606,19 +609,6 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
         return { ...s, ...patch };
     }));
 
-    const movePlaylistItem = (index, direction, e) => {
-        e.stopPropagation();
-        const newPlaylist = [...playlist];
-        const newIndex = index + direction;
-        if (newIndex < 0 || newIndex >= newPlaylist.length) return;
-        
-        const temp = newPlaylist[index];
-        newPlaylist[index] = newPlaylist[newIndex];
-        newPlaylist[newIndex] = temp;
-        
-        setPlaylist(newPlaylist);
-    };
-
     const handleMediaDrop = async (e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -745,17 +735,6 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
         stopPhotoOutput();
     };
 
-    const movePhotoItem = (index, direction, e) => {
-        if (e) e.stopPropagation();
-        const newPlaylist = [...photoPlaylist];
-        const newIdx = index + direction;
-        if (newIdx < 0 || newIdx >= newPlaylist.length) return;
-        const temp = newPlaylist[index];
-        newPlaylist[index] = newPlaylist[newIdx];
-        newPlaylist[newIdx] = temp;
-        setPhotoPlaylist(newPlaylist);
-    };
-
     const stopPhotoOutput = () => {
         setIsPhotoLive(false);
         setCurrentPhotoIdx(-1);
@@ -849,33 +828,6 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
         setDraggedPhotoIdx(null);
     };
 
-    const handlePlayCurrent = () => {
-        const ytUrl = youtubeUrl.trim();
-        if (ytUrl) {
-            let videoId = '';
-            try {
-                const url = new URL(ytUrl);
-                if (url.hostname.includes('youtu.be')) videoId = url.pathname.slice(1);
-                else videoId = url.searchParams.get('v');
-            } catch (e) {}
-
-            if (videoId) {
-                const payload = { type: 'youtube', id: videoId, name: `YouTube: ${videoId}`, ts: Date.now() };
-                socket?.emit('play_media', payload);
-                setMediaData(payload);
-                setIsPlaying(true);
-            } else {
-                alert("Invalid YouTube URL");
-            }
-        } else if (selectedLocalPath) {
-            const payload = { type: 'local', path: selectedLocalPath, name: localFileName, ts: Date.now() };
-            socket?.emit('play_media', payload);
-            setMediaData(payload);
-            setIsPlaying(true);
-        } else {
-            alert("Please provide a YouTube URL or select a local file.");
-        }
-    };
 
     const handleStopClear = () => {
         socket?.emit('stop_media');
@@ -1339,7 +1291,7 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
                                 {/* Thumbnail */}
                                 {item.type === 'photo' ? (
                                     <img 
-                                        src={authUrl('/local-image', item.mediaId ? { mediaId: item.mediaId } : { path: item.path })} 
+                                        src={item.mediaId ? authUrl('/local-image', { mediaId: item.mediaId }) : undefined}
                                         alt={item.name}
                                         className="w-full h-full object-cover"
                                     />

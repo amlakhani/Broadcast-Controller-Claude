@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react';
 import { io } from 'socket.io-client';
 import { socketOptions } from './auth';
+import ErrorBoundary from './components/ErrorBoundary';
+import { DEFAULT_LAYER_VISIBILITY } from './utils/layers';
 import LowerThirdsGraphic from './graphics/LowerThirdsGraphic';
 import LyricsGraphic from './graphics/LyricsGraphic';
 import StageDisplayGraphic from './graphics/StageDisplayGraphic';
@@ -14,16 +16,6 @@ import StageCanvas from './graphics/StageCanvas';
 
 const socket = io(socketOptions()); // Connects to the host automatically
 
-const DEFAULT_LAYER_VISIBILITY = {
-    presentation: true,
-    media: true,
-    lowerThirds: true,
-    lyrics: true,
-    translation: true,
-    sabhaTimer: true,
-    particles: true,
-    mediaMessage: true,
-};
 
 const NDI_LAYER_SOURCES = new Set(['presentation', 'media', 'lowerThirds', 'lyrics', 'translation', 'sabhaTimer', 'particles', 'mediaMessage']);
 
@@ -119,20 +111,30 @@ export default function GraphicsApp() {
         };
     };
 
+    // Each layer gets its own boundary. A throw inside any one of them used to unmount the
+    // whole output window and put a black frame on air; now only the failing layer goes dark.
+    const layer = (name, node) => (
+        <div style={layerStyle(name)}>
+            <ErrorBoundary label={`graphics:${name}`} socket={socket}>{node}</ErrorBoundary>
+        </div>
+    );
+
     return (
         <div className="fixed inset-0 overflow-hidden">
             {mode === 'stage' ? (
-                <StageDisplayGraphic socket={socket} windowMode={mode} />
+                <ErrorBoundary label="graphics:stage" socket={socket}>
+                    <StageDisplayGraphic socket={socket} windowMode={mode} />
+                </ErrorBoundary>
             ) : (
                 <StageCanvas fitMode={fitMode}>
-                    <div style={layerStyle('presentation')}><PresentationGraphic socket={socket} windowMode={mode} isPreview={isPreview} /></div>
-                    <div style={layerStyle('translation')}><TranslationGraphic socket={socket} windowMode={mode} /></div>
-                    <div style={layerStyle('lowerThirds')}><LowerThirdsGraphic socket={socket} windowMode={mode} /></div>
-                    <div style={layerStyle('lyrics')}><LyricsGraphic socket={socket} windowMode={mode} /></div>
-                    <div style={layerStyle('media')}><MediaGraphic socket={socket} windowMode={mode} /></div>
-                    <div style={layerStyle('sabhaTimer')}><SabhaTimerGraphic socket={socket} windowMode={mode} /></div>
-                    <div style={layerStyle('particles')}><ParticlesGraphic socket={socket} windowMode={mode} /></div>
-                    <div style={layerStyle('mediaMessage')}><MediaMessageOverlayGraphic socket={socket} windowMode={mode} /></div>
+                    {layer('presentation', <PresentationGraphic socket={socket} windowMode={mode} isPreview={isPreview} />)}
+                    {layer('translation', <TranslationGraphic socket={socket} windowMode={mode} />)}
+                    {layer('lowerThirds', <LowerThirdsGraphic socket={socket} windowMode={mode} />)}
+                    {layer('lyrics', <LyricsGraphic socket={socket} windowMode={mode} />)}
+                    {layer('media', <MediaGraphic socket={socket} windowMode={mode} />)}
+                    {layer('sabhaTimer', <SabhaTimerGraphic socket={socket} windowMode={mode} />)}
+                    {layer('particles', <ParticlesGraphic socket={socket} windowMode={mode} />)}
+                    {layer('mediaMessage', <MediaMessageOverlayGraphic socket={socket} windowMode={mode} />)}
                 </StageCanvas>
             )}
         </div>

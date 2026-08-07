@@ -1,8 +1,10 @@
-import { useState, useEffect, useRef, useMemo, useReducer, useCallback } from 'react';
+import { useState, useEffect, useRef, useMemo, useReducer, useCallback, lazy, Suspense } from 'react';
 import { io } from 'socket.io-client';
 import { ChevronLeft, ChevronRight, ClipboardList, Command, ExternalLink, Film, Grid3x3, Languages, LayoutGrid, ListVideo, Monitor, MonitorCheck, Moon, Music, PanelLeftClose, PanelLeftOpen, Pause, Play, Presentation, Radio, RotateCcw, Search, Settings, Sun, Timer, Trash2, Type, X, Zap } from 'lucide-react';
 import { authUrl, getAuthToken, getRemoteToken, isRemoteEntry, socketOptions } from './auth';
 import { useThrottledCallback } from './utils/performance';
+import { downloadBackup, restoreBackup } from './utils/backup';
+import { DEFAULT_LAYER_VISIBILITY } from './utils/layers';
 
 import RunOfShowPanel from './components/RunOfShowPanel';
 import PadLayoutPanel from './components/PadLayoutPanel';
@@ -14,20 +16,14 @@ import MediaPanel from './components/MediaPanel';
 import StageDisplayPanel from './components/StageDisplayPanel';
 import TranslationPanel from './components/TranslationPanel';
 import BackstageCueSheetPanel from './components/BackstageCueSheetPanel';
-import SuperSourcePanel from './components/SuperSourcePanel';
+// Lazy + mounted only after its tab is first opened. It is the heaviest panel in the app
+// (the designer plus its geometry model) and, unlike the others, it only *requests* ATEM state
+// on mount rather than publishing anything — so nothing is lost by not mounting it up front.
+// Once opened it stays mounted, keeping its in-progress layout across tab switches.
+const SuperSourcePanel = lazy(() => import('./components/SuperSourcePanel'));
 import RemotePairing from './components/RemotePairing';
 import RemoteQr from './components/RemoteQr';
 
-const DEFAULT_LAYER_VISIBILITY = {
-  presentation: true,
-  media: true,
-  lowerThirds: true,
-  lyrics: true,
-  translation: true,
-  sabhaTimer: true,
-  particles: true,
-  mediaMessage: true,
-};
 
 const SHOW_PARTICLE_OVERLAY_CONTROLS_KEY = 'bc-show-particle-overlay-controls';
 
@@ -254,6 +250,12 @@ function App() {
   const [remoteAccessPending, setRemoteAccessPending] = useState(false);
   const [socket, setSocket] = useState(null);
   const [activeTab, setActiveTab] = useState('runshow');
+  // Latches true the first time the SuperSource tab is opened, so its lazy chunk is fetched on
+  // demand and then stays mounted (preserving an in-progress layout across tab switches).
+  const [hasVisitedSuperSource, setHasVisitedSuperSource] = useState(false);
+  useEffect(() => {
+    if (activeTab === 'supersource') setHasVisitedSuperSource(true);
+  }, [activeTab]);
   const [navCollapsed, setNavCollapsed] = useState(() => {
     return localStorage.getItem('bc-nav-collapsed') === 'true';
   });
@@ -304,7 +306,6 @@ function App() {
     error: null
   });
   const [operatorState, setOperatorState] = useState(null);
-  const [socketConnected, setSocketConnected] = useState(false);
 
   const [isGraphicsOpen, setIsGraphicsOpen] = useState(false);
   const [isStageOpen, setIsStageOpen] = useState(false);
@@ -331,7 +332,6 @@ function App() {
     localStorage.removeItem('bc-remote-session');
     setRemoteToken('');
     setRemoteSession(null);
-    setSocketConnected(false);
   }, []);
 
   useEffect(() => {
@@ -377,12 +377,10 @@ function App() {
   useEffect(() => {
     if (!socket) return undefined;
     const handleConnect = () => {
-      setSocketConnected(true);
       if (!isRemoteClient) socket.emit('remote_access_status_request');
     };
     const handleDisconnect = (reason) => {
-      setSocketConnected(false);
-      if (!isRemoteClient && reason === 'io server disconnect') {
+        if (!isRemoteClient && reason === 'io server disconnect') {
         setTimeout(() => socket.connect(), 250);
       }
     };
@@ -669,11 +667,53 @@ function App() {
     return window.broadcastAPI.onBeforeReload(() => handleClearAll());
   }, [handleClearAll]);
 
-  const handleClearCache = () => {
-    if (window.confirm("WARNING: Are you sure you want to clear all saved data (playlists, library, presets, themes)? This cannot be undone.")) {
-      localStorage.clear();
-      window.location.reload();
+  const [backupStatus, setBackupStatus] = useState('');
+  const backupInputRef = useRef(null);
+
+  const handleExportBackup = async () => {
+    setBackupStatus('Preparing backup…');
+    try {
+      const backup = await downloadBackup();
+      setBackupStatus(`Exported ${Object.keys(backup.settings).length} settings and ${backup.decks.length} deck(s).`);
+    } catch (err) {
+      console.error('Backup failed:', err);
+      setBackupStatus('Could not create a backup.');
     }
+  };
+
+  const handleImportBackup = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    setBackupStatus('Restoring…');
+    try {
+      const result = await restoreBackup(file);
+      setBackupStatus(`Restored ${result.keys} settings and ${result.decks} deck(s). Reloading…`);
+      setTimeout(() => window.location.reload(), 800);
+    } catch (err) {
+      console.error('Restore failed:', err);
+      setBackupStatus(err.message || 'Could not restore that backup.');
+    }
+  };
+
+  // Scoped to this app's own keys rather than localStorage.clear(), which also wiped unrelated
+  // keys, and now names what is actually about to be lost. The old copy did not mention that it
+  // also destroyed display assignments and (back when they lived here) the API keys.
+  const handleClearCache = () => {
+    const confirmed = window.confirm(
+      'Factory reset will delete your song library, saved presentations and their slides, media '
+      + 'playlists, pad layout, message presets, styles and display assignments on this machine.\n\n'
+      + 'This cannot be undone. Export a backup first if you might want any of it back.\n\n'
+      + 'Continue?'
+    );
+    if (!confirmed) return;
+
+    for (const key of Object.keys(localStorage)) {
+      if (key.startsWith('bc_') || key.startsWith('bc-')) localStorage.removeItem(key);
+    }
+    // Slides live in IndexedDB, so clearing localStorage alone would leave them orphaned.
+    window.indexedDB?.deleteDatabase('bc-decks');
+    window.location.reload();
   };
 
   const handleRemoteAccessToggle = () => {
@@ -1426,13 +1466,33 @@ function App() {
                 <section id="settings-cache" className="surface space-y-3 p-3 rounded-lg scroll-mt-4">
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div>
-                      <h3 className="text-sm font-bold text-slate-800 dark:text-white uppercase tracking-wider">Cache / Reset</h3>
-                      <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">Factory reset clears saved playlists, libraries, presets, themes, and local UI settings.</p>
+                      <h3 className="text-sm font-bold text-slate-800 dark:text-white uppercase tracking-wider">Backup &amp; Reset</h3>
+                      <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                        Export your song library, saved presentations and their slides, playlists, pad layout and presets to a file
+                        &mdash; then import it on another machine or after a reset. API keys are not included; they stay in this
+                        computer&rsquo;s keychain.
+                      </p>
                     </div>
-                    <button onClick={handleClearCache} className="rounded-lg border border-red-500/40 bg-red-500/10 px-4 py-2 text-xs font-bold uppercase tracking-wider text-red-500 transition hover:bg-red-600 hover:text-white active:scale-95">
-                      Factory Reset
-                    </button>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button onClick={handleExportBackup} className="control-button px-4 py-2 text-xs font-bold uppercase tracking-wider">
+                        Export Backup
+                      </button>
+                      <button onClick={() => backupInputRef.current?.click()} className="control-button px-4 py-2 text-xs font-bold uppercase tracking-wider">
+                        Import Backup
+                      </button>
+                      <input
+                        ref={backupInputRef}
+                        type="file"
+                        accept="application/json,.json"
+                        onChange={handleImportBackup}
+                        className="hidden"
+                      />
+                      <button onClick={handleClearCache} className="rounded-lg border border-red-500/40 bg-red-500/10 px-4 py-2 text-xs font-bold uppercase tracking-wider text-red-500 transition hover:bg-red-600 hover:text-white active:scale-95">
+                        Factory Reset
+                      </button>
+                    </div>
                   </div>
+                  {backupStatus && <p className="text-xs text-slate-500 dark:text-slate-400">{backupStatus}</p>}
                 </section>
               </div>
             </div>
@@ -1462,9 +1522,11 @@ function App() {
               />
             </div>
             <div style={{ display: activeTab === 'translation' ? 'block' : 'none' }}><TranslationPanel socket={socket} /></div>
-            {!isRemoteClient && (
+            {!isRemoteClient && hasVisitedSuperSource && (
               <div style={{ display: activeTab === 'supersource' ? 'block' : 'none' }}>
-                <SuperSourcePanel socket={socket} isActive={activeTab === 'supersource'} />
+                <Suspense fallback={<div className="p-6 text-xs text-slate-500">Loading SuperSource Designer…</div>}>
+                  <SuperSourcePanel socket={socket} isActive={activeTab === 'supersource'} />
+                </Suspense>
               </div>
             )}
 

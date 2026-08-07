@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
 import { getRemoteToken, socketOptions } from './auth';
-import RemotePairing, { peekFragmentPairingCode } from './components/RemotePairing';
+import RemotePairing from './components/RemotePairing';
+import { peekFragmentPairingCode } from './utils/pairing';
+import { useWakeLock } from './utils/useWakeLock';
 import PadButton from './components/PadButton';
 import { isPadClickEnabled, playPadClick, setPadClickEnabled } from './components/padClick';
 import {
@@ -195,31 +197,7 @@ export default function RemotePadApp() {
     }, [remoteToken]);
 
     // Keep the screen awake while operating the show.
-    useEffect(() => {
-        if (!remoteToken || typeof navigator === 'undefined' || !navigator.wakeLock) return;
-        let sentinel = null;
-        let cancelled = false;
-
-        const acquire = async () => {
-            try {
-                sentinel = await navigator.wakeLock.request('screen');
-            } catch {
-                // Unsupported or denied — not fatal.
-            }
-        };
-
-        const onVisibility = () => {
-            if (document.visibilityState === 'visible' && !cancelled) acquire();
-        };
-
-        acquire();
-        document.addEventListener('visibilitychange', onVisibility);
-        return () => {
-            cancelled = true;
-            document.removeEventListener('visibilitychange', onVisibility);
-            sentinel?.release?.().catch(() => {});
-        };
-    }, [remoteToken]);
+    useWakeLock(Boolean(remoteToken));
 
     useEffect(() => {
         if (!toast) return;
@@ -359,7 +337,11 @@ export default function RemotePadApp() {
                                 disabled={!connected || !isPadActionAvailable(button.action, { state: operatorState, ctx: { presMeta, mediaTime } })}
                                 active={getPadButtonActive(button, { state: operatorState, ctx: { presMeta } })}
                                 pending={Boolean(pending[button.id])}
-                                onFire={() => fire(button)}
+                                // Passed by reference, not as an inline arrow. `fire` is kept
+                                // stable via live refs specifically so PadButton's memo holds;
+                                // a fresh closure here made memo a no-op and repainted every
+                                // key on every mediaTime tick. PadButton calls onFire(button).
+                                onFire={fire}
                             />
                         ))}
                     </div>

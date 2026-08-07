@@ -47,10 +47,14 @@ error instead of running:
 
 | Platform | Required |
 |---|---|
-| **Windows** | [Node.js](https://nodejs.org/) 18+ · [Python 3](https://www.python.org/) · **Visual Studio Build Tools 2022** with the **"Desktop development with C++"** workload ([download](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022)) |
-| **macOS** | [Node.js](https://nodejs.org/) 18+ · **Xcode Command Line Tools** (`xcode-select --install`) |
+| **Windows** | [Node.js](https://nodejs.org/) 22+ · [Python 3](https://www.python.org/) · **Visual Studio Build Tools 2022** with the **"Desktop development with C++"** workload ([download](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022)) |
+| **macOS** | [Node.js](https://nodejs.org/) 22+ · **Xcode Command Line Tools** (`xcode-select --install`) |
 
 `npm install` checks for these automatically (see `scripts/check-build-prereqs.js`) and fails fast with a specific, actionable message if something's missing, rather than the raw compiler error.
+
+> **Node 22 or newer is required**, not merely recommended: the test runner relies on the shell
+> expanding `tests/*.test.js`, which older Node does not do, and both `package.json` files declare
+> `engines.node >= 22`.
 
 ```bash
 # 1. Install dependencies (root + frontend)
@@ -63,6 +67,34 @@ npm run build:frontend
 # 3. Launch the Electron app
 npm start
 ```
+
+### Running the tests
+```bash
+npm test
+```
+The suite starts the real `server.js` on an ephemeral port and drives it over real socket.io
+connections. **The frontend install above is a hard prerequisite** — the tests import
+`socket.io-client` from `frontend/node_modules`, so running only the root install leaves them
+failing with a module-resolution error.
+
+```bash
+npm --prefix frontend run lint
+```
+
+Both commands, plus the frontend build, run in CI on every push (`.github/workflows/ci.yml`).
+The macOS installers are built separately by `.github/workflows/build-macos.yml`, which runs on
+demand or when a `v*` tag is pushed. There is no Windows CI — `npm run build:win` is manual.
+
+### Where your data is stored
+| What | Where |
+|---|---|
+| Song library, media playlists, pad layout, presets, styles, display assignments | Browser `localStorage` in the app's profile |
+| Saved presentation slides | IndexedDB (`bc-decks`) in the same profile |
+| Azure / Soniox API keys | The OS keychain, via Electron `safeStorage` — never in the browser profile, and never sent to the renderer |
+| Glossary, Local AI, ATEM and remote-network settings | JSON files in Electron's `userData` directory |
+
+Use **Settings → Backup & Reset → Export Backup** to save the first two to a file (this is also how
+you move a library to the venue machine). Factory Reset clears them and cannot be undone.
 
 ### Build installers
 ```bash
@@ -183,15 +215,20 @@ The **Confidence Monitor** shows the speaker timers, prompts, and what's next. T
 
 ### Project layout
 ```
-main.js                  Electron main process (windows, GPU flags, NDI service)
+main.js                  Electron main process (windows, GPU flags, NDI + ATEM services)
 server.js                Express + Socket.IO server (serves UI, syncs state)
 ndi_output_service.js    Offscreen capture → NDI sender
+atem_service.js          ATEM switcher connection + SuperSource push
+translation_secrets.js   API keys, encrypted at rest via Electron safeStorage
+*_translation_worker.js  Azure / Soniox / local (whisper + Ollama) ASR workers
 frontend/src/            React control UI + graphics components
   ├─ App.jsx             Control window (sidebar nav, panels)
   ├─ GraphicsApp.jsx     Output windows (graphics / stage)
   └─ graphics/           Lower thirds, lyrics, media, particles (WebGL), etc.
 public_react/            Built frontend served by the server
+fonts/                   Self-hosted webfonts (Gujarati + Latin) — no CDN at runtime
 scripts/                 Build & native‑NDI rebuild helpers
+tests/                   node --test suite (see "Running the tests" above)
 docs/                    User guide + screenshots
 ```
 

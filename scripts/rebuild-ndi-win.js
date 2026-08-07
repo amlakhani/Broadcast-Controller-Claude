@@ -1,6 +1,7 @@
 import { spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 
 function fail(message) {
     console.error(`NDI Windows rebuild failed: ${message}`);
@@ -64,10 +65,14 @@ if (!fs.existsSync(vcvarsPath)) {
     fail(`vcvars64.bat was not found at ${vcvarsPath}`);
 }
 
-const devDir = path.join('C:\\tmp', 'broadcast-controller-node-gyp-cache');
+// Use os.tmpdir() rather than a hardcoded path at the drive root. The previous location was not
+// a Windows convention, ignored %TEMP%, and failed on a machine where the user cannot create
+// directories at C:\. (The macOS sibling script already did this correctly.)
+const devDir = path.join(os.tmpdir(), 'broadcast-controller-node-gyp-cache');
 fs.mkdirSync(devDir, { recursive: true });
 
-const commandFile = path.join('C:\\tmp', `broadcast-controller-rebuild-ndi-${Date.now()}.cmd`);
+const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-rebuild-ndi-'));
+const commandFile = path.join(scratchDir, 'rebuild-ndi.cmd');
 const commands = [
     '@echo off',
     `call "${vcvarsPath}"`,
@@ -79,11 +84,16 @@ const commands = [
 ].filter(Boolean).join('\r\n');
 fs.writeFileSync(commandFile, commands);
 
-const result = spawnSync('cmd.exe', ['/d', '/c', commandFile], {
-    cwd: process.cwd(),
-    stdio: 'inherit',
-    shell: false
-});
+// finally, so a throw between writing the script and running it can't leak the temp dir.
+let result;
+try {
+    result = spawnSync('cmd.exe', ['/d', '/c', commandFile], {
+        cwd: process.cwd(),
+        stdio: 'inherit',
+        shell: false
+    });
+} finally {
+    fs.rmSync(scratchDir, { recursive: true, force: true });
+}
 
-fs.rmSync(commandFile, { force: true });
-process.exit(result.status ?? 1);
+process.exit(result?.status ?? 1);

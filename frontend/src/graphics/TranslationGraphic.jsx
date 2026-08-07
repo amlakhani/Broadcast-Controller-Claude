@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import gsap from 'gsap';
 import { useGSAP } from '@gsap/react';
-import { applyAnimationIn, applyAnimationOut } from './AnimationUtils';
 import { LAYER_Z } from './layerZ';
 
 // Helper to prune finalized sentences so the total text stays within 2 lines,
@@ -48,6 +47,15 @@ export default function TranslationGraphic({ socket, windowMode }) {
     const isShowingRef = useRef(false);
     const clearTimerRef = useRef(null);
 
+    // Live mirrors of state the socket handler reads. Depending on `style`/`autoClear`
+    // directly meant the listener effect below tore down and re-attached all four listeners on
+    // every render — and `style` is set from every incoming caption, so during live captioning
+    // that happened several times a second. A caption arriving mid-teardown was simply dropped.
+    const styleRef = useRef(style);
+    styleRef.current = style;
+    const autoClearRef = useRef(autoClear);
+    autoClearRef.current = autoClear;
+
     const { contextSafe } = useGSAP({ scope: containerRef });
 
     const triggerAnimateOut = contextSafe(() => {
@@ -75,6 +83,11 @@ export default function TranslationGraphic({ socket, windowMode }) {
         });
     });
 
+    // contextSafe() returns a fresh function on every render, so this is held in a ref for the
+    // same reason as styleRef/autoClearRef above. LowerThirdsGraphic uses this same pattern.
+    const triggerAnimateOutRef = useRef(triggerAnimateOut);
+    triggerAnimateOutRef.current = triggerAnimateOut;
+
     useEffect(() => {
         if (!socket) return;
         
@@ -89,11 +102,11 @@ export default function TranslationGraphic({ socket, windowMode }) {
 
             if (d.style) setStyle(d.style);
             
-            const currentAutoClear = d.layout?.autoClear || autoClear || 0;
+            const currentAutoClear = d.layout?.autoClear || autoClearRef.current || 0;
             setAutoClear(currentAutoClear);
 
             // Update texts and apply pruning
-            const fontSize = d.style?.fontSize || style.fontSize || 48;
+            const fontSize = d.style?.fontSize || styleRef.current.fontSize || 48;
             if (d.isFinal) {
                 setInterimText('');
                 setFinalizedSentences(prev => {
@@ -126,13 +139,13 @@ export default function TranslationGraphic({ socket, windowMode }) {
             // Setup new auto-clear timer if autoClear is positive
             if (currentAutoClear > 0) {
                 clearTimerRef.current = setTimeout(() => {
-                    triggerAnimateOut();
+                    triggerAnimateOutRef.current();
                 }, currentAutoClear * 1000);
             }
         };
 
         const handleHideTranslation = () => {
-            triggerAnimateOut();
+            triggerAnimateOutRef.current();
         };
 
         const handleStyleUpdate = (s) => {
@@ -159,7 +172,7 @@ export default function TranslationGraphic({ socket, windowMode }) {
                 clearTimeout(clearTimerRef.current);
             }
         };
-    }, [socket, windowMode, style, autoClear, triggerAnimateOut]);
+    }, [socket, windowMode]);
 
     const getContainerStyle = () => {
         if (windowMode === 'stage') return {};

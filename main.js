@@ -14,10 +14,37 @@ import {
     getAuthToken,
     loadAtemSettings,
     saveAtemSettings,
+    setTranslationSecretResolver,
+    setPresentationLiveListener,
+    isLocalSocket,
+    onLocalSocket,
 } from './server.js';
+import {
+    setTranslationSecretsDir,
+    setTranslationSecret,
+    getTranslationSecret,
+    getTranslationSecretStatus,
+} from './translation_secrets.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// This is a live-broadcast tool: a single unhandled rejection anywhere must not be allowed to
+// take the show off air. Log with full stack for post-show diagnosis and keep running — a
+// degraded app the operator can still drive beats a black output and a dead tray icon.
+function logFatal(kind, error) {
+    const detail = error?.stack || String(error);
+    console.error(`[${kind}]`, detail);
+    try {
+        const line = `${new Date().toISOString()} [${kind}] ${detail}\n\n`;
+        fs.appendFileSync(path.join(app.getPath('userData'), 'crash.log'), line, 'utf8');
+    } catch (err) {
+        console.error('[crash-log] could not write crash log:', err);
+    }
+}
+
+process.on('uncaughtException', (error) => logFatal('uncaughtException', error));
+process.on('unhandledRejection', (reason) => logFatal('unhandledRejection', reason));
 
 const APP_VERSION = '1.0.0';
 let controlWindow;
@@ -28,8 +55,15 @@ let serverPort = null;
 let ndiOutputService = null;
 let atemService = null;
 
-// System-wide presentation-clicker capture, active for the app's whole lifetime (registered
-// once, unregistered at quit). Covers every key mapping in common use across clicker models —
+// System-wide presentation-clicker capture, held ONLY while a deck is actually on screen.
+//
+// A global shortcut *consumes* the keystroke process-wide, so registering these for the app's
+// whole lifetime meant that merely having Broadcast Controller running broke the arrow keys and
+// PageUp/PageDown in every other application on the machine. Scoping them to live presentation
+// keeps the clicker working when it matters and gives the keys back the rest of the time. (This
+// is the same hazard the note below describes for Space, which was already excluded for it.)
+//
+// Covers every key mapping in common use across clicker models —
 // PageDown/PageUp is the most common standard, but plenty of models send plain arrow keys
 // instead, and some (mainly combo laser-pointer/media-remote units) send the media-transport
 // keys instead of either. Space is deliberately excluded from the global set even though the
@@ -39,7 +73,10 @@ let atemService = null;
 const CLICKER_NEXT_KEYS = ['PageDown', 'Right', 'Down', 'MediaNextTrack'];
 const CLICKER_PREV_KEYS = ['PageUp', 'Left', 'Up', 'MediaPreviousTrack'];
 
+let clickerShortcutsHeld = false;
+
 function registerClickerShortcuts() {
+    if (clickerShortcutsHeld) return;
     const sendNav = (direction) => () => {
         console.log(`[clicker] nav "${direction}" triggered`);
         controlWindow?.webContents.send('presentation-clicker-nav', direction);
@@ -53,7 +90,17 @@ function registerClickerShortcuts() {
             console.warn(`[clicker] Failed to register global shortcut "${key}" — it may already be in use by another application. Presentation clicker navigation mapped to this key will not work.`);
         }
     }
+    clickerShortcutsHeld = true;
     console.log(`[clicker] global shortcut registration: ${results.join(', ')}`);
+}
+
+function releaseClickerShortcuts() {
+    if (!clickerShortcutsHeld) return;
+    for (const key of [...CLICKER_NEXT_KEYS, ...CLICKER_PREV_KEYS]) {
+        globalShortcut.unregister(key);
+    }
+    clickerShortcutsHeld = false;
+    console.log('[clicker] global shortcuts released');
 }
 
 function localAppUrl(pathname = '/', params = {}) {
@@ -83,6 +130,22 @@ app.commandLine.appendSwitch('enable-zero-copy');
 // that. For smooth full-motion video, drive the output displays from a native GPU output.
 app.commandLine.appendSwitch('force_high_performance_gpu');
 
+// Windows that are allowed to embed arbitrary operator-chosen sites, and therefore the only
+// ones whose subframe responses get their frame-protection headers stripped. The NDI offscreen
+// renderer registers itself here too, since it loads the same graphics page.
+const outputWebContentsIds = new Set();
+
+function registerOutputWebContents(win) {
+    if (!win || win.isDestroyed()) return;
+    const id = win.webContents.id;
+    outputWebContentsIds.add(id);
+    win.webContents.once('destroyed', () => outputWebContentsIds.delete(id));
+}
+
+function isOutputWebContents(webContentsId) {
+    return typeof webContentsId === 'number' && outputWebContentsIds.has(webContentsId);
+}
+
 function isLocalAppUrl(urlString) {
     try {
         const parsed = new URL(urlString);
@@ -92,20 +155,36 @@ function isLocalAppUrl(urlString) {
     }
 }
 
-function hardenWindowNavigation(win) {
-    win.webContents.setWindowOpenHandler(({ url }) => {
+// loadURL returns a promise; every call site used to drop it, so a window that failed to load
+// produced an unhandled rejection instead of a diagnosable message.
+function loadWindowUrl(win, url, label) {
+    win.loadURL(url).catch((err) => {
+        console.error(`Failed to load the ${label}:`, err);
+    });
+}
+
+// `allowExternalOpen` must stay false for any window that embeds operator-chosen third-party
+// sites in iframes. setWindowOpenHandler fires for window.open() from ANY frame and gives no way
+// to tell which frame asked, so on the output windows an embedded page could otherwise drive
+// shell.openExternal and pop the operator's browser mid-show. Only the control window — the
+// operator's own UI, where clicking a link should open a browser — gets that privilege.
+function hardenWindowNavigation(win, { allowExternalOpen = false } = {}) {
+    const openExternalIfSafe = (url) => {
+        if (!allowExternalOpen) return;
         if (url.startsWith('https://') || url.startsWith('http://')) {
             shell.openExternal(url);
         }
+    };
+
+    win.webContents.setWindowOpenHandler(({ url }) => {
+        openExternalIfSafe(url);
         return { action: 'deny' };
     });
 
     win.webContents.on('will-navigate', (event, url) => {
         if (!isLocalAppUrl(url)) {
             event.preventDefault();
-            if (url.startsWith('https://') || url.startsWith('http://')) {
-                shell.openExternal(url);
-            }
+            openExternalIfSafe(url);
         }
     });
 }
@@ -223,7 +302,7 @@ function createWindows() {
             preload: path.join(__dirname, 'preload.cjs'),
             nodeIntegration: false,
             contextIsolation: true,
-            sandbox: false,
+            sandbox: true,
             // Same reasoning as the graphics/stage/backstage windows below: an operator
             // routinely leaves this window unfocused while looking at the output display,
             // and Chromium throttling its nested frames (e.g. the Live Preview iframe)
@@ -232,8 +311,8 @@ function createWindows() {
         }
     });
 
-    hardenWindowNavigation(controlWindow);
-    controlWindow.loadURL(localAppUrl('/'));
+    hardenWindowNavigation(controlWindow, { allowExternalOpen: true });
+    loadWindowUrl(controlWindow, localAppUrl('/'), 'control window');
 
     // Show window only once the page is rendered — feels instant
     controlWindow.once('ready-to-show', () => {
@@ -285,7 +364,7 @@ function createGraphicsWindow(display) {
             preload: path.join(__dirname, 'preload.cjs'),
             nodeIntegration: false,
             contextIsolation: true,
-            sandbox: false,
+            sandbox: true,
             webSecurity: true,
             // This window is never focused (operator works in the control window). Without this,
             // Chromium throttles its rendering/timers, causing the projector output to stutter.
@@ -294,7 +373,8 @@ function createGraphicsWindow(display) {
     });
 
     hardenWindowNavigation(graphicsWindow);
-    graphicsWindow.loadURL(localAppUrl('/graphics', { mode: 'graphics' }));
+    registerOutputWebContents(graphicsWindow);
+    loadWindowUrl(graphicsWindow, localAppUrl('/graphics', { mode: 'graphics' }), 'graphics output');
 
     graphicsWindow.on('closed', () => {
         graphicsWindow = null;
@@ -338,7 +418,7 @@ function createStageWindow(display) {
             preload: path.join(__dirname, 'preload.cjs'),
             nodeIntegration: false,
             contextIsolation: true,
-            sandbox: false,
+            sandbox: true,
             webSecurity: true,
             // Never focused — keep it rendering at full rate (see graphics window).
             backgroundThrottling: false
@@ -346,7 +426,8 @@ function createStageWindow(display) {
     });
 
     hardenWindowNavigation(stageWindow);
-    stageWindow.loadURL(localAppUrl('/graphics', { mode: 'stage' }));
+    registerOutputWebContents(stageWindow);
+    loadWindowUrl(stageWindow, localAppUrl('/graphics', { mode: 'stage' }), 'confidence monitor');
 
     stageWindow.on('closed', () => {
         stageWindow = null;
@@ -389,7 +470,7 @@ function createBackstageWindow(display) {
             preload: path.join(__dirname, 'preload.cjs'),
             nodeIntegration: false,
             contextIsolation: true,
-            sandbox: false,
+            sandbox: true,
             webSecurity: true,
             // Never focused — keep it rendering at full rate (see graphics window).
             backgroundThrottling: false
@@ -397,38 +478,26 @@ function createBackstageWindow(display) {
     });
 
     hardenWindowNavigation(backstageWindow);
-    backstageWindow.loadURL(localAppUrl('/backstage'));
+    loadWindowUrl(backstageWindow, localAppUrl('/backstage'), 'backstage monitor');
 
     backstageWindow.on('closed', () => {
         backstageWindow = null;
     });
 }
 
-function broadcastDisplays() {
-    const displays = screen.getAllDisplays().map(d => ({
+function getDisplayList() {
+    return screen.getAllDisplays().map(d => ({
         id: d.id,
         label: d.label || (d.internal ? 'Internal Display' : `External Display (${d.size.width}x${d.size.height})`),
         bounds: d.bounds
     }));
-    io.emit('available_displays', displays);
 }
 
-function isLocalSocket(socket) {
-    return socket.data?.clientType === 'local';
-}
-
-function onLocalSocket(socket, event, handler) {
-    socket.on(event, (...args) => {
-        if (!isLocalSocket(socket)) {
-            const ack = args.find(arg => typeof arg === 'function');
-            if (typeof ack === 'function') {
-                ack({ ok: false, error: 'This action is only available on the main controller.' });
-            }
-            socket.emit('action_forbidden', { error: 'This action is only available on the main controller.' });
-            return;
-        }
-        handler(...args);
-    });
+// `target` defaults to every client, which is right when the display topology actually changed.
+// On connect, pass the connecting socket instead — broadcasting to everyone made app startup
+// O(n²) as five windows connected in quick succession.
+function broadcastDisplays(target = io) {
+    target.emit('available_displays', getDisplayList());
 }
 
 // GPU diagnostic: confirms hardware acceleration (especially "video_decode") is active.
@@ -502,20 +571,32 @@ async function logGpuStatus() {
 app.whenReady().then(() => {
     setAppMenu();
     logGpuStatus();
-    registerClickerShortcuts();
+    setPresentationLiveListener((live) => {
+        if (live) registerClickerShortcuts();
+        else releaseClickerShortcuts();
+    });
     setTranslationGlossaryDir(app.getPath('userData'));
+    setTranslationSecretsDir(app.getPath('userData'));
+    // Lets server.js fetch the decrypted key at start_translation time, so it never has to be
+    // sent up from the renderer (or across the LAN).
+    setTranslationSecretResolver(getTranslationSecret);
     ndiOutputService = new NdiOutputService({
         preloadPath: path.join(__dirname, 'preload.cjs'),
-        onStatus: (status) => io.emit('ndi_status_update', status)
+        onStatus: (status) => io.emit('ndi_status_update', status),
+        // The offscreen renderer loads the same graphics page, so it needs the same
+        // frame-header exemption for embedded sites.
+        onWindowCreated: registerOutputWebContents
     });
 
     atemService = new AtemService({
         // Remote-paired clients must never see the switcher's LAN address or the
         // full input list, so the fan-out is split by socket type.
         onStatus: (status) => {
-            for (const socket of io.sockets.sockets.values()) {
-                socket.emit('atem_status_update', isLocalSocket(socket) ? status : atemService.getPublicStatus());
-            }
+            // getPublicStatus() was recomputed once per remote socket; it only depends on the
+            // status, so build it once. Rooms do the fan-out, so the payload is serialized once
+            // per room instead of once per socket.
+            io.to('local').emit('atem_status_update', status);
+            io.to('remote').emit('atem_status_update', atemService.getPublicStatus());
         }
     });
 
@@ -543,8 +624,13 @@ app.whenReady().then(() => {
     // Strip only frame-blocking headers so operator-selected websites can
     // still be embedded in the graphics output iframes.
     // Handles: X-Frame-Options, COEP, COOP, CORP, and CSP frame-ancestors
+    //
+    // Scoped to the output windows via webContentsId. This used to apply to every subframe in
+    // defaultSession, which disabled clickjacking and cross-origin isolation defenses for any
+    // site the operator ever loaded — including inside the control window. Only the surfaces
+    // that actually need to embed arbitrary sites get the exemption.
     session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
-        if (details.resourceType !== 'subFrame') {
+        if (details.resourceType !== 'subFrame' || !isOutputWebContents(details.webContentsId)) {
             callback({});
             return;
         }
@@ -590,7 +676,7 @@ app.whenReady().then(() => {
 
     io.on('connection', (socket) => {
         // Send displays on connect
-        broadcastDisplays();
+        broadcastDisplays(socket);
 
         onLocalSocket(socket, 'set_output_display', (displayId) => {
             const targetDisplay = screen.getAllDisplays().find(d => d.id === Number(displayId));
@@ -634,9 +720,8 @@ app.whenReady().then(() => {
             }
         });
 
-        socket.on('set_bg_color', (color) => {
-            io.emit('bg_color_update', color);
-        });
+        // set_bg_color is handled in server.js. It used to be registered here as well, so every
+        // colour change was broadcast twice.
 
         onLocalSocket(socket, 'ndi_start', (config = {}) => {
             if (!serverPort || !ndiOutputService) return;
@@ -673,8 +758,14 @@ app.whenReady().then(() => {
             const settings = savedConnection || (config.address ? config : saved);
             const status = await atemService.connect({ address: settings.address, port: settings.port });
             // Remember what's active so a restart resumes the same saved
-            // connection and the saved-connections chip row stays in sync.
-            saveAtemSettings({ ...saved, address: settings.address, port: settings.port, activeConnectionId: config.connectionId || null });
+            // connection and the saved-connections chip row stays in sync. Wrapped because a
+            // read-only userData dir would otherwise reject out of this async handler — and
+            // failing to persist must not also fail the connection that just succeeded.
+            try {
+                saveAtemSettings({ ...saved, address: settings.address, port: settings.port, activeConnectionId: config.connectionId || null });
+            } catch (err) {
+                console.error('Connected to the ATEM but could not save the connection:', err);
+            }
             if (typeof ack === 'function') ack({ ok: status.connectionState !== 'error', status });
         });
 
@@ -743,6 +834,20 @@ app.whenReady().then(() => {
             return result.filePaths;
         }
         return null;
+    });
+
+    // Write-only from the renderer's point of view: it can set or clear a key and ask whether
+    // one exists, but there is deliberately no handler that returns a key's value.
+    ipcMain.handle('set-translation-secret', (event, name, value) => {
+        if (event.sender !== controlWindow?.webContents) {
+            return { ok: false, error: 'Credentials can only be changed from the main controller.' };
+        }
+        return setTranslationSecret(name, value);
+    });
+
+    ipcMain.handle('get-translation-secret-status', (event) => {
+        if (event.sender !== controlWindow?.webContents) return {};
+        return getTranslationSecretStatus();
     });
 
     ipcMain.handle('select-whisper-executable', async () => {

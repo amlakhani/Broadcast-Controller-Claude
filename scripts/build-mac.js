@@ -22,10 +22,20 @@ function run(command, args, options = {}) {
     }
 }
 
-function renameIfExists(from, to) {
+// `required` for the x64 DMG itself: silently skipping the rename when the expected filename
+// isn't there is how you ship an x64 build named as if it were universal. The name depends on
+// electron-builder's default artifactName, so if that ever changes this must fail, not shrug.
+function renameIfExists(from, to, { required = false } = {}) {
     if (fs.existsSync(from)) {
         fs.renameSync(from, to);
+        return true;
     }
+    if (required) {
+        console.error(`Expected build output not found: ${from}`);
+        console.error('electron-builder artifact naming may have changed — check "application packages/".');
+        process.exit(1);
+    }
+    return false;
 }
 
 // --publish never: only build the DMGs. Without it, electron-builder detects
@@ -41,7 +51,8 @@ run('electron-builder', ['--mac', '--x64', '--publish', 'never']);
 
 renameIfExists(
     path.join(outputDir, `Broadcast Controller-${version}.dmg`),
-    path.join(outputDir, `Broadcast Controller-${version}-x64.dmg`)
+    path.join(outputDir, `Broadcast Controller-${version}-x64.dmg`),
+    { required: true }
 );
 renameIfExists(
     path.join(outputDir, `Broadcast Controller-${version}.dmg.blockmap`),

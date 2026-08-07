@@ -21,16 +21,24 @@ if (!fs.existsSync(addonPath)) {
 
 const header = fs.readFileSync(addonPath, { start: 0, end: 7 });
 const magic = header.readUInt32BE(0);
-const machOMagics = new Set([
+// Thin Mach-O only. The fat/universal magics (0xcafebabe / 0xbebafeca) used to be accepted
+// here, but the arch check below reads offset 4 as a CPU type — in a fat header that field is
+// nfat_arch, an architecture *count*. So a universal binary either failed with a nonsense
+// "not x64" message or passed by coincidence. grandiose emits thin binaries, and this script
+// exists to confirm the per-arch rebuild produced the right one, so reject fat outright.
+const thinMachOMagics = new Set([
     0xfeedface,
     0xcefaedfe,
     0xfeedfacf,
-    0xcffaedfe,
-    0xcafebabe,
-    0xbebafeca
+    0xcffaedfe
 ]);
+const fatMachOMagics = new Set([0xcafebabe, 0xbebafeca]);
 
-if (!machOMagics.has(magic)) {
+if (fatMachOMagics.has(magic)) {
+    fail('grandiose.node is a universal (fat) binary; this build expects a single-architecture one. Run npm run rebuild:ndi:mac for the requested architecture.');
+}
+
+if (!thinMachOMagics.has(magic)) {
     fail('grandiose.node is not a Mach-O binary. Run npm run rebuild:ndi:mac on macOS.');
 }
 

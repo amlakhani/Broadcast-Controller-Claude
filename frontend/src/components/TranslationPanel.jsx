@@ -3,10 +3,14 @@ import { Activity, AlertTriangle, BookOpen, CheckCircle, Play, RefreshCw, Save, 
 import { deferUntilIdle, readLocalStorageObjectSafe, useDebouncedLocalStorageEffect } from '../utils/performance';
 
 
-const AZURE_KEY_STORAGE = 'bc_azure_speech_key';
+// Note there is no *_KEY_STORAGE key here any more. The Azure and Soniox credentials used to
+// live in localStorage in plaintext and be re-written on every keystroke; they are now held by
+// the main process under OS encryption (translation_secrets.js) and resolved server-side when
+// translation starts, so the key value never enters this renderer at all. All this component
+// tracks is whether a key has been set.
 const AZURE_REGION_STORAGE = 'bc_azure_speech_region';
-const SONIOX_KEY_STORAGE = 'bc_soniox_api_key';
 const SONIOX_MODEL_STORAGE = 'bc_soniox_model';
+const LEGACY_KEY_STORAGE = ['bc_azure_speech_key', 'bc_soniox_api_key'];
 const TRANSLATION_TARGET_STORAGE = 'bc_azure_target_lang';
 const TRANSLATION_ENGINE_STORAGE = 'bc_translation_engine_v1';
 const TRANSLATION_STYLE_STORAGE = 'bc_translation_style_v1';
@@ -36,9 +40,13 @@ const STATUS_LABELS = {
 
 export default function TranslationPanel({ socket }) {
     // Azure Configuration State
-    const [azureKey, setAzureKey] = useState(() => localStorage.getItem(AZURE_KEY_STORAGE) || '');
+    // Holds only what the operator is currently typing. Cleared once saved — the stored value
+    // is never read back.
+    const [azureKey, setAzureKey] = useState('');
+    const [sonioxKey, setSonioxKey] = useState('');
+    const [secretStatus, setSecretStatus] = useState({ azure: false, soniox: false });
+    const [secretNotice, setSecretNotice] = useState('');
     const [azureRegion, setAzureRegion] = useState(() => localStorage.getItem(AZURE_REGION_STORAGE) || 'eastus');
-    const [sonioxKey, setSonioxKey] = useState(() => localStorage.getItem(SONIOX_KEY_STORAGE) || '');
     const [sonioxModel, setSonioxModel] = useState(() => localStorage.getItem(SONIOX_MODEL_STORAGE) || 'stt-rt-v4');
     const [targetLang, setTargetLang] = useState(() => localStorage.getItem(TRANSLATION_TARGET_STORAGE) || 'en');
     const [translationEngine, setTranslationEngine] = useState(() => localStorage.getItem(TRANSLATION_ENGINE_STORAGE) || 'azure');
@@ -95,7 +103,6 @@ export default function TranslationPanel({ socket }) {
     const noAudioTimerRef = useRef(null);
     
     // Azure SDK Refs
-    const recognizerRef = useRef(null);
     const audioInputRef = useRef(null);
     const processorNodeRef = useRef(null);
     const startTranslationRef = useRef(null);
@@ -107,18 +114,61 @@ export default function TranslationPanel({ socket }) {
     const isSonioxEngine = translationEngine === 'soniox';
     const showLocalFallback = translationEngine === 'azure' && translationStatus === 'error';
 
-    // Persist Azure configurations
+    const refreshSecretStatus = useCallback(async () => {
+        if (!window.broadcastAPI?.getTranslationSecretStatus) return;
+        try {
+            setSecretStatus(await window.broadcastAPI.getTranslationSecretStatus() || {});
+        } catch (err) {
+            console.error('Could not read credential status:', err);
+        }
+    }, []);
+
+    // One-time migration: move any key left in localStorage by an older build into the
+    // encrypted store, then delete the plaintext copy.
     useEffect(() => {
-        localStorage.setItem(AZURE_KEY_STORAGE, azureKey);
-    }, [azureKey]);
+        const api = window.broadcastAPI;
+        if (!api?.setTranslationSecret) return;
+
+        (async () => {
+            for (const [storageKey, name] of [[LEGACY_KEY_STORAGE[0], 'azure'], [LEGACY_KEY_STORAGE[1], 'soniox']]) {
+                const legacy = localStorage.getItem(storageKey);
+                if (legacy) {
+                    try {
+                        await api.setTranslationSecret(name, legacy);
+                    } catch (err) {
+                        console.error(`Could not migrate the stored ${name} key:`, err);
+                    }
+                }
+                localStorage.removeItem(storageKey);
+            }
+            refreshSecretStatus();
+        })();
+    }, [refreshSecretStatus]);
+
+    const saveSecret = useCallback(async (name, value, clearInput) => {
+        const api = window.broadcastAPI;
+        if (!api?.setTranslationSecret) {
+            setSecretNotice('Credentials can only be saved from the desktop app.');
+            return;
+        }
+        try {
+            const result = await api.setTranslationSecret(name, value);
+            if (!result?.ok) {
+                setSecretNotice(result?.error || 'Could not save that key.');
+                return;
+            }
+            clearInput('');
+            setSecretNotice(result.warning || (result.stored ? 'Key saved.' : 'Key removed.'));
+            refreshSecretStatus();
+        } catch (err) {
+            console.error('Could not save credential:', err);
+            setSecretNotice('Could not save that key.');
+        }
+    }, [refreshSecretStatus]);
 
     useEffect(() => {
         localStorage.setItem(AZURE_REGION_STORAGE, azureRegion);
     }, [azureRegion]);
-
-    useEffect(() => {
-        localStorage.setItem(SONIOX_KEY_STORAGE, sonioxKey);
-    }, [sonioxKey]);
 
     useEffect(() => {
         localStorage.setItem(SONIOX_MODEL_STORAGE, sonioxModel);
@@ -539,17 +589,19 @@ export default function TranslationPanel({ socket }) {
     const startTranslation = async ({ force = false } = {}) => {
         if (!force && (isBusy || isTranslating)) return;
 
-        if (translationEngine === 'azure' && !azureKey.trim()) {
+        // Gate on whether a key is *stored*, not on the input box — the box is only ever
+        // populated while the operator is typing a new one.
+        if (translationEngine === 'azure' && !secretStatus.azure) {
             setShowAzureConfig(true);
             setTranslationStatus('error');
-            setLastError('Please enter a valid Azure Speech Key in the settings.');
+            setLastError('Save a valid Azure Speech key in the settings first.');
             return;
         }
 
-        if (translationEngine === 'soniox' && !sonioxKey.trim()) {
+        if (translationEngine === 'soniox' && !secretStatus.soniox) {
             setShowSonioxConfig(true);
             setTranslationStatus('error');
-            setLastError('Please enter a valid Soniox API key in the settings.');
+            setLastError('Save a valid Soniox API key in the settings first.');
             return;
         }
 
@@ -577,9 +629,10 @@ export default function TranslationPanel({ socket }) {
                 await saveLocalAiSettings();
             }
 
+            // No `key` field: the server resolves the credential from the encrypted store in
+            // the main process, so it never crosses this boundary (or the LAN).
             socket.emit('start_translation', {
                 engine: translationEngine,
-                key: translationEngine === 'soniox' ? sonioxKey : azureKey,
                 region: azureRegion,
                 targetLang,
                 sourceLanguages,
@@ -947,14 +1000,37 @@ export default function TranslationPanel({ socket }) {
                     </div>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div className="space-y-1.5">
-                            <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">Speech Subscription Key (Key 1 / Key 2)</label>
-                            <input 
-                                type="password" 
-                                value={azureKey} 
-                                onChange={e => setAzureKey(e.target.value)} 
-                                placeholder="Paste your Azure Speech API key..." 
-                                className="control-field px-4 py-2.5 text-xs" 
-                            />
+                            <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                                Speech Subscription Key (Key 1 / Key 2)
+                                {secretStatus.azure && <span className="ml-2 text-emerald-500">saved</span>}
+                            </label>
+                            <div className="flex gap-2">
+                                <input
+                                    type="password"
+                                    value={azureKey}
+                                    onChange={e => setAzureKey(e.target.value)}
+                                    placeholder={secretStatus.azure ? 'A key is saved. Paste a new one to replace it.' : 'Paste your Azure Speech API key...'}
+                                    className="control-field px-4 py-2.5 text-xs flex-1"
+                                />
+                                <button
+                                    type="button"
+                                    onClick={() => saveSecret('azure', azureKey, setAzureKey)}
+                                    disabled={!azureKey.trim()}
+                                    className="control-button px-3 py-2.5 text-xs disabled:opacity-40"
+                                >
+                                    Save
+                                </button>
+                                {secretStatus.azure && (
+                                    <button
+                                        type="button"
+                                        onClick={() => saveSecret('azure', '', setAzureKey)}
+                                        className="control-button px-3 py-2.5 text-xs"
+                                    >
+                                        Clear
+                                    </button>
+                                )}
+                            </div>
+                            {secretNotice && <p className="text-[10px] text-slate-500 dark:text-slate-400">{secretNotice}</p>}
                         </div>
                         <div className="space-y-1.5">
                             <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">Service Location/Region</label>
@@ -995,14 +1071,37 @@ export default function TranslationPanel({ socket }) {
                     </div>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div className="space-y-1.5">
-                            <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">Soniox API Key</label>
-                            <input
-                                type="password"
-                                value={sonioxKey}
-                                onChange={e => setSonioxKey(e.target.value)}
-                                placeholder="Paste your Soniox API key..."
-                                className="control-field px-4 py-2.5 text-xs"
-                            />
+                            <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                                Soniox API Key
+                                {secretStatus.soniox && <span className="ml-2 text-emerald-500">saved</span>}
+                            </label>
+                            <div className="flex gap-2">
+                                <input
+                                    type="password"
+                                    value={sonioxKey}
+                                    onChange={e => setSonioxKey(e.target.value)}
+                                    placeholder={secretStatus.soniox ? 'A key is saved. Paste a new one to replace it.' : 'Paste your Soniox API key...'}
+                                    className="control-field px-4 py-2.5 text-xs flex-1"
+                                />
+                                <button
+                                    type="button"
+                                    onClick={() => saveSecret('soniox', sonioxKey, setSonioxKey)}
+                                    disabled={!sonioxKey.trim()}
+                                    className="control-button px-3 py-2.5 text-xs disabled:opacity-40"
+                                >
+                                    Save
+                                </button>
+                                {secretStatus.soniox && (
+                                    <button
+                                        type="button"
+                                        onClick={() => saveSecret('soniox', '', setSonioxKey)}
+                                        className="control-button px-3 py-2.5 text-xs"
+                                    >
+                                        Clear
+                                    </button>
+                                )}
+                            </div>
+                            {secretNotice && <p className="text-[10px] text-slate-500 dark:text-slate-400">{secretNotice}</p>}
                         </div>
                         <div className="space-y-1.5">
                             <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">Real-Time Model</label>

@@ -1,14 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-// Non-destructive check: is a scanned pairing code sitting in the fragment?
-// Lets a host decide to re-pair before this component mounts and consumes it.
-export function peekFragmentPairingCode() {
-  try {
-    return /(?:^|[#&])c=(\d{6})(?:&|$)/.exec(window.location.hash || '')?.[1] || '';
-  } catch {
-    return '';
-  }
-}
 
 // A scanned QR carries the code as "#c=123456". Read it once, then strip it from the URL so
 // the credential does not linger in history or on screen. Fragments never reach the server.

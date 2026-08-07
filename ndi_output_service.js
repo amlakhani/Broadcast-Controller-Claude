@@ -32,9 +32,12 @@ function withTimeout(promise, ms, message) {
 }
 
 export class NdiOutputService {
-    constructor({ preloadPath, onStatus }) {
+    constructor({ preloadPath, onStatus, onWindowCreated = null }) {
         this.preloadPath = preloadPath;
         this.onStatus = onStatus;
+        // Called with the offscreen window once it exists, so the main process can treat it as
+        // an output surface (see registerOutputWebContents in main.js).
+        this.onWindowCreated = onWindowCreated;
         this.width = 1920;
         this.height = 1080;
         this.targetFps = 30;
@@ -110,11 +113,13 @@ export class NdiOutputService {
                     preload: this.preloadPath,
                     nodeIntegration: false,
                     contextIsolation: true,
-                    sandbox: false,
+                    sandbox: true,
                     webSecurity: true,
                     offscreen: true
                 }
             });
+
+            this.onWindowCreated?.(this.window);
 
             this.window.on('closed', () => {
                 this.window = null;
@@ -262,14 +267,19 @@ export class NdiOutputService {
             });
             if (sessionId !== this.sessionId) return;
 
+            // Record only. This used to emitStatus() here, which meant a full status object was
+            // io.emit'd to EVERY connected client 30 times a second — control window, graphics,
+            // stage, backstage, the NDI renderer itself, and every paired phone over Wi-Fi.
+            // pollStatus publishes this at 1 Hz, which is what it exists for.
             this.frameCount += 1;
-            this.emitStatus({
-                enabled: true,
-                lastFrameAt: Date.now(),
-                error: null
-            });
+            this.lastFrameAt = Date.now();
+            this.lastFrameError = null;
         } catch (err) {
-            this.emitStatus({ error: err?.message || String(err) });
+            // Errors still publish immediately — the operator needs to know the feed broke
+            // without waiting for the next 1 Hz tick. Stored too, so pollStatus doesn't
+            // immediately clear it.
+            this.lastFrameError = err?.message || String(err);
+            this.emitStatus({ error: this.lastFrameError });
         } finally {
             this.isSendingFrame = false;
         }
@@ -294,7 +304,9 @@ export class NdiOutputService {
         this.emitStatus({
             enabled: true,
             receivers,
-            fps
+            fps,
+            lastFrameAt: this.lastFrameAt ?? null,
+            error: this.lastFrameError ?? null
         });
     }
 }

@@ -140,8 +140,15 @@ process.on('message', (msg) => {
         stopActiveTranslation();
     } else if (msg.type === 'audio_chunk') {
         if (activePushStream && msg.chunk) {
-            const buf = Buffer.from(msg.chunk.data || msg.chunk);
-            activePushStream.write(buf);
+            // A write to a stream that has already been closed throws, and this is inside the
+            // IPC message handler — an unguarded throw here takes the whole worker down
+            // mid-service. Audio chunks arrive continuously, so losing one is survivable;
+            // losing the recognizer is not.
+            try {
+                activePushStream.write(Buffer.from(msg.chunk.data || msg.chunk));
+            } catch (err) {
+                console.error('Dropped an audio chunk:', err?.message || err);
+            }
         }
     }
 });

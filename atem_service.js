@@ -94,6 +94,10 @@ export class AtemService {
         this.isFlushing = false;
         this.lastSent = new Map();
         this.pushSentAt = null;
+
+        // Trailing-edge coalescer for push telemetry (see queuePushStatus).
+        this.pushStatusTimer = null;
+        this.pendingPushStatus = null;
     }
 
     getStatus() {
@@ -125,6 +129,27 @@ export class AtemService {
     emitStatus(patch = {}) {
         this.status = { ...this.status, ...patch, device: { ...this.status.device, ...(patch.device || {}) } };
         this.onStatus?.(this.getStatus());
+    }
+
+    // Coalesces high-frequency push telemetry onto a trailing edge. The newest patch wins;
+    // intermediate ones during a drag carry no information the previous one didn't.
+    queuePushStatus(patch) {
+        this.pendingPushStatus = { ...(this.pendingPushStatus || {}), ...patch };
+        if (this.pushStatusTimer) return;
+        this.pushStatusTimer = setTimeout(() => {
+            this.pushStatusTimer = null;
+            const pending = this.pendingPushStatus;
+            this.pendingPushStatus = null;
+            if (pending) this.emitStatus(pending);
+        }, STATUS_INTERVAL_MS);
+    }
+
+    clearPushStatusTimer() {
+        if (this.pushStatusTimer) {
+            clearTimeout(this.pushStatusTimer);
+            this.pushStatusTimer = null;
+        }
+        this.pendingPushStatus = null;
     }
 
     loadAtemModule() {
@@ -354,7 +379,11 @@ export class AtemService {
     rebuild(session) {
         if (session !== this.sessionId || this.explicitDisconnect) return;
         const { address, port } = this.status;
-        this.connect({ address, port });
+        // connect() catches internally today, so this is currently safe — the explicit catch is
+        // here so that staying safe does not depend on that remaining true.
+        this.connect({ address, port }).catch((err) => {
+            console.error('ATEM rebuild failed:', err);
+        });
     }
 
     scheduleReconnect(session) {
@@ -379,6 +408,7 @@ export class AtemService {
         this.clearTimer('watchdogTimer');
         this.clearTimer('flushTimer');
         this.clearTimer('statusTimer');
+        this.clearPushStatusTimer();
         this.pending.clear();
         this.lastSent.clear();
 
@@ -425,8 +455,12 @@ export class AtemService {
 
         const boxCount = this.status.device.boxCounts[ssrcId] ?? 4;
         for (const patch of patches) {
-            if (patch.boxIndex >= boxCount) continue; // device physically has fewer boxes
-            const key = `${ssrcId}:${patch.boxIndex}`;
+            // Range-check both ends. An upper-bound-only check let a negative (or non-integer)
+            // index through and fabricate pending keys the switcher never has.
+            const boxIndex = Number(patch?.boxIndex);
+            if (!Number.isInteger(boxIndex) || boxIndex < 0 || boxIndex >= boxCount) continue;
+            if (!patch.props || typeof patch.props !== 'object' || Array.isArray(patch.props)) continue;
+            const key = `${ssrcId}:${boxIndex}`;
             this.pending.set(key, { ...(this.pending.get(key) || {}), ...patch.props });
         }
 
@@ -461,12 +495,20 @@ export class AtemService {
                 await this.atem.setSuperSourceBoxSettings(delta, boxIndex, ssrcId);
                 this.lastSent.set(key, { ...previous, ...delta });
             }
-            this.emitStatus({
+            // Throttled: flush() runs every FLUSH_INTERVAL_MS (25 Hz) for as long as the
+            // operator drags a SuperSource box, and each emitStatus deep-copies the whole
+            // status object (inputs, every mixEffect with its keyers, aux buses) and fans it
+            // out per-socket. This is push telemetry — round-trip time and a timestamp — so
+            // coalescing it to the same 250 ms cadence as the stateChanged path loses nothing
+            // the operator can perceive.
+            this.queuePushStatus({
                 lastPushAt: Date.now(),
                 lastPushError: null,
                 lastPushRoundTripMs: Date.now() - this.pushSentAt,
             });
         } catch (err) {
+            // Errors are not throttled: a failed push must surface immediately.
+            this.clearPushStatusTimer();
             this.emitStatus({ lastPushError: err?.message || String(err) });
         } finally {
             this.isFlushing = false;
@@ -480,6 +522,9 @@ export class AtemService {
         if (!this.status.armed) return { ok: false, error: 'Push to ATEM is not armed.' };
         if (!this.atem || this.status.connectionState !== 'connected') {
             return { ok: false, error: 'Not connected.' };
+        }
+        if (!props || typeof props !== 'object' || Array.isArray(props)) {
+            return { ok: false, error: 'Invalid SuperSource properties.' };
         }
         try {
             await this.atem.setSuperSourceProperties(props, ssrcId);

@@ -1,0 +1,56 @@
+name: CI
+
+# Runs the test suite and both linters on every push and pull request.
+#
+# This did not exist before: the only workflow was the macOS packaging build, which never ran
+# `npm test` or `npm run lint`, so a regression could only be caught by someone running them by
+# hand. Deliberately kept off the packaging path — this must stay fast enough to run on every
+# push, and it needs no NDI SDK or native toolchain.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    # Ubuntu, not macOS: nothing here touches the native NDI module, and the Linux runner is
+    # much faster to schedule.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Node 22 is a hard floor, not a preference: `node --test tests/*.test.js` relies on the
+      # runner expanding that glob itself, which only happens from Node 22 on.
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+
+      # --ignore-scripts skips the preinstall NDI toolchain check and grandiose's native
+      # compile, neither of which the tests touch. Without it this job would need the full
+      # platform build environment just to run unit tests.
+      - name: Install root dependencies
+        run: npm ci --ignore-scripts
+
+      # The test suite imports socket.io-client from frontend/node_modules, so this install is
+      # required for `npm test` to resolve at all — not just for the frontend build.
+      - name: Install frontend dependencies
+        run: npm --prefix frontend ci
+
+      - name: Lint frontend
+        run: npm --prefix frontend run lint
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build frontend
+        run: npm run build:frontend

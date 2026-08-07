@@ -18,6 +18,7 @@ import {
 } from 'lucide-react';
 import { deferUntilIdle, readLocalStorageArraySafe, useDebouncedLocalStorageEffect } from '../utils/performance';
 import { EMPTY_PRESENTATION, getDeckType, normalizeCanvaUrl, parseSourceUrl, slideImageUrl } from '../utils/presentation';
+import { deleteDeckImages, getDeckImages, putDeckImages } from '../utils/deckStore';
 
 const LIBRARY_KEY = 'bc_pres_library_v1';
 
@@ -42,8 +43,23 @@ export default function PresentationPanel({ socket, isActive }) {
 
     const fileInputRef = useRef(null);
 
+    // Slide images live in IndexedDB (see utils/deckStore); localStorage holds metadata only.
+    // Any library saved by an older build still has its images inline, so move them across on
+    // load and drop them from the localStorage copy.
     useEffect(() => deferUntilIdle(() => {
-        setLibrary(readLocalStorageArraySafe(LIBRARY_KEY));
+        const saved = readLocalStorageArraySafe(LIBRARY_KEY);
+        setLibrary(saved);
+
+        const inline = saved.filter(item => Array.isArray(item.images) && item.images.length);
+        if (inline.length === 0) return;
+
+        Promise.all(inline.map(item =>
+            putDeckImages(item.id, { images: item.images, thumbs: item.thumbs || [] })
+        ))
+            .then(() => {
+                setLibrary(current => current.map(({ images: _i, thumbs: _t, ...rest }) => rest));
+            })
+            .catch(err => console.error('Could not migrate saved decks to the deck store:', err));
     }), []);
 
     useDebouncedLocalStorageEffect(LIBRARY_KEY, library);
@@ -126,7 +142,7 @@ export default function PresentationPanel({ socket, isActive }) {
         setNewName('');
     };
 
-    const confirmSave = () => {
+    const confirmSave = async () => {
         const name = newName.trim();
         if (!name) return;
 
@@ -138,17 +154,30 @@ export default function PresentationPanel({ socket, isActive }) {
                 return;
             }
 
+            const id = Math.random().toString(36).slice(2, 11);
+            // Images go to IndexedDB; only metadata is kept in localStorage, which is what
+            // keeps a large deck from blowing the ~5MB quota and silently disappearing.
+            try {
+                await putDeckImages(id, {
+                    images: stagingImages.map(img => img.src),
+                    thumbs: stagingImages.map(img => img.thumb || img.src)
+                });
+            } catch (err) {
+                console.error('Failed to store deck slides:', err);
+                setSaveWarning('Could not save the slides for this deck. Try again, or save fewer slides.');
+                return;
+            }
+
             const newItem = {
-                id: Math.random().toString(36).slice(2, 11),
+                id,
                 name,
                 type: 'Image Deck',
                 mode: 'images',
-                images: stagingImages.map(img => img.src),
-                thumbs: stagingImages.map(img => img.thumb || img.src),
                 totalSlides: stagingImages.length
             };
             const newLib = [...library, newItem];
             if (!persistLibrarySafe(newLib)) {
+                await deleteDeckImages(id);
                 setSaveWarning('Storage is full — delete an old saved presentation or save fewer slides.');
                 return;
             }
@@ -201,6 +230,8 @@ export default function PresentationPanel({ socket, isActive }) {
     const removeFromLibrary = (id) => {
         if (!confirm('Are you sure you want to delete this presentation?')) return;
         saveLibrary(library.filter(item => item.id !== id));
+        // Drop the slides too, or they stay in IndexedDB forever with nothing referencing them.
+        deleteDeckImages(id);
     };
 
     const renameLibraryItem = (id) => {
@@ -223,21 +254,34 @@ export default function PresentationPanel({ socket, isActive }) {
         setRenameValue('');
     };
 
-    const loadFromLibrary = (item) => {
+    const loadFromLibrary = async (item) => {
         if (item.mode === 'images' || item.type === 'Image Deck') {
             setIsStaging(false);
             setStagingImages([]);
             setSelectedStagedIdx(0);
             setJumpInput('1');
+            setStatus('Loading deck…');
+
+            // `item.images` is only present for a deck that hasn't been migrated out of
+            // localStorage yet; otherwise the slides come from the deck store.
+            const stored = item.images?.length
+                ? { images: item.images, thumbs: item.thumbs || [] }
+                : await getDeckImages(item.id);
+
+            if (!stored.images.length) {
+                setStatus('That deck has no saved slides. Re-import the PDF or images.');
+                return;
+            }
+
             const nextState = {
                 ...EMPTY_PRESENTATION,
-                images: item.images || [],
+                images: stored.images,
                 // Decks saved before thumbnails existed have no `thumbs` — the slide
                 // endpoint already falls back to the full image when one is missing.
-                thumbs: item.thumbs || [],
+                thumbs: stored.thumbs,
                 mode: 'images',
                 currentIdx: 0,
-                totalSlides: (item.images || []).length
+                totalSlides: stored.images.length
             };
             setStatus(`Image deck loaded (${nextState.totalSlides} slides) from library. Preview is ready.`);
             setPresState(nextState);
@@ -261,19 +305,27 @@ export default function PresentationPanel({ socket, isActive }) {
         ));
     }, [library, libraryQuery]);
 
-    const loadScript = async (url) => new Promise((resolve, reject) => {
-        const existing = document.querySelector(`script[src="${url}"]`);
-        if (existing) {
-            if (window.pdfjsLib) resolve();
-            else existing.addEventListener('load', resolve, { once: true });
-            return;
+    // pdf.js is bundled, not fetched from a CDN at runtime. The old loader injected a <script>
+    // from cdnjs with no integrity check, which is arbitrary code execution in an Electron
+    // renderer if that CDN is ever compromised — and it made PDF import fail outright on a
+    // venue rig with no internet, which is the normal state for an isolated broadcast LAN.
+    // Loaded lazily so the ~1MB renderer stays out of the initial control-window bundle.
+    const pdfjsPromiseRef = useRef(null);
+    const loadPdfJs = () => {
+        if (!pdfjsPromiseRef.current) {
+            pdfjsPromiseRef.current = import('pdfjs-dist').then((pdfjsLib) => {
+                pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
+                    'pdfjs-dist/build/pdf.worker.min.mjs',
+                    import.meta.url
+                ).toString();
+                return pdfjsLib;
+            }).catch((err) => {
+                pdfjsPromiseRef.current = null;
+                throw err;
+            });
         }
-        const s = document.createElement('script');
-        s.src = url;
-        s.onload = resolve;
-        s.onerror = reject;
-        document.head.appendChild(s);
-    });
+        return pdfjsPromiseRef.current;
+    };
 
     const resetFileInput = () => {
         if (fileInputRef.current) fileInputRef.current.value = '';
@@ -335,14 +387,11 @@ export default function PresentationPanel({ socket, isActive }) {
 
         if (ext === 'pdf') {
             try {
-                if (!window.pdfjsLib) {
-                    setStatus('Loading PDF renderer...');
-                    await loadScript('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js');
-                    window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-                }
+                setStatus('Loading PDF renderer...');
+                const pdfjsLib = await loadPdfJs();
 
                 const buffer = await file.arrayBuffer();
-                const pdf = await window.pdfjsLib.getDocument(new Uint8Array(buffer)).promise;
+                const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
                 const newStaging = [];
 
                 for (let i = 1; i <= pdf.numPages; i++) {

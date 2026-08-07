@@ -2,7 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
 import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Grid3x3, Library, Monitor, MonitorOff } from 'lucide-react';
 import { getRemoteToken, socketOptions } from './auth';
-import RemotePairing, { peekFragmentPairingCode } from './components/RemotePairing';
+import RemotePairing from './components/RemotePairing';
+import { peekFragmentPairingCode } from './utils/pairing';
+import { useWakeLock } from './utils/useWakeLock';
 import { getDeckType, normalizeSlideCount, parseSourceUrl, slideImageUrl } from './utils/presentation';
 
 const EMPTY_META = {
@@ -153,31 +155,7 @@ export default function RemoteSlidesApp() {
     }, [remoteToken, clearPending]);
 
     // Keep the screen awake while operating the show.
-    useEffect(() => {
-        if (!remoteToken || typeof navigator === 'undefined' || !navigator.wakeLock) return;
-        let sentinel = null;
-        let cancelled = false;
-
-        const acquire = async () => {
-            try {
-                sentinel = await navigator.wakeLock.request('screen');
-            } catch {
-                // Unsupported or denied — not fatal.
-            }
-        };
-
-        const onVisibility = () => {
-            if (document.visibilityState === 'visible' && !cancelled) acquire();
-        };
-
-        acquire();
-        document.addEventListener('visibilitychange', onVisibility);
-        return () => {
-            cancelled = true;
-            document.removeEventListener('visibilitychange', onVisibility);
-            sentinel?.release?.().catch(() => {});
-        };
-    }, [remoteToken]);
+    useWakeLock(Boolean(remoteToken));
 
     // Keep ~10 slides ahead and 3 behind warm in the background, so Next/Prev is a
     // cache hit instead of a fresh download. `new Image()` shares the browser's HTTP

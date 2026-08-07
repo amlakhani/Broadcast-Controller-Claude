@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useRef, useState } from 'react';
+import { createElement, memo, useCallback, useEffect, useRef, useState } from 'react';
 import { PAD_COLORS, DEFAULT_PAD_COLOR } from './padModel';
 import { getPadIcon } from './padIcons';
 
@@ -58,7 +58,7 @@ function PadButton({
         frame.current = requestAnimationFrame(step);
         timer.current = setTimeout(() => {
             cancel();
-            onFire?.();
+            onFire?.(button);
         }, HOLD_MS);
     };
 
@@ -70,11 +70,14 @@ function PadButton({
             cancel();
             return;
         }
-        if (!disabled) onFire?.();
+        if (!disabled) onFire?.(button);
     };
 
     const palette = PAD_COLORS[button.color] || PAD_COLORS[DEFAULT_PAD_COLOR];
-    const Icon = getPadIcon(button.icon);
+    // createElement rather than <Icon />: getPadIcon is a lookup into a module-level map of
+    // lucide components, but rendering the result as a capitalised local binding trips
+    // react-hooks/static-components, which reads it as defining a component during render.
+    const icon = getPadIcon(button.icon);
 
     return (
         <button
@@ -110,7 +113,7 @@ function PadButton({
             )}
 
             <span className="relative flex flex-col items-center gap-1">
-                {Icon && <Icon className="h-6 w-6" />}
+                {icon && createElement(icon, { className: "h-6 w-6" })}
                 <span className="text-xs font-bold leading-tight">{button.label}</span>
                 {button.sub && <span className="text-[10px] font-semibold opacity-75">{button.sub}</span>}
             </span>

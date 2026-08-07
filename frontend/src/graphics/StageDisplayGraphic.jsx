@@ -15,7 +15,6 @@ const colorRed = [239, 68, 68];
 const monitorBg = '#0d0d0c';
 const monitorShell = '#181715';
 const monitorPanel = '#22201d';
-const monitorField = '#10100f';
 const monitorBorder = '#4a443a';
 const monitorBorderSoft = '#383329';
 

@@ -1,4 +1,9 @@
 @import "tailwindcss";
+/* Latin display faces, mirrored locally by scripts/fetch-latin-webfonts.js. Previously these
+   came from the Google Fonts CDN via a <link> in graphics.html — on the on-air output window —
+   which contradicted the no-CDN policy stated below and meant a venue with no internet fell
+   back to a system font mid-service. */
+@import "./fonts-latin.css";
 @variant dark (&:where(.dark, .dark *));
 
 /* ---------------------------------------------------------------------------

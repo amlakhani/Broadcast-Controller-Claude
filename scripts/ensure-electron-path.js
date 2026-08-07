@@ -16,14 +16,22 @@ const executablePathByPlatform = {
 
 const executablePath = executablePathByPlatform[process.platform];
 
+// Fail loudly, like every sibling script in this folder. Exiting 0 here let `npm start` carry
+// on and die with electron's own opaque error instead of naming the actual problem.
 if (!executablePath) {
-    process.exit(0);
+    console.error(`Electron does not ship a binary for this platform (${process.platform}).`);
+    process.exit(1);
 }
 
 const fullPath = path.join(electronDir, 'dist', executablePath);
 
 if (!fs.existsSync(fullPath)) {
-    process.exit(0);
+    console.error(
+        `The Electron binary is missing at ${fullPath}.
+`
+        + 'Reinstall dependencies with "npm install" (or "npm ci") and try again.'
+    );
+    process.exit(1);
 }
 
 fs.writeFileSync(pathFile, executablePath, 'utf8');

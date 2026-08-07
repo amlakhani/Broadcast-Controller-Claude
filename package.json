@@ -6,6 +6,9 @@
   "main": "main.js",
   "author": "Anuj",
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "preinstall": "node scripts/check-build-prereqs.js",
     "prestart": "npm run build:frontend",

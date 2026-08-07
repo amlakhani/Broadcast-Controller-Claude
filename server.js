@@ -19,11 +19,26 @@ const AUTH_TOKEN = crypto.randomBytes(32).toString('hex');
 const io = new Server(server, {
     maxHttpBufferSize: 1e8 // 100MB
 });
+// Confine remote access to the selected network. This must be the FIRST middleware — ahead of
+// the body parser, every route, and the static handlers — so a device on another network gets
+// no request body parsed on its behalf and cannot even fetch the JS bundle. Loopback always
+// passes, which is what keeps the app's own windows working. (isAllowedInterface and
+// recordBlockedRemote are function declarations defined below and hoisted; nothing can reach
+// this middleware before the module has finished evaluating, since listen() comes last.)
+app.use((req, res, next) => {
+    if (isAllowedInterface(req.socket?.localAddress)) return next();
+    recordBlockedRemote(req.socket?.remoteAddress);
+    return res.status(403).send('Forbidden: remote access is limited to a different network.');
+});
+
 app.use(express.json({ limit: '1mb' }));
 
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.webm', '.mkv']);
 const IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp']);
 const STREAM_EXTENSIONS = new Set([...VIDEO_EXTENSIONS, ...IMAGE_EXTENSIONS]);
+// Generous enough for a full service's playlists and photo sets, bounded enough that a long
+// run can't accumulate readable-path capabilities indefinitely.
+const MAX_REGISTERED_LOCAL_MEDIA = 500;
 const GLOSSARY_LANGUAGES = ['en', 'gu', 'hi'];
 const TRANSLATION_ENGINES = new Set(['azure', 'local', 'soniox']);
 const DEFAULT_SONIOX_MODEL = 'stt-rt-v4';
@@ -112,8 +127,16 @@ function clearRemoteCookie(res) {
     res.setHeader('Set-Cookie', 'bc_remote_token=; Path=/; SameSite=Strict; HttpOnly; Max-Age=0');
 }
 
+// Compare BYTE length, not string length. `token.length` counts UTF-16 code units, so a
+// 64-char multi-byte string ('é'.repeat(64)) passes a string-length check but yields a
+// 128-byte buffer, and timingSafeEqual throws RangeError. That throw is fatal inside the
+// io.use middleware, so this must never be reachable.
 function isValidAuthToken(token) {
-    return typeof token === 'string' && token.length === AUTH_TOKEN.length && crypto.timingSafeEqual(Buffer.from(token), Buffer.from(AUTH_TOKEN));
+    if (typeof token !== 'string') return false;
+    const candidate = Buffer.from(token, 'utf8');
+    const expected = Buffer.from(AUTH_TOKEN, 'utf8');
+    if (candidate.length !== expected.length) return false;
+    return crypto.timingSafeEqual(candidate, expected);
 }
 
 function getRemoteSession(token) {
@@ -131,10 +154,14 @@ function isValidRemoteToken(token) {
     return remoteAccessEnabled && Boolean(getRemoteSession(token));
 }
 
+// Byte-length compare for the same reason as isValidAuthToken above. Callers currently
+// pre-strip non-digits, but that must not be an unwritten invariant this function relies on.
 function timingSafeEqualString(a, b) {
     if (typeof a !== 'string' || typeof b !== 'string') return false;
-    if (!a.length || a.length !== b.length) return false;
-    return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+    const left = Buffer.from(a, 'utf8');
+    const right = Buffer.from(b, 'utf8');
+    if (!left.length || left.length !== right.length) return false;
+    return crypto.timingSafeEqual(left, right);
 }
 
 function isValidPairingCode(code) {
@@ -264,15 +291,40 @@ function isAllowedOrigin(origin, port = app.get('port')) {
     return !origin || getAllowedOrigin(port).has(origin);
 }
 
+// The built pages never change while the app is running, so read each one once instead of on
+// every request. Also turns a missing build from a 500-with-stack into an actionable message.
+const pageCache = new Map();
+
+function readPage(fileName) {
+    if (pageCache.has(fileName)) return pageCache.get(fileName);
+    let html;
+    try {
+        html = fs.readFileSync(path.join(__dirname, 'public_react', fileName), 'utf8');
+    } catch (err) {
+        console.error(`Could not read ${fileName} from public_react:`, err);
+        return null;
+    }
+    pageCache.set(fileName, html);
+    return html;
+}
+
+function sendMissingBuild(res, fileName) {
+    res.status(500).type('text/plain').send(
+        `${fileName} is missing from public_react. Run "npm run build:frontend" and restart.`
+    );
+}
+
 function sendAppHtml(res, fileName) {
-    const html = fs.readFileSync(path.join(__dirname, 'public_react', fileName), 'utf8');
+    const html = readPage(fileName);
+    if (html === null) return sendMissingBuild(res, fileName);
     setAuthCookies(res, { authToken: AUTH_TOKEN });
     res.set('Content-Type', 'text/html; charset=utf-8');
     res.send(html.replace('</head>', `<script>window.__BC_AUTH_TOKEN__=${JSON.stringify(AUTH_TOKEN)};</script></head>`));
 }
 
 function sendRemoteHtml(res, fileName = 'index.html') {
-    const html = fs.readFileSync(path.join(__dirname, 'public_react', fileName), 'utf8');
+    const html = readPage(fileName);
+    if (html === null) return sendMissingBuild(res, fileName);
     res.set('Content-Type', 'text/html; charset=utf-8');
     res.send(html.replace('</head>', '<script>window.__BC_REMOTE_ENTRY__=true;</script></head>'));
 }
@@ -313,6 +365,30 @@ function getNetworkAdapters() {
     return adapters;
 }
 
+// Write to a temp file and rename over the target. rename is atomic on both platforms we ship,
+// so a crash or power loss mid-write leaves the previous file intact instead of a truncated one.
+// That mattered: every loader falls back to defaults on a parse failure (which is the right
+// behaviour), so a torn write presented as silent config loss — including the ATEM switcher
+// address, at showtime.
+//
+// `version` is written on every settings file so a future schema change has something to branch
+// on; loaders currently accept a missing version as "v1" for files written before this.
+function writeJsonAtomic(filePath, value) {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const tmpPath = `${filePath}.${process.pid}.tmp`;
+    try {
+        fs.writeFileSync(tmpPath, JSON.stringify(value, null, 2), 'utf8');
+        fs.renameSync(tmpPath, filePath);
+    } catch (err) {
+        try {
+            fs.rmSync(tmpPath, { force: true });
+        } catch {
+            // The temp file is already gone, or unreachable; the original error is what matters.
+        }
+        throw err;
+    }
+}
+
 function getRemoteNetworkPath() {
     return path.join(translationGlossaryDir, 'remote-network.json');
 }
@@ -340,8 +416,7 @@ function saveRemoteNetworkSelection(selected) {
     const value = typeof selected === 'string' && selected.trim() ? selected.trim() : 'auto';
     remoteNetworkSelection = value;
     try {
-        fs.mkdirSync(translationGlossaryDir, { recursive: true });
-        fs.writeFileSync(getRemoteNetworkPath(), JSON.stringify({ selected: value }, null, 2), 'utf8');
+        writeJsonAtomic(getRemoteNetworkPath(), { version: 1, selected: value });
     } catch (err) {
         console.error('Failed to save remote network selection:', err);
     }
@@ -485,7 +560,19 @@ function registerLocalMediaPath(rawPath, allowedExtensions = STREAM_EXTENSIONS) 
         registeredAt: Date.now()
     };
     registeredLocalMedia.set(mediaId, entry);
+    evictOldestRegisteredMedia();
     return { mediaId, ...entry };
+}
+
+// Every registered path stays readable for as long as it is in the map, so the map must not
+// grow without bound across a long show. Map preserves insertion order, so the oldest ids
+// drop out first — the same FIFO shape presSlideBufferCache uses.
+function evictOldestRegisteredMedia() {
+    while (registeredLocalMedia.size > MAX_REGISTERED_LOCAL_MEDIA) {
+        const oldest = registeredLocalMedia.keys().next().value;
+        if (oldest === undefined) return;
+        registeredLocalMedia.delete(oldest);
+    }
 }
 
 function getRegisteredLocalMedia(mediaId, allowedExtensions = STREAM_EXTENSIONS) {
@@ -501,15 +588,12 @@ function getRegisteredLocalMedia(mediaId, allowedExtensions = STREAM_EXTENSIONS)
     }
 }
 
+// Media is served ONLY by opaque mediaId. There used to be a `?path=` fallback for local-token
+// holders, which was an unrestricted arbitrary-file-read over the whole filesystem (any file
+// with an allowed extension, no directory confinement). Clients register a path once via
+// POST /api/local-media/register and use the id they get back.
 function resolveMediaRequest(req, allowedExtensions) {
-    const registered = getRegisteredLocalMedia(req.query.mediaId, allowedExtensions);
-    if (registered) return registered;
-
-    if (isValidAuthToken(getRequestToken(req))) {
-        return getValidatedLocalPath(req.query.path, allowedExtensions);
-    }
-
-    return null;
+    return getRegisteredLocalMedia(req.query.mediaId, allowedExtensions);
 }
 
 function normalizeLocalMediaPayload(data, socket, allowedExtensions = STREAM_EXTENSIONS) {
@@ -600,8 +684,7 @@ function loadLocalAiSettings() {
 
 function saveLocalAiSettings(settings) {
     const normalized = normalizeLocalAiSettings(settings);
-    fs.mkdirSync(translationGlossaryDir, { recursive: true });
-    fs.writeFileSync(getLocalAiSettingsPath(), JSON.stringify(normalized, null, 2), 'utf8');
+    writeJsonAtomic(getLocalAiSettingsPath(), { version: 1, ...normalized });
     localAiSettingsCache = normalized;
     return normalized;
 }
@@ -718,8 +801,7 @@ function loadAtemSettings() {
 
 function saveAtemSettings(settings) {
     const normalized = normalizeAtemSettings(settings);
-    fs.mkdirSync(translationGlossaryDir, { recursive: true });
-    fs.writeFileSync(getAtemSettingsPath(), JSON.stringify(normalized, null, 2), 'utf8');
+    writeJsonAtomic(getAtemSettingsPath(), { version: 1, ...normalized });
     atemSettingsCache = normalized;
     return normalized;
 }
@@ -820,12 +902,7 @@ function loadTranslationGlossary() {
 
 function saveTranslationGlossary(entries) {
     const sanitized = sanitizeGlossaryEntries(entries);
-    fs.mkdirSync(translationGlossaryDir, { recursive: true });
-    fs.writeFileSync(
-        getTranslationGlossaryPath(),
-        JSON.stringify({ version: 1, entries: sanitized }, null, 2),
-        'utf8'
-    );
+    writeJsonAtomic(getTranslationGlossaryPath(), { version: 1, entries: sanitized });
     translationGlossaryCache = sanitized;
     return sanitized;
 }
@@ -975,36 +1052,32 @@ function streamLocalFile(req, res, localFile, notFoundMessage = 'File not found'
     }
 }
 
-// Confine remote access to the selected network. Runs ahead of every route and the static
-// handlers, so a device on another network cannot even fetch the JS bundle. Loopback always
-// passes, which is what keeps the app's own windows working.
-app.use((req, res, next) => {
-    if (isAllowedInterface(req.socket?.localAddress)) return next();
-    recordBlockedRemote(req.socket?.remoteAddress);
-    return res.status(403).send('Forbidden: remote access is limited to a different network.');
-});
 
-app.get('/', requireAuth, (req, res) => {
+// These six MUST be requireLocalAuth, not requireAuth. sendAppHtml embeds AUTH_TOKEN in the
+// page and sets the bc_auth cookie, so serving any of them to a merely-paired remote hands
+// that device full local privileges and defeats every onLocalSocket gate. Remotes are served
+// by sendRemoteHtml, which deliberately embeds no token.
+app.get('/', requireLocalAuth, (req, res) => {
     sendAppHtml(res, 'index.html');
 });
 
-app.get('/index.html', requireAuth, (req, res) => {
+app.get('/index.html', requireLocalAuth, (req, res) => {
     sendAppHtml(res, 'index.html');
 });
 
-app.get('/graphics', requireAuth, (req, res) => {
+app.get('/graphics', requireLocalAuth, (req, res) => {
     sendAppHtml(res, 'graphics.html');
 });
 
-app.get('/graphics.html', requireAuth, (req, res) => {
+app.get('/graphics.html', requireLocalAuth, (req, res) => {
     sendAppHtml(res, 'graphics.html');
 });
 
-app.get('/backstage', requireAuth, (req, res) => {
+app.get('/backstage', requireLocalAuth, (req, res) => {
     sendAppHtml(res, 'backstage.html');
 });
 
-app.get('/backstage.html', requireAuth, (req, res) => {
+app.get('/backstage.html', requireLocalAuth, (req, res) => {
     sendAppHtml(res, 'backstage.html');
 });
 
@@ -1112,6 +1185,16 @@ app.post('/api/local-media/register', requireLocalAuth, (req, res) => {
 
 // Serve static files from the 'public_react' directory for the new Vite app.
 // HTML entry points are handled above so they can receive the per-launch token.
+// Every page has a route above that injects __BC_AUTH_TOKEN__ or __BC_REMOTE_ENTRY__. Anything
+// with a .html extension that reaches this point is a request for the *raw* file — which would
+// hand back the same app minus that injection, i.e. a subtly different build (remote.html and
+// pad.html were both reachable this way). Refuse it; assets still serve normally.
+app.use((req, res, next) => {
+    if (req.path.toLowerCase().endsWith('.html')) {
+        return res.status(404).send('Not found');
+    }
+    return next();
+});
 app.use(express.static(path.join(__dirname, 'public_react'), { index: false }));
 // Fallback to 'public' for legacy assets like logo.png
 app.use(express.static(path.join(__dirname, 'public'), { index: false }));
@@ -1139,7 +1222,7 @@ app.get('/local-image', requireAuth, (req, res) => {
     res.sendFile(localImage.filePath, { dotfiles: 'deny' });
 });
 
-app.get('/fetch-google-sheet', requireAuth, async (req, res) => {
+app.get('/fetch-google-sheet', requireLocalAuth, async (req, res) => {
     const csvUrls = buildGoogleSheetCsvUrls(req.query.url || '');
     if (csvUrls.length === 0) {
         return res.status(400).send('Paste a valid Google Sheets link.');
@@ -1164,7 +1247,7 @@ app.get('/fetch-google-sheet', requireAuth, async (req, res) => {
 });
 
 // Anirdesh lyrics fetcher proxy
-app.get('/fetch-anirdesh', requireAuth, (req, res) => {
+app.get('/fetch-anirdesh', requireLocalAuth, (req, res) => {
     const anirdeshUrl = decodeURIComponent(req.query.url || '');
     if (!isAllowedHostname(anirdeshUrl, ['anirdesh.com'])) {
         return res.status(400).send('Invalid Anirdesh URL');
@@ -1189,7 +1272,13 @@ app.get('/fetch-anirdesh', requireAuth, (req, res) => {
             response.setEncoding('utf8');
             response.on('data', chunk => { data += chunk; });
             response.on('end', () => {
-                res.set('Content-Type', 'text/html; charset=utf-8');
+                // text/plain, not text/html: this is third-party markup being returned on the
+                // app's own origin, which is the origin that holds the local auth token. The
+                // client parses it (parseAnirdeshLyrics) rather than rendering it, so nothing
+                // needs it to be HTML — and serving it as HTML would make any hostile upstream
+                // response reflected XSS with access to that token.
+                res.set('Content-Type', 'text/plain; charset=utf-8');
+                res.set('X-Content-Type-Options', 'nosniff');
                 res.send(data);
             });
         }).on('error', (err) => {
@@ -1200,7 +1289,7 @@ app.get('/fetch-anirdesh', requireAuth, (req, res) => {
 });
 
 // Anirdesh search proxy
-app.get('/search-anirdesh', requireAuth, (req, res) => {
+app.get('/search-anirdesh', requireLocalAuth, (req, res) => {
     const query = req.query.q || '';
     const what = req.query.what || 'title';
     const type = req.query.type || 'keyword';
@@ -1210,7 +1299,9 @@ app.get('/search-anirdesh', requireAuth, (req, res) => {
         return res.json([]);
     }
 
-    const postData = `q=${encodeURIComponent(query)}&what=${what}&type=${type}&beg=${beg}`;
+    // Every value must be encoded, not just `q` — an unencoded `what`/`type`/`beg` lets a
+    // caller inject extra fields into the upstream POST body.
+    const postData = new URLSearchParams({ q: query, what, type, beg }).toString();
 
     const options = {
         hostname: 'www.anirdesh.com',
@@ -1414,7 +1505,7 @@ const YT_MAX_PAGES = 60;
 
 // YouTube Playlist fetcher proxy — scrapes the playlist page, then paginates
 // through YouTube's internal InnerTube browse API to fetch the whole playlist.
-app.get('/fetch-youtube-playlist', requireAuth, async (req, res) => {
+app.get('/fetch-youtube-playlist', requireLocalAuth, async (req, res) => {
     let playlistUrl = decodeURIComponent(req.query.url || '');
     if (!isAllowedHostname(playlistUrl, ['youtube.com', 'youtu.be']) || !playlistUrl.includes('list=')) {
         return res.status(400).send('Invalid YouTube Playlist URL');
@@ -1572,6 +1663,117 @@ const EMPTY_PRESENTATION_STATE = {
     showing: false
 };
 
+const PRES_MODES = new Set(['none', 'url', 'images']);
+// A deck is base64 image strings held in memory and fanned out to every local window, so it
+// needs a hard ceiling. 500 slides at ~4 MB each would still be far past anything real; the
+// byte budget is the limit that actually matters.
+// A 200-slide deck of 1080p JPEGs is roughly 40 MB once base64-encoded, so 64 MB leaves real
+// headroom while still refusing the payloads that were pinning server memory.
+const MAX_PRES_SLIDES = 500;
+const MAX_PRES_BYTES = 64 * 1024 * 1024;
+
+function sumStringBytes(values) {
+    let total = 0;
+    for (const value of values) {
+        total += typeof value === 'string' ? value.length : 0;
+    }
+    return total;
+}
+
+// pres_update used to store whatever a client sent, verbatim and unbounded. Shape it here so a
+// malformed or oversized deck is rejected at the edge instead of becoming the server's state.
+// Returns { ok, state } or { ok: false, error }.
+// Cue-sheet rows carry operator-defined columns, so keep the shape but bound what any one cell
+// (and any one row) can cost. Generous for real cue sheets; a hard stop for anything else.
+const MAX_BACKSTAGE_CELL_CHARS = 2000;
+const MAX_BACKSTAGE_ROW_KEYS = 40;
+
+const MAX_BACKSTAGE_CUSTOM_FIELDS = 40;
+
+function sanitizeBackstageCell(value) {
+    if (typeof value === 'string') return value.slice(0, MAX_BACKSTAGE_CELL_CHARS);
+    if (typeof value === 'number' || typeof value === 'boolean' || value === null) return value;
+    return undefined;
+}
+
+function sanitizeBackstageRow(row) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return {};
+    const sanitized = {};
+    for (const [key, value] of Object.entries(row).slice(0, MAX_BACKSTAGE_ROW_KEYS)) {
+        // customFields carries the operator's extra spreadsheet columns as
+        // [{ label, value, index }], so it has to survive one level of nesting — flattening it
+        // away would silently drop custom columns from the backstage monitor.
+        if (Array.isArray(value)) {
+            sanitized[key] = value.slice(0, MAX_BACKSTAGE_CUSTOM_FIELDS).map(entry => {
+                if (!entry || typeof entry !== 'object') return sanitizeBackstageCell(entry) ?? null;
+                const cleaned = {};
+                for (const [entryKey, entryValue] of Object.entries(entry).slice(0, MAX_BACKSTAGE_ROW_KEYS)) {
+                    const safe = sanitizeBackstageCell(entryValue);
+                    if (safe !== undefined) cleaned[entryKey] = safe;
+                }
+                return cleaned;
+            });
+            continue;
+        }
+        const safe = sanitizeBackstageCell(value);
+        if (safe !== undefined) sanitized[key] = safe;
+    }
+    return sanitized;
+}
+
+function getPresStateForTests() {
+    return currentPresState;
+}
+
+function normalizePresState(data) {
+    if (data === null || data === undefined) {
+        return { ok: true, state: null };
+    }
+    if (typeof data !== 'object' || Array.isArray(data)) {
+        return { ok: false, error: 'Presentation state must be an object.' };
+    }
+
+    const images = Array.isArray(data.images) ? data.images.filter(v => typeof v === 'string') : [];
+    const thumbs = Array.isArray(data.thumbs) ? data.thumbs.filter(v => typeof v === 'string') : [];
+
+    if (images.length > MAX_PRES_SLIDES || thumbs.length > MAX_PRES_SLIDES) {
+        return { ok: false, error: `A deck cannot exceed ${MAX_PRES_SLIDES} slides.` };
+    }
+
+    const totalBytes = sumStringBytes(images) + sumStringBytes(thumbs);
+    if (totalBytes > MAX_PRES_BYTES) {
+        return { ok: false, error: 'This deck is too large to load. Export it at a lower resolution.' };
+    }
+
+    const totalSlides = Number(data.totalSlides);
+    const currentIdx = Number(data.currentIdx);
+
+    return {
+        ok: true,
+        state: {
+            mode: PRES_MODES.has(data.mode) ? data.mode : 'none',
+            baseUrl: typeof data.baseUrl === 'string' ? data.baseUrl : '',
+            slideId: typeof data.slideId === 'string' ? data.slideId : '',
+            currentIdx: Number.isFinite(currentIdx) && currentIdx >= 0 ? Math.floor(currentIdx) : 0,
+            totalSlides: Number.isFinite(totalSlides) && totalSlides >= 0 ? Math.floor(totalSlides) : 0,
+            images,
+            thumbs,
+            isCanva: Boolean(data.isCanva),
+            showing: Boolean(data.showing)
+        }
+    };
+}
+
+// There is one live graphic, so there is one auto-clear timer — module scope, alongside the
+// rest of the authoritative show state.
+//
+// This used to be a per-socket closure, which produced two bugs: a hide from a tablet could not
+// cancel a timer started from the desktop (so the graphic came back down later anyway), and a
+// pending timer outlived the browser that set it with nothing able to cancel it. Note it is
+// deliberately NOT cleared on disconnect: "clear this graphic in 10 seconds" is a property of
+// the show, not of whichever browser happened to request it.
+let autoClearTimer = null;
+
 let currentPresState = null;
 // Identifies the currently loaded deck so slide image URLs can be cached
 // immutably (see the /api/presentation/slide/:index handler below). Bumped
@@ -1615,14 +1817,13 @@ let currentStageNegFlash = true;
 let currentStageNegWhite = false;
 let currentMediaData = null;
 let currentPhotoData = null;
-let currentParticlesState = { enabled: false, type: 'dust', intensity: 50, speed: 50 };
-let currentMediaMessageOverlay = { ...DEFAULT_MEDIA_MESSAGE_OVERLAY };
-let currentMediaPlaying = false;
-let currentMediaLoop = false;
-let currentMediaAutoNext = false;
-let currentMediaMuted = false;
-let currentOutputMode = { backgroundMode: 'green', fitMode: 'fit' };
-let currentLayerVisibility = {
+// Default show state, defined ONCE and used both to seed the live values below and to reset
+// them in resetServerStateForTests. Those two used to be separate verbatim copies of the same
+// literals (the sabha style block appeared twice, 12 lines each), so any new field had to be
+// added in both places or tests would silently leak state between cases.
+const DEFAULT_PARTICLES_STATE = Object.freeze({ enabled: false, type: 'dust', intensity: 50, speed: 50 });
+const DEFAULT_OUTPUT_MODE = Object.freeze({ backgroundMode: 'green', fitMode: 'fit' });
+const DEFAULT_LAYER_VISIBILITY = Object.freeze({
     presentation: true,
     media: true,
     lowerThirds: true,
@@ -1631,35 +1832,56 @@ let currentLayerVisibility = {
     sabhaTimer: true,
     particles: true,
     mediaMessage: true
-};
+});
+
+function createDefaultSabhaState() {
+    return {
+        showing: false,
+        overlayMedia: false,
+        timeStr: '16:00',
+        message: 'Sabha Starts In',
+        style: {
+            msg: { fontFamily: "'Outfit', sans-serif", fontWeight: '700', fontSize: '36', letterSpacing: '5', color: '#ffffff' },
+            timer: { fontFamily: "'Outfit', sans-serif", fontWeight: '700', fontSize: '130', letterSpacing: '0', color: '#ffffff' }
+        }
+    };
+}
+
+function createDefaultTranslationStatus() {
+    return { state: 'idle', error: null, engine: 'azure', updatedAt: Date.now() };
+}
+
+function createDefaultBackstageState() {
+    return {
+        title: 'Backstage Monitor',
+        rows: [],
+        currentIndex: -1,
+        completedRows: {},
+        displayMode: 'currentNext',
+        message: null,
+        timing: null,
+        programDriftSeconds: 0,
+        serviceStartedAt: null,
+        updatedAt: Date.now()
+    };
+}
+
+let currentParticlesState = { ...DEFAULT_PARTICLES_STATE };
+let currentMediaMessageOverlay = { ...DEFAULT_MEDIA_MESSAGE_OVERLAY };
+let currentMediaPlaying = false;
+let currentMediaLoop = false;
+let currentMediaAutoNext = false;
+let currentMediaMuted = false;
+let currentOutputMode = { ...DEFAULT_OUTPUT_MODE };
+let currentLayerVisibility = { ...DEFAULT_LAYER_VISIBILITY };
 let currentLowerThirdState = null;
 let currentLyricsState = null;
-let currentSabhaState = { 
-    showing: false, 
-    overlayMedia: false, 
-    timeStr: '16:00', 
-    message: 'Sabha Starts In', 
-    style: {
-        msg: { fontFamily: "'Outfit', sans-serif", fontWeight: '700', fontSize: '36', letterSpacing: '5', color: '#ffffff' },
-        timer: { fontFamily: "'Outfit', sans-serif", fontWeight: '700', fontSize: '130', letterSpacing: '0', color: '#ffffff' }
-    }
-};
+let currentSabhaState = createDefaultSabhaState();
 let currentTranslationState = null;
 let lastTranslationStyle = {};
 let lastTranslationLayout = {};
-let currentTranslationStatus = { state: 'idle', error: null, engine: 'azure', updatedAt: Date.now() };
-let currentBackstageState = {
-    title: 'Backstage Monitor',
-    rows: [],
-    currentIndex: -1,
-    completedRows: {},
-    displayMode: 'currentNext',
-    message: null,
-    timing: null,
-    programDriftSeconds: 0,
-    serviceStartedAt: null,
-    updatedAt: Date.now()
-};
+let currentTranslationStatus = createDefaultTranslationStatus();
+let currentBackstageState = createDefaultBackstageState();
 let lastClearSnapshot = null;
 let translationWorker = null;
 let spawnTranslationWorker = defaultSpawn;
@@ -1861,8 +2083,35 @@ function getOperatorState() {
     };
 }
 
-function emitOperatorState(target = io) {
-    target.emit('operator_state_update', getOperatorState());
+// Broadcasting to everyone is coalesced onto a short trailing edge. There are ~30 call sites,
+// and most state mutations already io.emit the specific change too, so an un-debounced version
+// meant two full-state broadcasts per event — to every window and every paired phone. 60 ms is
+// below the threshold where an operator would notice a control-surface lag, and it collapses
+// bursts (a deck load, a clear-all) into one send.
+//
+// Targeted sends — emitOperatorState(socket) on connect — stay immediate: a client that just
+// connected needs its snapshot now, and there is no burst to collapse.
+const OPERATOR_STATE_DEBOUNCE_MS = 60;
+let operatorStateTimer = null;
+
+function emitOperatorState(target = null) {
+    if (target) {
+        target.emit('operator_state_update', getOperatorState());
+        return;
+    }
+    if (operatorStateTimer) return;
+    operatorStateTimer = setTimeout(() => {
+        operatorStateTimer = null;
+        io.emit('operator_state_update', getOperatorState());
+    }, OPERATOR_STATE_DEBOUNCE_MS);
+    operatorStateTimer.unref?.();
+}
+
+function flushOperatorState() {
+    if (!operatorStateTimer) return;
+    clearTimeout(operatorStateTimer);
+    operatorStateTimer = null;
+    io.emit('operator_state_update', getOperatorState());
 }
 
 // Slim presentation state for lightweight clients (the slides remote).
@@ -1912,6 +2161,32 @@ function broadcastPresState() {
     io.to('remote').emit('pres_update', getPresStateLite());
     emitPresMeta();
     emitOperatorState();
+    notifyPresentationLive();
+}
+
+// main.js uses this to hold the system-wide clicker shortcuts only while a deck is actually on
+// screen. Every path that shows, hides, loads or clears a deck goes through broadcastPresState,
+// so this is the one place that needs to report.
+let presentationLiveListener = null;
+let lastPresentationLive = false;
+
+function isPresentationLive() {
+    return Boolean(currentPresState && currentPresState.mode !== 'none' && currentPresState.showing);
+}
+
+function notifyPresentationLive() {
+    const live = isPresentationLive();
+    if (live === lastPresentationLive) return;
+    lastPresentationLive = live;
+    try {
+        presentationLiveListener?.(live);
+    } catch (err) {
+        console.error('Presentation-live listener failed:', err);
+    }
+}
+
+function setPresentationLiveListener(listener) {
+    presentationLiveListener = typeof listener === 'function' ? listener : null;
 }
 
 function sendPresStateTo(socket) {
@@ -1951,9 +2226,29 @@ function applyPresGoto(payload, originSocket) {
     broadcastPresState();
 }
 
+// Supplied by main.js so the API key never has to travel from the renderer. Falls back to
+// whatever the caller passed, which keeps the test suite (and any non-Electron run) working.
+let translationSecretResolver = null;
+
+function setTranslationSecretResolver(resolver) {
+    translationSecretResolver = typeof resolver === 'function' ? resolver : null;
+}
+
+function resolveTranslationKey(engine, providedKey) {
+    if (providedKey) return providedKey;
+    if (!translationSecretResolver) return '';
+    try {
+        return translationSecretResolver(engine) || '';
+    } catch (err) {
+        console.error('Failed to resolve stored translation key:', err);
+        return '';
+    }
+}
+
 function validateTranslationConfig(config) {
     const engine = TRANSLATION_ENGINES.has(config?.engine) ? config.engine : 'azure';
-    const key = typeof config?.key === 'string' ? config.key.trim() : '';
+    const providedKey = typeof config?.key === 'string' ? config.key.trim() : '';
+    const key = engine === 'local' ? '' : resolveTranslationKey(engine, providedKey);
     const region = typeof config?.region === 'string' ? config.region.trim() : '';
     const targetLang = typeof config?.targetLang === 'string' ? config.targetLang.trim() : '';
     const sonioxModel = typeof config?.sonioxModel === 'string' && config.sonioxModel.trim()
@@ -2014,6 +2309,16 @@ const cleanupWorker = ({ emitStatus = false, status = 'idle', error = null, engi
 
 function resetServerStateForTests() {
     stopPairingRotation();
+    lastPresentationLive = false;
+    if (autoClearTimer) {
+        clearTimeout(autoClearTimer);
+        autoClearTimer = null;
+    }
+    // A pending debounced broadcast would otherwise fire against the next test's state.
+    if (operatorStateTimer) {
+        clearTimeout(operatorStateTimer);
+        operatorStateTimer = null;
+    }
     remoteNetworkSelection = null;
     lastBlockedRemote = null;
     lastBlockedEmitAt = 0;
@@ -2033,52 +2338,23 @@ function resetServerStateForTests() {
     currentStageNegWhite = false;
     currentMediaData = null;
     currentPhotoData = null;
-    currentParticlesState = { enabled: false, type: 'dust', intensity: 50, speed: 50 };
+    currentParticlesState = { ...DEFAULT_PARTICLES_STATE };
     currentMediaMessageOverlay = { ...DEFAULT_MEDIA_MESSAGE_OVERLAY };
     currentMediaPlaying = false;
     currentMediaLoop = false;
     currentMediaAutoNext = false;
     currentMediaMuted = false;
-    currentOutputMode = { backgroundMode: 'green', fitMode: 'fit' };
-    currentLayerVisibility = {
-        presentation: true,
-        media: true,
-        lowerThirds: true,
-        lyrics: true,
-        translation: true,
-        sabhaTimer: true,
-        particles: true,
-        mediaMessage: true
-    };
+    currentOutputMode = { ...DEFAULT_OUTPUT_MODE };
+    currentLayerVisibility = { ...DEFAULT_LAYER_VISIBILITY };
     atemSettingsCache = null;
     currentLowerThirdState = null;
     currentLyricsState = null;
-    currentSabhaState = {
-        showing: false,
-        overlayMedia: false,
-        timeStr: '16:00',
-        message: 'Sabha Starts In',
-        style: {
-            msg: { fontFamily: "'Outfit', sans-serif", fontWeight: '700', fontSize: '36', letterSpacing: '5', color: '#ffffff' },
-            timer: { fontFamily: "'Outfit', sans-serif", fontWeight: '700', fontSize: '130', letterSpacing: '0', color: '#ffffff' }
-        }
-    };
+    currentSabhaState = createDefaultSabhaState();
     currentTranslationState = null;
     lastTranslationStyle = {};
     lastTranslationLayout = {};
-    currentTranslationStatus = { state: 'idle', error: null, engine: 'azure', updatedAt: Date.now() };
-    currentBackstageState = {
-        title: 'Backstage Monitor',
-        rows: [],
-        currentIndex: -1,
-        completedRows: {},
-        displayMode: 'currentNext',
-        message: null,
-        timing: null,
-        programDriftSeconds: 0,
-        serviceStartedAt: null,
-        updatedAt: Date.now()
-    };
+    currentTranslationStatus = createDefaultTranslationStatus();
+    currentBackstageState = createDefaultBackstageState();
     lastClearSnapshot = null;
     registeredLocalMedia = new Map();
     pairingAttempts.clear();
@@ -2104,12 +2380,6 @@ function emitTranslationGlossaryUpdate() {
     io.emit('translation_glossary_update', loadTranslationGlossary());
 }
 
-function sendGlossaryResult(ack, result) {
-    if (typeof ack === 'function') {
-        ack(result);
-    }
-}
-
 function sendSocketResult(ack, result) {
     if (typeof ack === 'function') {
         ack(result);
@@ -2120,33 +2390,42 @@ function sendLocalAiSettings(socket) {
     socket.emit('local_ai_settings_update', loadLocalAiSettings());
 }
 
+// socket.io's middleware runner has no try/catch of its own: a throw here escapes as an
+// uncaught exception and kills the Electron main process mid-show. Every handshake is
+// attacker-influenced, so the whole body is wrapped and any throw becomes a rejected
+// connection instead of dead air.
 io.use((socket, next) => {
-    const origin = socket.handshake.headers.origin || '';
-    const token = socket.handshake.auth?.token || socket.handshake.query?.auth || '';
-    const remoteToken = socket.handshake.auth?.remoteToken || socket.handshake.query?.remoteToken || '';
-    // Same network confinement as the HTTP middleware (loopback always allowed).
-    if (!isAllowedInterface(socket.request?.socket?.localAddress)) {
-        recordBlockedRemote(socket.request?.socket?.remoteAddress);
+    try {
+        const origin = socket.handshake.headers.origin || '';
+        const token = socket.handshake.auth?.token || socket.handshake.query?.auth || '';
+        const remoteToken = socket.handshake.auth?.remoteToken || socket.handshake.query?.remoteToken || '';
+        // Same network confinement as the HTTP middleware (loopback always allowed).
+        if (!isAllowedInterface(socket.request?.socket?.localAddress)) {
+            recordBlockedRemote(socket.request?.socket?.remoteAddress);
+            return next(new Error('Unauthorized'));
+        }
+        if (!isAllowedOrigin(origin)) {
+            return next(new Error('Unauthorized'));
+        }
+        if (isValidAuthToken(token)) {
+            socket.data.clientType = 'local';
+            return next();
+        }
+        const remoteSession = getRemoteSession(remoteToken);
+        if (remoteAccessEnabled && remoteSession) {
+            socket.data.clientType = 'remote';
+            socket.data.remoteToken = remoteToken;
+            socket.data.remoteSession = remoteSession;
+            return next();
+        }
+        if (remoteToken && !remoteAccessEnabled) {
+            remoteSessions.delete(remoteToken);
+        }
+        return next(new Error('Unauthorized'));
+    } catch (err) {
+        console.error('Socket handshake check failed:', err);
         return next(new Error('Unauthorized'));
     }
-    if (!isAllowedOrigin(origin)) {
-        return next(new Error('Unauthorized'));
-    }
-    if (isValidAuthToken(token)) {
-        socket.data.clientType = 'local';
-        return next();
-    }
-    const remoteSession = getRemoteSession(remoteToken);
-    if (remoteAccessEnabled && remoteSession) {
-        socket.data.clientType = 'remote';
-        socket.data.remoteToken = remoteToken;
-        socket.data.remoteSession = remoteSession;
-        return next();
-    }
-    if (remoteToken && !remoteAccessEnabled) {
-        remoteSessions.delete(remoteToken);
-    }
-    return next(new Error('Unauthorized'));
 });
 
 async function testLocalAiSettings(settings = loadLocalAiSettings()) {
@@ -2247,7 +2526,11 @@ io.on('connection', (socket) => {
     });
 
     onLocalSocket(socket, 'remote_pairing_code_rotate', (ack) => {
-        remotePairingCode = generatePairingCode();
+        // Must go through rotatePairingCode, not assign directly. A direct assignment leaves
+        // previousPairingCode intact, so a code graced by an earlier *timed* rotation stays
+        // usable after a manual rotate — exactly what manual rotation exists to prevent. It
+        // also skipped remotePairingCodeIssuedAt, which made the operator's countdown wrong.
+        rotatePairingCode({ grace: false });
         emitRemoteAccessStatus();
         sendSocketResult(ack, { ok: true, status: getRemoteStatus() });
     });
@@ -2299,9 +2582,7 @@ io.on('connection', (socket) => {
         sendSocketResult(ack, { ok: true, status: getRemoteStatus() });
     });
 
-    let autoClearTimer = null;
-
-    socket.on('show_lower_third', async (data) => {
+    socket.on('show_lower_third', (data) => {
         console.log('Showing lower third:', data);
         currentLowerThirdState = {
             name: data?.name || '',
@@ -2329,7 +2610,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('show_lyrics', async (data) => {
+    socket.on('show_lyrics', (data) => {
         console.log('Showing lyrics:', data);
         currentLyricsState = {
             engText: data?.engText || '',
@@ -2560,9 +2841,13 @@ io.on('connection', (socket) => {
     });
 
     socket.on('backstage_state_update', (state = {}) => {
+        // Row *count* was capped but row *content* was not, so 500 rows of arbitrary strings
+        // could still be arbitrarily large. Cue-sheet rows have operator-defined columns, so
+        // bound each cell rather than pinning the shape.
+        const rows = Array.isArray(state.rows) ? state.rows.slice(0, 500).map(sanitizeBackstageRow) : [];
         currentBackstageState = {
             title: typeof state.title === 'string' ? state.title.slice(0, 160) : 'Backstage Monitor',
-            rows: Array.isArray(state.rows) ? state.rows.slice(0, 500) : [],
+            rows,
             currentIndex: Number.isFinite(Number(state.currentIndex)) ? Number(state.currentIndex) : -1,
             completedRows: state.completedRows && typeof state.completedRows === 'object' ? state.completedRows : {},
             displayMode: ['currentNext', 'full'].includes(state.displayMode) ? state.displayMode : 'currentNext',
@@ -2587,7 +2872,6 @@ io.on('connection', (socket) => {
     // Sabha Countdown Relay
     socket.on('sabha_timer_update', (data) => {
         currentSabhaState = { ...currentSabhaState, ...data };
-        console.log('Sabha Timer State Merged:', currentSabhaState);
         io.emit('sabha_timer_state', currentSabhaState);
         emitOperatorState();
     });
@@ -2694,10 +2978,32 @@ io.on('connection', (socket) => {
         emitOperatorState();
     });
 
-    socket.on('pres_update', (data) => {
-        currentPresState = data;
+    // The deck payload used to be stored verbatim, unbounded and ungated: a remote could pin
+    // up to maxHttpBufferSize of server memory and force a fan-out of it to every local window.
+    // Now it is shape-checked and size-capped for everyone, and inline slide images are
+    // local-only — the slides remote legitimately loads Google Slides/Canva decks, which are
+    // URL-based and carry no image data, so it keeps working.
+    socket.on('pres_update', (data, ack) => {
+        const result = normalizePresState(data);
+        if (!result.ok) {
+            console.warn('Rejected pres_update:', result.error);
+            sendSocketResult(ack, result);
+            socket.emit('pres_update_rejected', { error: result.error });
+            return;
+        }
+
+        const carriesImages = Boolean(result.state?.images?.length || result.state?.thumbs?.length);
+        if (carriesImages && !isLocalSocket(socket)) {
+            const error = 'Image decks can only be loaded from the main controller.';
+            sendSocketResult(ack, { ok: false, error });
+            socket.emit('pres_update_rejected', { error });
+            return;
+        }
+
+        currentPresState = result.state;
         bumpPresDeckId();
         broadcastPresState();
+        sendSocketResult(ack, { ok: true });
     });
 
     // The graphics window's own keyboard shortcuts (ArrowRight/Left/Home/End) used
@@ -2786,7 +3092,10 @@ io.on('connection', (socket) => {
     });
 
     socket.on('start_translation', (config) => {
-        if (config?.engine === 'local' && !requireLocalSocket(socket)) return;
+        // Local-only for every engine, not just 'local'. The azure/soniox payloads carry the
+        // operator's paid API key, and when Remote Operators is on that key would otherwise
+        // cross the venue LAN in cleartext.
+        if (!requireLocalSocket(socket)) return;
         const validated = validateTranslationConfig(config);
         if (!validated.ok) {
             socket.emit('translation_failed', { error: validated.error });
@@ -2837,8 +3146,10 @@ io.on('connection', (socket) => {
                         style: lastTranslationStyle,
                         layout: lastTranslationLayout
                     };
+                    // Deliberately no emitOperatorState() here. This fires for every interim
+                    // ASR token — several times a second during live captioning — and the
+                    // dedicated translation_update event above already carries what changed.
                     io.emit('translation_update', currentTranslationState);
-                    emitOperatorState();
                 } else if (msg.type === 'translation_canceled') {
                     io.emit('translation_canceled', { error: msg.error });
                     cleanupWorker({ emitStatus: true, status: 'error', error: msg.error });
@@ -2892,22 +3203,22 @@ io.on('connection', (socket) => {
     socket.on('translation_glossary_request', (ack) => {
         const entries = loadTranslationGlossary();
         socket.emit('translation_glossary_update', entries);
-        sendGlossaryResult(ack, { ok: true, entries });
+        sendSocketResult(ack, { ok: true, entries });
     });
 
     socket.on('translation_glossary_add', (entry, ack) => {
         const normalized = normalizeGlossaryEntry(entry);
         if (!isUsableGlossaryEntry(normalized)) {
-            sendGlossaryResult(ack, { ok: false, error: 'Enter at least two matching language phrases.' });
+            sendSocketResult(ack, { ok: false, error: 'Enter at least two matching language phrases.' });
             return;
         }
 
         try {
             const entries = saveTranslationGlossary([...loadTranslationGlossary(), normalized]);
             emitTranslationGlossaryUpdate();
-            sendGlossaryResult(ack, { ok: true, entry: normalized, entries });
+            sendSocketResult(ack, { ok: true, entry: normalized, entries });
         } catch (err) {
-            sendGlossaryResult(ack, { ok: false, error: err.message || 'Failed to save glossary entry.' });
+            sendSocketResult(ack, { ok: false, error: err.message || 'Failed to save glossary entry.' });
         }
     });
 
@@ -2915,13 +3226,13 @@ io.on('connection', (socket) => {
         const entries = loadTranslationGlossary();
         const index = entries.findIndex(item => item.id === entry?.id);
         if (index === -1) {
-            sendGlossaryResult(ack, { ok: false, error: 'Glossary entry was not found.' });
+            sendSocketResult(ack, { ok: false, error: 'Glossary entry was not found.' });
             return;
         }
 
         const normalized = normalizeGlossaryEntry(entry, entries[index]);
         if (!isUsableGlossaryEntry(normalized)) {
-            sendGlossaryResult(ack, { ok: false, error: 'Enter at least two matching language phrases.' });
+            sendSocketResult(ack, { ok: false, error: 'Enter at least two matching language phrases.' });
             return;
         }
 
@@ -2930,9 +3241,9 @@ io.on('connection', (socket) => {
             nextEntries[index] = normalized;
             const saved = saveTranslationGlossary(nextEntries);
             emitTranslationGlossaryUpdate();
-            sendGlossaryResult(ack, { ok: true, entry: normalized, entries: saved });
+            sendSocketResult(ack, { ok: true, entry: normalized, entries: saved });
         } catch (err) {
-            sendGlossaryResult(ack, { ok: false, error: err.message || 'Failed to update glossary entry.' });
+            sendSocketResult(ack, { ok: false, error: err.message || 'Failed to update glossary entry.' });
         }
     });
 
@@ -2940,16 +3251,16 @@ io.on('connection', (socket) => {
         const entries = loadTranslationGlossary();
         const nextEntries = entries.filter(entry => entry.id !== id);
         if (nextEntries.length === entries.length) {
-            sendGlossaryResult(ack, { ok: false, error: 'Glossary entry was not found.' });
+            sendSocketResult(ack, { ok: false, error: 'Glossary entry was not found.' });
             return;
         }
 
         try {
             const saved = saveTranslationGlossary(nextEntries);
             emitTranslationGlossaryUpdate();
-            sendGlossaryResult(ack, { ok: true, entries: saved });
+            sendSocketResult(ack, { ok: true, entries: saved });
         } catch (err) {
-            sendGlossaryResult(ack, { ok: false, error: err.message || 'Failed to delete glossary entry.' });
+            sendSocketResult(ack, { ok: false, error: err.message || 'Failed to delete glossary entry.' });
         }
     });
 
@@ -3020,9 +3331,34 @@ io.on('connection', (socket) => {
         emitOperatorState();
     });
 
+    // Reported by ErrorBoundary when a renderer subtree fails. Logged here because a failure on
+    // the graphics output is otherwise invisible: that window has no visible error state (it is
+    // on air) and usually has no devtools open during a service.
+    socket.on('client_error', (report = {}) => {
+        const label = typeof report.label === 'string' ? report.label.slice(0, 80) : 'unknown';
+        const message = typeof report.message === 'string' ? report.message.slice(0, 500) : '';
+        console.error(`[client:${label}] ${message}`);
+    });
+
     socket.on('disconnect', () => {
         console.log('Client disconnected');
     });
+});
+
+// Registered after every route, so these are the last things Express tries. Without them an
+// unknown path fell through to Express's default HTML 404 and a throw inside any handler
+// produced a 500 carrying a stack trace.
+app.use((req, res) => {
+    res.status(404).type('text/plain').send('Not found');
+});
+
+// Four args: Express identifies error middleware by arity, so `next` must stay even though it
+// is unused.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+    console.error(`Unhandled error on ${req.method} ${req.path}:`, err);
+    if (res.headersSent) return;
+    res.status(500).type('text/plain').send('Something went wrong handling that request.');
 });
 
 const DEFAULT_PORT = 5522;
@@ -3157,7 +3493,13 @@ export {
     isAllowedInterface,
     getAuthToken,
     resetServerStateForTests,
+    getPresStateForTests,
+    normalizePresState,
     setTranslationWorkerFactoryForTests,
+    setTranslationSecretResolver,
+    setPresentationLiveListener,
+    isLocalSocket,
+    onLocalSocket,
     setTranslationGlossaryDir,
     loadTranslationGlossary,
     saveTranslationGlossary,

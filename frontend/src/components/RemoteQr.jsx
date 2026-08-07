@@ -1,13 +1,8 @@
 import { useEffect, useState } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
 import { X } from 'lucide-react';
+import { buildRemoteQrValue } from '../utils/pairing';
 
-// The pairing code rides in the URL *fragment*: fragments are never sent to the server,
-// so the credential stays out of request logs. RemotePairing strips it after use.
-export function buildRemoteQrValue(url, code) {
-    if (!url) return '';
-    return code ? `${url}#c=${code}` : url;
-}
 
 function secondsLeft(expiresAt) {
     if (!expiresAt) return null;

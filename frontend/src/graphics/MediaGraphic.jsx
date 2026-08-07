@@ -184,25 +184,35 @@ export default function MediaGraphic({ socket, windowMode }) {
     useEffect(() => {
         if (!socket || windowMode === 'stage') return;
 
-        socket.on('media_play', (data) => {
+        // Every handler is named and removed by reference below. Previously three of them were
+        // anonymous and never removed at all, and the rest were removed with the argument-less
+        // socket.off('event') form — which drops EVERY listener for that event on a socket that
+        // is shared at module scope by all the graphics layers.
+        const handleMediaPlay = (data) => {
             stopMediaTracking();
             setMediaData(data);
             if (data.loop !== undefined) setLoop(data.loop);
             if (data.autoNext !== undefined) setAutoNext(data.autoNext);
             if (data.muted !== undefined) setMuted(data.muted);
-        });
-
-        socket.on('media_set_loop', (state) => setLoop(state));
-        socket.on('media_set_auto_next', (state) => setAutoNext(state));
-        socket.on('media_set_muted', (state) => setMuted(state));
-
-        socket.on('media_stop', () => {
+        };
+        const handleSetLoop = (state) => setLoop(state);
+        const handleSetAutoNext = (state) => setAutoNext(state);
+        const handleSetMuted = (state) => setMuted(state);
+        const handleMediaStop = () => {
             stopMediaTracking();
             stopAudioLevelTracking();
             setMediaData(null);
-        });
+        };
+        const handlePhotoPlay = (data) => setPhotoData(data);
+        const handlePhotoStop = () => setPhotoData(null);
 
-        socket.on('media_seek', (time) => {
+        socket.on('media_play', handleMediaPlay);
+        socket.on('media_set_loop', handleSetLoop);
+        socket.on('media_set_auto_next', handleSetAutoNext);
+        socket.on('media_set_muted', handleSetMuted);
+        socket.on('media_stop', handleMediaStop);
+
+        const handleMediaSeek = (time) => {
             const currentMedia = mediaDataRef.current;
             if (currentMedia?.type === 'local' && localVideoRef.current) {
                 const vid = localVideoRef.current;
@@ -215,9 +225,9 @@ export default function MediaGraphic({ socket, windowMode }) {
             } else if (currentMedia?.type === 'youtube' && ytPlayerRef.current?.seekTo) {
                 try { ytPlayerRef.current.seekTo(time, true); } catch(e) {}
             }
-        });
+        };
 
-        socket.on('media_toggle_play', (shouldPlay) => {
+        const handleTogglePlay = (shouldPlay) => {
             const currentMedia = mediaDataRef.current;
             if (currentMedia?.type === 'local' && localVideoRef.current) {
                 if (shouldPlay) localVideoRef.current.play();
@@ -228,43 +238,43 @@ export default function MediaGraphic({ socket, windowMode }) {
                     else ytPlayerRef.current.pauseVideo();
                 } catch(e) {}
             }
-        });
+        };
 
-        socket.on('photo_play', (data) => setPhotoData(data));
-        socket.on('photo_stop', () => setPhotoData(null));
+        socket.on('media_seek', handleMediaSeek);
+        socket.on('media_toggle_play', handleTogglePlay);
+        socket.on('photo_play', handlePhotoPlay);
+        socket.on('photo_stop', handlePhotoStop);
 
         socket.emit('request_media_state');
 
         return () => {
-            socket.off('media_play');
-            socket.off('media_stop');
-            socket.off('media_seek');
-            socket.off('media_toggle_play');
-            socket.off('photo_play');
-            socket.off('photo_stop');
+            socket.off('media_play', handleMediaPlay);
+            socket.off('media_set_loop', handleSetLoop);
+            socket.off('media_set_auto_next', handleSetAutoNext);
+            socket.off('media_set_muted', handleSetMuted);
+            socket.off('media_stop', handleMediaStop);
+            socket.off('media_seek', handleMediaSeek);
+            socket.off('media_toggle_play', handleTogglePlay);
+            socket.off('photo_play', handlePhotoPlay);
+            socket.off('photo_stop', handlePhotoStop);
             stopMediaTracking();
             stopAudioLevelTracking();
         };
     }, [socket, windowMode]);
 
-    // Initialize YouTube API only once
-    useEffect(() => {
+    // Injected on first actual YouTube playback rather than on mount, so an output window that
+    // never plays a YouTube item makes no external request at all. graphics.html used to load
+    // this eagerly in <head>, which stalled the on-air renderer's parse whenever the network
+    // was slow or blocked.
+    const ensureYouTubeApi = () => {
+        if (document.querySelector('script[src*="youtube.com/iframe_api"]')) return;
         if (!window.onYouTubeIframeAPIReady) {
-            window.onYouTubeIframeAPIReady = () => {
-                console.log("YouTube API Ready");
-            };
-            if (!document.querySelector('script[src*="youtube.com/iframe_api"]')) {
-                const tag = document.createElement('script');
-                tag.src = "https://www.youtube.com/iframe_api";
-                const firstScriptTag = document.getElementsByTagName('script')[0];
-                if (firstScriptTag) {
-                    firstScriptTag.parentNode.insertBefore(tag, firstScriptTag);
-                } else {
-                    document.head.appendChild(tag);
-                }
-            }
+            window.onYouTubeIframeAPIReady = () => {};
         }
-    }, []);
+        const tag = document.createElement('script');
+        tag.src = 'https://www.youtube.com/iframe_api';
+        document.head.appendChild(tag);
+    };
 
     // Handle initialization when mediaData changes
     useEffect(() => {
@@ -283,6 +293,7 @@ export default function MediaGraphic({ socket, windowMode }) {
         let cancelled = false;
 
         if (mediaData.type === 'youtube') {
+            ensureYouTubeApi();
             const MAX_ATTEMPTS = 40; // ~2s at 50ms between attempts
 
             const tryInitYouTubePlayer = (attempt = 0) => {
@@ -408,7 +419,7 @@ export default function MediaGraphic({ socket, windowMode }) {
                             id="local-video-player" 
                             ref={localVideoRef}
                             className="w-full h-full object-contain"
-                            src={authUrl('/stream-video', mediaData.mediaId ? { mediaId: mediaData.mediaId } : { path: mediaData.path })} 
+                            src={mediaData.mediaId ? authUrl('/stream-video', { mediaId: mediaData.mediaId }) : undefined}
                             autoPlay 
                             muted={isPreview || muted}
                             onLoadedMetadata={emitLocalVideoTime}
@@ -442,7 +453,7 @@ export default function MediaGraphic({ socket, windowMode }) {
                 >
                     {photoData.type === 'photo' && (
                         <img 
-                            src={authUrl('/stream-video', photoData.mediaId ? { mediaId: photoData.mediaId } : { path: photoData.path })} 
+                            src={photoData.mediaId ? authUrl('/stream-video', { mediaId: photoData.mediaId }) : undefined}
                             className="w-full h-full object-contain"
                             alt={photoData.name || "Photo"} 
                         />

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { AlertTriangle, Check, Clock, EyeOff, MessageSquare, Play, Plus, Save, Send, Square, Trash2 } from 'lucide-react';
 import { deferUntilIdle, readLocalStorageArraySafe, useDebouncedLocalStorageEffect } from '../utils/performance';
 
@@ -67,8 +67,16 @@ export default function StageDisplayPanel({ socket }) {
     const [timerTotalSeconds, setTimerTotalSeconds] = useState(0);
     const [timerMsRemaining, setTimerMsRemaining] = useState(0);
     const [timerMode, setTimerMode] = useState('down');
-    const [progressPct, setProgressPct] = useState(100);
-    const [progressColor, setProgressColor] = useState('rgb(59, 130, 246)');
+    // The progress bar is written straight to the DOM through this ref rather than held in
+    // state. It updates 10x a second while a timer runs, and as state that re-rendered this
+    // entire 450-line, 20-state panel 10x a second for two purely presentational values.
+    const progressBarRef = useRef(null);
+    const setProgressPct = (pct) => {
+        if (progressBarRef.current) progressBarRef.current.style.width = `${pct}%`;
+    };
+    const setProgressColor = (color) => {
+        if (progressBarRef.current) progressBarRef.current.style.backgroundColor = color;
+    };
     const [timerPresets, setTimerPresets] = useState(DEFAULT_PRESETS);
     const [isPresetEditMode, setIsPresetEditMode] = useState(false);
     const [savePresetBtnState, setSavePresetBtnState] = useState('SAVE CURRENT');
@@ -360,7 +368,11 @@ export default function StageDisplayPanel({ socket }) {
                     </div>
 
                     <div className="surface h-4 overflow-hidden rounded-full">
-                        <div className="h-full transition-all duration-100 ease-linear" style={{ width: `${progressPct}%`, backgroundColor: progressColor }} />
+                        <div
+                            ref={progressBarRef}
+                            className="h-full transition-all duration-100 ease-linear"
+                            style={{ width: '100%', backgroundColor: 'rgb(59, 130, 246)' }}
+                        />
                     </div>
 
                     <div className="space-y-3">
