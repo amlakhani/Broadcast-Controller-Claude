@@ -1,0 +1,81 @@
+name: Build Windows Installers
+
+# Builds the Windows NSIS installer and the portable .exe on a GitHub-hosted Windows runner.
+#
+# The macOS equivalent (build-macos.yml) already existed; this is its counterpart, so a release
+# no longer depends on someone remembering to run `npm run build:win` by hand on a Windows box.
+#
+# grandiose downloads the NDI SDK from downloads.ndi.tv during install and compiles the native
+# module, so the build is unattended — no secrets and no manual SDK step. windows-latest ships
+# the Visual Studio C++ toolchain and Python that scripts/check-ndi-win-build-env.js requires.
+#
+# Run it manually from the Actions tab (workflow_dispatch), or push a version tag like v1.0.0 to
+# also attach the installers to the GitHub Release.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # needed only for the Release step on tag pushes
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+
+      # The preinstall hook runs check-ndi-win-build-env.js first, so a runner image missing the
+      # C++ toolchain fails here with a specific message rather than a raw node-gyp error.
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install frontend dependencies
+        run: npm --prefix frontend ci
+
+      # prebuild:win runs the frontend build plus the NDI check/rebuild/verify chain, then
+      # electron-builder produces both targets declared in package.json (nsis + portable).
+      # The installers are unsigned: there is no code-signing certificate in CI, so SmartScreen
+      # will warn on first run. Signing needs a cert in repository secrets.
+      - name: Build Windows installers
+        run: npm run build:win
+
+      - name: List build output
+        run: Get-ChildItem "application packages" | Format-Table Name, Length
+        shell: pwsh
+
+      - name: Upload installers as build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installers
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            application packages/*.exe
+            application packages/*.exe.blockmap
+
+      # Only when triggered by a version tag: attach the installers to the Release. Matches the
+      # macOS workflow, so a single tag push produces one Release carrying both platforms.
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            application packages/*.exe
+            application packages/*.exe.blockmap
+          fail_on_unmatched_files: true
+          generate_release_notes: true

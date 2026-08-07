@@ -12,6 +12,41 @@ function commandWorks(command, args) {
     return spawnSync(command, args, { stdio: 'ignore', shell: false }).status === 0;
 }
 
+// node-gyp bakes the devdir into the generated .vcxproj as a *quoted* node_lib_file path, and
+// MSBuild's Contains() condition in Microsoft.CppBuild.targets cannot parse an embedded quote.
+// So a devdir containing an apostrophe fails the link step with a bewildering MSB4100, nowhere
+// near the real cause. That is not hypothetical: a Windows account named e.g. "Anuj's Framework"
+// puts an apostrophe in %TEMP% (C:\Users\ANUJ'S~1\AppData\Local\Temp), and the 8.3 short name
+// keeps it. Double quotes and non-ASCII break the same way.
+function isBuildPathSafe(dir) {
+    return !/['"]/.test(dir) && /^[\x20-\x7E]*$/.test(dir);
+}
+
+// %TEMP% when it is usable, and a plainly-named fallback when it is not. C:\Users\Public is
+// world-writable and, unlike a per-user temp dir, cannot inherit an apostrophe from the account
+// name; the drive root is the last resort.
+function buildScratchRoot() {
+    const tmp = os.tmpdir();
+    if (isBuildPathSafe(tmp)) return tmp;
+
+    const systemDrive = process.env.SystemDrive || 'C:';
+    for (const candidate of [process.env.PUBLIC, path.join(systemDrive, path.sep)]) {
+        if (!candidate) continue;
+        const dir = path.join(candidate, 'bc-native-build');
+        if (!isBuildPathSafe(dir)) continue;
+        try {
+            fs.mkdirSync(dir, { recursive: true });
+            console.log(`Note: %TEMP% (${tmp}) contains characters that break node-gyp on Windows; using ${dir} instead.`);
+            return dir;
+        } catch {
+            // Not writable — try the next candidate.
+        }
+    }
+
+    fail(`no usable build directory: %TEMP% (${tmp}) contains characters node-gyp cannot handle, and no fallback was writable.`);
+    return '';
+}
+
 function findPython() {
     if (process.env.PYTHON && fs.existsSync(process.env.PYTHON)) return process.env.PYTHON;
     if (commandWorks('py', ['-3', '--version'])) return 'PATH';
@@ -65,13 +100,14 @@ if (!fs.existsSync(vcvarsPath)) {
     fail(`vcvars64.bat was not found at ${vcvarsPath}`);
 }
 
-// Use os.tmpdir() rather than a hardcoded path at the drive root. The previous location was not
-// a Windows convention, ignored %TEMP%, and failed on a machine where the user cannot create
-// directories at C:\. (The macOS sibling script already did this correctly.)
-const devDir = path.join(os.tmpdir(), 'broadcast-controller-node-gyp-cache');
+// Prefer %TEMP% over a hardcoded drive-root path (which is not a Windows convention and fails
+// where the user cannot write to C:\), but fall back when %TEMP% is unusable — see
+// buildScratchRoot above for why that matters here.
+const scratchRoot = buildScratchRoot();
+const devDir = path.join(scratchRoot, 'broadcast-controller-node-gyp-cache');
 fs.mkdirSync(devDir, { recursive: true });
 
-const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-rebuild-ndi-'));
+const scratchDir = fs.mkdtempSync(path.join(scratchRoot, 'bc-rebuild-ndi-'));
 const commandFile = path.join(scratchDir, 'rebuild-ndi.cmd');
 const commands = [
     '@echo off',

@@ -82,8 +82,10 @@ npm --prefix frontend run lint
 ```
 
 Both commands, plus the frontend build, run in CI on every push (`.github/workflows/ci.yml`).
-The macOS installers are built separately by `.github/workflows/build-macos.yml`, which runs on
-demand or when a `v*` tag is pushed. There is no Windows CI — `npm run build:win` is manual.
+Installers are built by `.github/workflows/build-macos.yml` and `build-windows.yml`, each of
+which runs on demand or when a `v*` tag is pushed — a single tag produces one Release carrying
+both platforms. Both packaging workflows run the test suite before building, so a tagged push
+cannot publish a Release from a broken commit.
 
 ### Where your data is stored
 | What | Where |
@@ -101,6 +103,14 @@ you move a library to the venue machine). Factory Reset clears them and cannot b
 npm run build:mac     # produces arm64 + Intel .dmg in "application packages/"
 npm run build:win     # run on Windows: nsis installer + portable .exe
 ```
+
+> **Windows gotcha, if you build locally:** node-gyp writes the build cache path into the
+> generated `.vcxproj` as a *quoted* string, and MSBuild cannot parse an embedded quote inside
+> its `Contains()` conditions. So if your `%TEMP%` contains an apostrophe — which it does when
+> the Windows account name does, e.g. `C:\Users\ANUJ'S~1\AppData\Local\Temp` — the native NDI
+> module fails to link with a baffling `MSB4100` that names neither the path nor the cause.
+> `scripts/rebuild-ndi-win.js` detects this and falls back to `C:\Users\Public\bc-native-build`,
+> printing a note when it does. Nothing to do; just don't be alarmed by the fallback message.
 Mac builds rebuild and validate the native NDI module per‑architecture automatically. `build:mac` must run on macOS — Apple's DMG packaging and code‑signing tooling isn't cross‑platform, and there's no Windows workaround for this step.
 
 ---

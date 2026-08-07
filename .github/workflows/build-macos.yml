@@ -43,6 +43,11 @@ jobs:
       - name: Install frontend dependencies
         run: npm --prefix frontend ci
 
+      # Gate packaging on the suite. Without this a tagged push could publish a Release built
+      # from a broken commit, since nothing else on this path runs the tests.
+      - name: Run tests
+        run: npm test
+
       # build:mac runs prebuild:mac (frontend build + NDI check/rebuild/verify),
       # then packages arm64 and x64 DMGs into "application packages/".
       # Signing is disabled: no Apple Developer cert in CI, so the DMGs are
