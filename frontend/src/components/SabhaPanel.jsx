@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Check, ChevronDown, Clock3, Minus, Palette, Play, Plus, SlidersHorizontal, Square, Type } from 'lucide-react';
+import { Check, Clock3, Minus, Palette, Play, Plus, SlidersHorizontal, Square, Type } from 'lucide-react';
+import Section from './Section';
 
 const TIME_PRESETS = [
     { time: '15:45', label: '3:45 PM' },
@@ -88,25 +89,6 @@ const previewGradient = ({ enabled, bgIntensity, bgHeight, bgSoftness }) => {
     const featherStop = reachStop * (0.68 + softness * 0.18);
     return `linear-gradient(to top, rgba(0,0,0,${maxAlpha}) 0%, rgba(0,0,0,${maxAlpha * 0.86}) ${holdStop}%, rgba(0,0,0,${maxAlpha * 0.52}) ${midStop}%, rgba(0,0,0,${maxAlpha * 0.16}) ${featherStop}%, transparent ${reachStop}%, transparent 100%)`;
 };
-
-function Section({ icon: Icon, title, children, defaultOpen = false }) {
-    return (
-        <details className="surface group rounded-lg" open={defaultOpen}>
-            <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3">
-                <div className="flex items-center gap-2">
-                    <span className="surface-muted flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 dark:text-slate-300">
-                        <Icon className="h-4 w-4" />
-                    </span>
-                    <h4 className="text-xs font-bold uppercase tracking-widest text-slate-600 dark:text-slate-300">{title}</h4>
-                </div>
-                <ChevronDown className="h-4 w-4 text-slate-400 transition group-open:rotate-180" />
-            </summary>
-            <div className="border-t section-rule px-4 py-4">
-                {children}
-            </div>
-        </details>
-    );
-}
 
 function ColorField({ label, value, onChange }) {
     return (

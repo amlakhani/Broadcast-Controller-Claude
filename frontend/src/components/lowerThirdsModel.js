@@ -83,7 +83,12 @@ export const DEFAULT_LT_STYLE = {
     // from the same self-hosted catalogue the lyrics panel uses.
     gujFontFamily: "'Rasa', serif",
     fontWeight: '700',
+    // Sizes the English lines (name + subtitle).
     fontSizeFactor: '100',
+    // Gujarati scripts sit optically smaller than Latin at the same point size, so the
+    // title gets its own factor. Absent on anything saved before this existed, and
+    // withStyle then falls it back to fontSizeFactor — see the note there.
+    gujFontSizeFactor: '100',
     color: '#ffffff',
     // Per-line overrides. Empty string means "inherit `color`", so every existing
     // saved template keeps rendering exactly as before.
@@ -358,14 +363,22 @@ export const withDesign = (design = {}) => ({
     accentGradient: design.accentGradient ?? DEFAULT_LT_DESIGN.accentGradient
 });
 
-export const withStyle = (style = {}) => ({
-    ...DEFAULT_LT_STYLE,
-    ...style,
-    textGlow: toNumber(clean(style.textGlow, DEFAULT_LT_STYLE.textGlow), DEFAULT_LT_STYLE.textGlow),
-    bold: style.bold ?? DEFAULT_LT_STYLE.bold,
-    italic: style.italic ?? DEFAULT_LT_STYLE.italic,
-    underline: style.underline ?? DEFAULT_LT_STYLE.underline
-});
+export const withStyle = (style = {}) => {
+    const fontSizeFactor = clean(style.fontSizeFactor, DEFAULT_LT_STYLE.fontSizeFactor);
+    return {
+        ...DEFAULT_LT_STYLE,
+        ...style,
+        fontSizeFactor,
+        // Falls back to the English size rather than to the default, so a template or cue
+        // saved before this control existed keeps both lines on the one scale it was
+        // designed at. A preset with fontSizeFactor 112 must not drop its title to 100.
+        gujFontSizeFactor: clean(style.gujFontSizeFactor, fontSizeFactor),
+        textGlow: toNumber(clean(style.textGlow, DEFAULT_LT_STYLE.textGlow), DEFAULT_LT_STYLE.textGlow),
+        bold: style.bold ?? DEFAULT_LT_STYLE.bold,
+        italic: style.italic ?? DEFAULT_LT_STYLE.italic,
+        underline: style.underline ?? DEFAULT_LT_STYLE.underline
+    };
+};
 
 // Per-line colour with fallback to the single `color`, so templates saved before
 // per-line colours existed render identically.
@@ -418,11 +431,14 @@ export const normalizeDraft = (input = {}) => {
             logoSize: clean(input.layout?.logoSize, legacyDesign.logoSize),
             textAlign: clean(input.layout?.textAlign, legacyDesign.textAlign)
         },
-        typography: {
-            ...DEFAULT_LOWER_THIRD_DRAFT.typography,
+        // Run the merge back through withStyle so the Gujarati-size fallback is applied to
+        // the *merged* English size. Passing the explicit value (or undefined) keeps a draft
+        // that carries only `typography` from inheriting a stale size off `style`.
+        typography: withStyle({
             ...legacyStyle,
-            ...(input.typography || {})
-        },
+            ...(input.typography || {}),
+            gujFontSizeFactor: input.typography?.gujFontSizeFactor ?? input.style?.gujFontSizeFactor
+        }),
         behavior: {
             ...DEFAULT_LOWER_THIRD_DRAFT.behavior,
             ...(input.behavior || {}),

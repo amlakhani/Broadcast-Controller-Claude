@@ -214,6 +214,15 @@ export default function LowerThirdsGraphic({ socket, windowMode }) {
         // (this previously passed containerRef, making the two asymmetric).
         applyAnimationOut(tl, panelRef.current, currentAnimationRef.current, true, els);
         tl.to(containerRef.current, { duration: 0.05, opacity: 0, ease: 'none' }, '>');
+
+        // Safety net in case onComplete never fires (e.g. the tab was backgrounded).
+        // Derived from the timeline's own computed duration rather than a guessed
+        // constant, so it can never fire before the eased exit actually finishes and
+        // cut it off mid-fade (that used to flash the raw chroma-key background).
+        clearFallbackTimerRef.current = setTimeout(() => {
+            stopActiveAnimation();
+            finishClear();
+        }, tl.duration() * 1000 + 150);
     });
 
     useEffect(() => {
@@ -228,13 +237,9 @@ export default function LowerThirdsGraphic({ socket, windowMode }) {
             animateInRef.current?.(d);
         };
         const handleStopGraphic = () => {
+            // animateOut() schedules its own completion safety net, timed off the
+            // real exit-animation timeline it builds.
             animateOutRef.current?.();
-            // Scale the safety net with the animation speed, otherwise a slow exit
-            // (0.5x) would be cut off mid-flight by a fixed 950ms timer.
-            const speed = currentSpeedRef.current > 0 ? currentSpeedRef.current : 1;
-            clearFallbackTimerRef.current = setTimeout(() => {
-                finishClear();
-            }, Math.round(950 / speed) + 150);
         };
         const handleStyleUpdate = (s) => {
             setStyle(s);
@@ -257,12 +262,16 @@ export default function LowerThirdsGraphic({ socket, windowMode }) {
             socket.off('update_lt_style', handleStyleUpdate);
             socket.off('update_lt_design', handleDesignUpdate);
         };
-    }, [socket, stopActiveAnimation, finishClear]);
+    }, [socket, stopActiveAnimation]);
 
     // Derived styles
     const sf = (style.fontSizeFactor || 100) / 100;
+    // The Gujarati title is scaled separately — the script renders optically smaller than
+    // Latin at the same size. Falls back to the English factor for payloads sent before
+    // this existed, so an older cue still renders at one uniform scale.
+    const gujSf = (style.gujFontSizeFactor || style.fontSizeFactor || 100) / 100;
     const nameFontSize = `${4 * sf}rem`;
-    const titleFontSize = `${2.2 * sf}rem`;
+    const titleFontSize = `${2.2 * gujSf}rem`;
     const subtitle2FontSize = `${1.5 * sf}rem`;
 
     const getLangVisibility = (element) => {

@@ -104,6 +104,49 @@ test('normalizeDraft round-trips the new typography keys', () => {
     assert.equal(again.typography.sub2BgColor, '#101010');
 });
 
+test('Gujarati size falls back to the English size on anything saved before it existed', () => {
+    // The whole point of the fallback: a preset designed at 112% must not drop its
+    // Gujarati title to 100% just because it predates the separate control.
+    assert.equal(withStyle({ fontSizeFactor: '112' }).gujFontSizeFactor, '112');
+    assert.equal(withStyle({}).gujFontSizeFactor, DEFAULT_LT_STYLE.fontSizeFactor);
+
+    // ...across every draft shape normalizeDraft accepts.
+    const legacyStyleOnly = normalizeDraft({ style: { fontSizeFactor: '86' } });
+    assert.equal(legacyStyleOnly.typography.gujFontSizeFactor, '86');
+
+    const typographyOnly = normalizeDraft({ typography: { fontSizeFactor: '124' } });
+    assert.equal(typographyOnly.typography.gujFontSizeFactor, '124');
+
+    const flatLegacy = normalizeDraft({ name: 'Old', style: { fontSizeFactor: '95' } });
+    assert.equal(flatLegacy.typography.gujFontSizeFactor, '95');
+});
+
+test('an explicit Gujarati size wins over the English size and survives a round trip', () => {
+    const draft = normalizeDraft({ typography: { fontSizeFactor: '100', gujFontSizeFactor: '130' } });
+    assert.equal(draft.typography.gujFontSizeFactor, '130');
+    assert.equal(draft.typography.fontSizeFactor, '100');
+
+    // Re-normalizing must not let the English size clobber the explicit Gujarati one.
+    const again = normalizeDraft(draft);
+    assert.equal(again.typography.gujFontSizeFactor, '130');
+
+    const payload = buildLowerThirdPayload(again);
+    assert.equal(payload.style.gujFontSizeFactor, '130');
+    assert.equal(payload.style.fontSizeFactor, '100');
+});
+
+test('every built-in preset resolves a Gujarati size matching its English size', () => {
+    // None of them set gujFontSizeFactor, so all must inherit and render as designed.
+    for (const template of BUILT_IN_TEMPLATES) {
+        const { typography } = normalizeDraft(template);
+        assert.equal(
+            typography.gujFontSizeFactor,
+            typography.fontSizeFactor,
+            `${template.name} changed scale when the Gujarati size was split out`
+        );
+    }
+});
+
 test('per-line colour falls back to the shared colour', () => {
     const style = withStyle({ color: '#abcdef' });
     assert.equal(resolveLineColor(style, 'nameColor'), '#abcdef');

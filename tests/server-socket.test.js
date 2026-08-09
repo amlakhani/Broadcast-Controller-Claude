@@ -573,10 +573,10 @@ test('an auto-clear started on one client can be cancelled from another', async 
     const tablet = await connectClient();
     const watcher = await connectClient();
 
-    // Only the auto-clear path emits stop_graphic; an explicit hide emits stop_lower_third.
-    // That makes stop_graphic an exact probe for "the timer fired".
-    let autoCleared = false;
-    watcher.on('stop_graphic', () => { autoCleared = true; });
+    // Both the explicit hide and the auto-clear now emit stop_lower_third, so the probe is
+    // the count: exactly one for the hide, and no phantom second one from the timer.
+    let stops = 0;
+    watcher.on('stop_lower_third', () => { stops += 1; });
 
     // Shown from the desktop with a short auto-clear...
     const shown = waitFor(watcher, 'play_graphic');
@@ -591,7 +591,78 @@ test('an auto-clear started on one client can be cancelled from another', async 
     await hidden;
 
     await new Promise(resolve => setTimeout(resolve, 450));
-    assert.equal(autoCleared, false, 'a cancelled auto-clear must not fire later');
+    assert.equal(stops, 1, 'a cancelled auto-clear must not fire later');
+});
+
+test('a lower third and lyrics keep independent auto-clear timers', async () => {
+    const operator = await connectClient();
+    const watcher = await connectClient();
+
+    // The two layers can be on air together, so each needs its own timer. They shared one,
+    // so showing either graphic disarmed the other's pending clear.
+    let lowerThirdStops = 0;
+    let lyricsStops = 0;
+    watcher.on('stop_lower_third', () => { lowerThirdStops += 1; });
+    watcher.on('stop_lyrics', () => { lyricsStops += 1; });
+
+    const lowerThirdShown = waitFor(watcher, 'play_graphic');
+    operator.emit('show_lower_third', { name: 'Speaker', title: 'Katha', autoClear: 0.3 });
+    await lowerThirdShown;
+
+    // Putting a verse up used to cancel the name super's auto-clear outright, leaving it on
+    // screen for the rest of the show.
+    const lyricsShown = waitFor(watcher, 'play_lyrics');
+    operator.emit('show_lyrics', { engText: 'Welcome', gujText: 'સ્વાગત' });
+    await lyricsShown;
+
+    await new Promise(resolve => setTimeout(resolve, 450));
+    assert.equal(lowerThirdStops, 1, 'the lower third auto-clear must still fire');
+    assert.equal(lyricsStops, 0, 'lyrics with no auto-clear must stay up');
+});
+
+test('an expiring auto-clear only takes down its own layer', async () => {
+    const operator = await connectClient();
+    const watcher = await connectClient();
+
+    // Auto-clear used to call the global hide, which emits stop_graphic — the event every
+    // layer listens to. A name super timing out therefore wiped the lyrics as well.
+    let sawGlobalStop = false;
+    let lyricsStops = 0;
+    watcher.on('stop_graphic', () => { sawGlobalStop = true; });
+    watcher.on('stop_lyrics', () => { lyricsStops += 1; });
+
+    const lyricsShown = waitFor(watcher, 'play_lyrics');
+    operator.emit('show_lyrics', { engText: 'Welcome', gujText: 'સ્વાગત' });
+    await lyricsShown;
+
+    const lowerThirdStopped = waitFor(watcher, 'stop_lower_third');
+    operator.emit('show_lower_third', { name: 'Speaker', title: 'Katha', autoClear: 0.3 });
+    await lowerThirdStopped;
+
+    assert.equal(sawGlobalStop, false, 'auto-clear must not emit the global stop_graphic');
+    assert.equal(lyricsStops, 0, 'the lyrics layer must survive a lower third auto-clearing');
+});
+
+test('hiding one layer leaves the other layer auto-clear armed', async () => {
+    const operator = await connectClient();
+    const watcher = await connectClient();
+
+    let lyricsStops = 0;
+    watcher.on('stop_lyrics', () => { lyricsStops += 1; });
+
+    const lyricsShown = waitFor(watcher, 'play_lyrics');
+    operator.emit('show_lyrics', { engText: 'Welcome', gujText: 'સ્વાગત', autoClear: 0.3 });
+    await lyricsShown;
+
+    // A manual lower-third hide used to disarm whichever timer was pending, so the verse
+    // below would never clear itself.
+    const lowerThirdShown = waitFor(watcher, 'play_graphic');
+    operator.emit('show_lower_third', { name: 'Speaker', title: 'Katha' });
+    await lowerThirdShown;
+    operator.emit('hide_lower_third');
+
+    await new Promise(resolve => setTimeout(resolve, 450));
+    assert.equal(lyricsStops, 1, 'the lyrics auto-clear must survive an unrelated hide');
 });
 
 test('presentation-live transitions are reported once per change', async () => {

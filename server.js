@@ -1764,15 +1764,62 @@ function normalizePresState(data) {
     };
 }
 
-// There is one live graphic, so there is one auto-clear timer — module scope, alongside the
-// rest of the authoritative show state.
+// Lower thirds and lyrics are independent layers that can be on air at the same time, so each
+// owns its own auto-clear timer. A single shared timer meant showing either graphic silently
+// cancelled the other's pending clear, and hiding either one disarmed whichever timer happened
+// to be pending — so a name super with a 10s auto-clear would sit on screen for the rest of the
+// show as soon as a verse went up.
 //
-// This used to be a per-socket closure, which produced two bugs: a hide from a tablet could not
-// cancel a timer started from the desktop (so the graphic came back down later anyway), and a
-// pending timer outlived the browser that set it with nothing able to cancel it. Note it is
-// deliberately NOT cleared on disconnect: "clear this graphic in 10 seconds" is a property of
-// the show, not of whichever browser happened to request it.
-let autoClearTimer = null;
+// These live at module scope, alongside the rest of the authoritative show state. They used to
+// be per-socket closures, which produced two bugs: a hide from a tablet could not cancel a timer
+// started from the desktop (so the graphic came back down later anyway), and a pending timer
+// outlived the browser that set it with nothing able to cancel it. Note they are deliberately
+// NOT cleared on disconnect: "clear this graphic in 10 seconds" is a property of the show, not
+// of whichever browser happened to request it.
+let lowerThirdAutoClearTimer = null;
+let lyricsAutoClearTimer = null;
+
+function clearLowerThirdAutoClear() {
+    if (lowerThirdAutoClearTimer) {
+        clearTimeout(lowerThirdAutoClearTimer);
+        lowerThirdAutoClearTimer = null;
+    }
+}
+
+function clearLyricsAutoClear() {
+    if (lyricsAutoClearTimer) {
+        clearTimeout(lyricsAutoClearTimer);
+        lyricsAutoClearTimer = null;
+    }
+}
+
+// Auto-clear must take down only the layer whose timer fired. The global `stop_graphic` used
+// previously is what every layer listens to, so a lower third expiring also wiped the lyrics,
+// the sabha timer and the particles.
+function hideLowerThirdNow() {
+    clearLowerThirdAutoClear();
+    currentLowerThirdState = null;
+    io.emit('stop_lower_third');
+    emitOperatorState();
+}
+
+function hideLyricsNow() {
+    clearLyricsAutoClear();
+    currentLyricsState = null;
+    io.emit('stop_lyrics');
+    emitOperatorState();
+}
+
+// Returns a timer handle when the payload carries a positive autoClear, otherwise null.
+// Callers disarm their own timer first and assign the result, so nothing is left pending.
+function armAutoClear(autoClear, onExpire, label) {
+    const seconds = Number(autoClear);
+    if (!autoClear || Number.isNaN(seconds) || seconds <= 0) return null;
+    return setTimeout(() => {
+        console.log(`Auto clearing ${label} after ${seconds}s`);
+        onExpire();
+    }, seconds * 1000);
+}
 
 let currentPresState = null;
 // Identifies the currently loaded deck so slide image URLs can be cached
@@ -2310,10 +2357,8 @@ const cleanupWorker = ({ emitStatus = false, status = 'idle', error = null, engi
 function resetServerStateForTests() {
     stopPairingRotation();
     lastPresentationLive = false;
-    if (autoClearTimer) {
-        clearTimeout(autoClearTimer);
-        autoClearTimer = null;
-    }
+    clearLowerThirdAutoClear();
+    clearLyricsAutoClear();
     // A pending debounced broadcast would otherwise fire against the next test's state.
     if (operatorStateTimer) {
         clearTimeout(operatorStateTimer);
@@ -2594,20 +2639,10 @@ io.on('connection', (socket) => {
         // 1. Tell the graphics window to play the animation
         io.emit('play_graphic', data);
         emitOperatorState();
-        
-        // 2. Handle Auto Clear
-        if (autoClearTimer) {
-            clearTimeout(autoClearTimer);
-            autoClearTimer = null;
-        }
 
-        if (data.autoClear && !isNaN(data.autoClear) && Number(data.autoClear) > 0) {
-            const ms = Number(data.autoClear) * 1000;
-            autoClearTimer = setTimeout(() => {
-                console.log(`Auto clearing after ${data.autoClear}s`);
-                triggerHide();
-            }, ms);
-        }
+        // 2. Handle Auto Clear
+        clearLowerThirdAutoClear();
+        lowerThirdAutoClearTimer = armAutoClear(data.autoClear, hideLowerThirdNow, 'lower third');
     });
 
     socket.on('show_lyrics', (data) => {
@@ -2621,23 +2656,14 @@ io.on('connection', (socket) => {
         io.emit('play_lyrics', data);
         emitOperatorState();
 
-        if (autoClearTimer) {
-            clearTimeout(autoClearTimer);
-            autoClearTimer = null;
-        }
-        if (data.autoClear && !isNaN(data.autoClear) && Number(data.autoClear) > 0) {
-            const ms = Number(data.autoClear) * 1000;
-            autoClearTimer = setTimeout(triggerHide, ms);
-        }
+        clearLyricsAutoClear();
+        lyricsAutoClearTimer = armAutoClear(data.autoClear, hideLyricsNow, 'lyrics');
     });
 
     socket.on('clear_all', () => {
         console.log('Global Clear Triggered');
-        if (autoClearTimer) {
-
-            clearTimeout(autoClearTimer);
-            autoClearTimer = null;
-        }
+        clearLowerThirdAutoClear();
+        clearLyricsAutoClear();
         lastClearSnapshot = {
             presentationState: currentPresState ? { ...currentPresState } : null,
             mediaData: currentMediaData,
@@ -2729,25 +2755,9 @@ io.on('connection', (socket) => {
         emitOperatorState();
     };
 
-    socket.on('hide_lower_third', () => {
-        if (autoClearTimer) {
-            clearTimeout(autoClearTimer);
-            autoClearTimer = null;
-        }
-        currentLowerThirdState = null;
-        io.emit('stop_lower_third');
-        emitOperatorState();
-    });
+    socket.on('hide_lower_third', hideLowerThirdNow);
 
-    socket.on('hide_lyrics', () => {
-        if (autoClearTimer) {
-            clearTimeout(autoClearTimer);
-            autoClearTimer = null;
-        }
-        currentLyricsState = null;
-        io.emit('stop_lyrics');
-        emitOperatorState();
-    });
+    socket.on('hide_lyrics', hideLyricsNow);
 
     // Style Updates
     socket.on('update_lt_style', (style) => io.emit('update_lt_style', style));
@@ -3114,9 +3124,14 @@ io.on('connection', (socket) => {
                     ? 'soniox_translation_worker.js'
                     : 'translation_worker.js';
             const workerPath = path.join(__dirname, workerFile);
-            // Spawn node directly with standard IPC stdio configuration
-            translationWorker = spawnTranslationWorker('node', [workerPath], {
-                stdio: ['inherit', 'inherit', 'inherit', 'ipc']
+            // Spawn Electron's own bundled runtime as a plain Node process, not a system
+            // "node" binary: a packaged install has no guarantee node is on PATH at all, and
+            // even when it is, an unrelated system node can't read *.js out of this app's
+            // asar archive — only Electron's own asar-aware runtime can. ELECTRON_RUN_AS_NODE
+            // makes process.execPath behave like `node`, skipping Chromium/GUI init.
+            translationWorker = spawnTranslationWorker(process.execPath, [workerPath], {
+                stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
+                env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }
             });
 
             translationWorker.send({

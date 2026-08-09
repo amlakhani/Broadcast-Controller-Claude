@@ -256,12 +256,16 @@ export function applyAnimationIn(tl, container, currentAnimation, isElasticPanel
             if (panelMode) {
                 gsap.set([elName, elTitle, elSubtitle2], { opacity: 1 });
 
-                // Ultra-smooth fluid reveal using clip-path (High Performance)
-                gsap.set(elPanel, { clipPath: "inset(0 100% 0 0)", opacity: 0 });
+                // Ultra-smooth fluid reveal using clip-path (High Performance).
+                // The panel itself stays at opacity 1 throughout — clip-path alone does the
+                // reveal. Cross-fading opacity here too used to mean the panel briefly sat
+                // at very low alpha mid-tween, which (with no real video behind it, just the
+                // flat chroma-key background) blended straight through to raw green.
+                gsap.set(elPanel, { clipPath: "inset(0 100% 0 0)", opacity: 1 });
                 gsap.set([elName, elTitle, elSubtitle2], { y: 30, opacity: 0 });
                 if (isVisible(elLogo)) gsap.set(elLogo, { scale: 0.9, opacity: 0 });
 
-                tl.to(elPanel, { duration: d(1.0), clipPath: "inset(0 0% 0 0)", opacity: 1, ease: "expo.out" });
+                tl.to(elPanel, { duration: d(1.0), clipPath: "inset(0 0% 0 0)", ease: "expo.out" });
                 if (isVisible(elLogo)) tl.to(elLogo, { duration: d(0.8), scale: 1, opacity: 1, ease: "power2.out" }, "-=0.8");
                 tl.to(elName, { duration: d(0.9), y: 0, opacity: 1, ease: "expo.out" }, "-=0.9")
                   .to(elTitle, { duration: d(0.9), y: 0, opacity: 1, ease: "expo.out" }, "-=0.8");
@@ -405,7 +409,10 @@ export function applyAnimationOut(tl, container, currentAnimation, isElasticPane
             tl.to([elName, elTitle, elSubtitle2], { duration: d(0.6), y: 30, opacity: 0, ease: "expo.in" });
             if (isVisible(elLogo)) tl.to(elLogo, { duration: d(0.5), scale: 0.9, opacity: 0, ease: "expo.in" }, '<');
             tl.to(ltSeparator, { duration: d(0.5), opacity: 0, scaleX: 0, ease: "expo.in" }, "-=0.4")
-              .to(elPanel, { duration: d(0.8), clipPath: "inset(0 100% 0 0)", opacity: 0, ease: "expo.in" }, "-=0.3");
+              // Panel opacity stays at 1 here too — see the matching note in applyAnimationIn.
+              // clip-path closing back to 0 width is what hides it; fading alpha on top of
+              // that just re-exposed the raw chroma-key green mid-close.
+              .to(elPanel, { duration: d(0.8), clipPath: "inset(0 100% 0 0)", ease: "expo.in" }, "-=0.3");
             break;
     }
 }

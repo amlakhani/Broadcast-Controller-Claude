@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
-import { ArrowDown, ArrowUp, Clapperboard, CopyPlus, Layers, Play, Save, Sparkles, Trash2 } from 'lucide-react';
+import { ArrowDown, ArrowUp, Clapperboard, Layers, LayoutTemplate, Play, Save, Sparkles, Trash2, Type } from 'lucide-react';
 import { GUJ_FONT_OPTIONS } from '../utils/lyricsFonts';
 import {
     ANIMATION_PRESETS,
@@ -19,7 +19,8 @@ import {
     normalizeDraft,
     templateToDraftPatch
 } from './lowerThirdsModel';
-import { deferUntilIdle, readLocalStorageArraySafe, useDebouncedLocalStorageEffect } from '../utils/performance';
+import { deferUntilIdle, readLocalStorageArraySafe, useDebouncedLocalStorageEffect, useThrottledCallback } from '../utils/performance';
+import Section from './Section';
 
 const cloneDefaultDraft = () => normalizeDraft(DEFAULT_LOWER_THIRD_DRAFT);
 
@@ -115,6 +116,17 @@ const FieldLabel = ({ children }) => (
     <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wider">{children}</label>
 );
 
+const SliderField = ({ label, value, onChange, min = 0, max = 100, step = 1, suffix = '%' }) => (
+    <div className="space-y-1">
+        <div className="flex items-center justify-between">
+            <FieldLabel>{label}</FieldLabel>
+            <span className="text-[10px] font-bold text-amber-500">{value}{suffix}</span>
+        </div>
+        <input type="range" min={min} max={max} step={step} value={value} onChange={e => onChange(Number(e.target.value))}
+            className="w-full h-1.5 bg-slate-200 dark:bg-slate-700 rounded-lg appearance-none cursor-pointer accent-amber-500" />
+    </div>
+);
+
 const inputClass = 'control-field px-3 py-2 text-sm';
 const compactInputClass = 'control-field px-2 py-1.5 text-xs';
 
@@ -163,15 +175,20 @@ export default function LowerThirdsPanel({ socket }) {
         return () => clearTimeout(crossSyncTimerRef.current);
     }, [content.name, updateSection]);
 
-    useEffect(() => {
-        if (!socket) return;
-        socket.emit('update_lt_style', currentStyle);
-    }, [socket, currentStyle]);
+    // Throttled so dragging a slider or typing a name doesn't emit per tick. Trailing
+    // edge always fires, so the graphics window still lands on the exact final value.
+    const emitStyle = useThrottledCallback((style) => socket?.emit('update_lt_style', style), 150);
+    const emitDesign = useThrottledCallback((design) => socket?.emit('update_lt_design', design), 150);
 
     useEffect(() => {
         if (!socket) return;
-        socket.emit('update_lt_design', currentDesign);
-    }, [socket, currentDesign]);
+        emitStyle(currentStyle);
+    }, [socket, emitStyle, currentStyle]);
+
+    useEffect(() => {
+        if (!socket) return;
+        emitDesign(currentDesign);
+    }, [socket, emitDesign, currentDesign]);
 
     // Reflect real on-air state regardless of what triggered it (this panel, another
     // remote, or the main app window) — matches the pattern used by MediaPanel/PresentationPanel.
@@ -351,16 +368,10 @@ export default function LowerThirdsPanel({ socket }) {
                 title="Cue Queue"
                 detail="Run order stores content and design together."
                 action={(
-                    <div className="flex items-center gap-2">
-                        <button onClick={addCurrentToCueQueue} className="control-button-muted text-[10px] px-2 py-1 font-bold flex items-center gap-1 text-slate-700 dark:text-slate-200">
-                            <CopyPlus className="w-3 h-3" />
-                            ADD CURRENT
-                        </button>
-                        <button onClick={showNextCue} disabled={cueQueue.length === 0 || activeCueIndex >= cueQueue.length - 1} className="text-[10px] px-3 py-1 rounded-lg font-bold transition flex items-center gap-1 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:hover:bg-emerald-600 text-white">
-                            <Play className="w-3 h-3" />
-                            NEXT CUE
-                        </button>
-                    </div>
+                    <button onClick={showNextCue} disabled={cueQueue.length === 0 || activeCueIndex >= cueQueue.length - 1} className="text-[10px] px-3 py-1 rounded-lg font-bold transition flex items-center gap-1 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:hover:bg-emerald-600 text-white">
+                        <Play className="w-3 h-3" />
+                        NEXT CUE
+                    </button>
                 )}
             />
             <div className="flex gap-2 overflow-x-auto pb-1 2xl:grid 2xl:grid-cols-2 2xl:overflow-x-visible 2xl:overflow-y-auto 2xl:max-h-[390px]">
@@ -401,7 +412,7 @@ export default function LowerThirdsPanel({ socket }) {
                     <SectionHeader
                         icon={Play}
                         title="Live Builder"
-                        detail="Build the next lower third here. Design presets below keep layout, motion, and content untouched."
+                        detail="Build the next lower third here. Content stays when you apply a design preset."
                         action={(
                             <div className="flex items-center gap-2">
                                 {liveLowerThird && (
@@ -465,17 +476,33 @@ export default function LowerThirdsPanel({ socket }) {
                                     <FieldLabel>Auto Clear</FieldLabel>
                                     <input type="number" value={behavior.autoClear} onChange={e => updateSection('behavior', { autoClear: e.target.value })} placeholder="Manual" min="0" className={inputClass} />
                                 </div>
-                                <div className="space-y-1.5 md:col-span-2">
-                                    <FieldLabel>Logo</FieldLabel>
-                                    <div className="flex items-center gap-2">
-                                        <input type="file" accept="image/*" onChange={handleFile}
-                                            className="min-w-0 flex-1 text-xs text-slate-600 dark:text-slate-400 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-bold file:bg-blue-600 file:text-white hover:file:bg-blue-700" />
-                                        {content.logo && (
-                                            <button onClick={() => updateSection('content', { logo: null })} className="px-3 py-2 rounded-lg text-[10px] font-bold bg-red-600/10 text-red-600 border border-red-600/20">
-                                                REMOVE
-                                            </button>
-                                        )}
-                                    </div>
+                                {/* Logo placement and size sit with the upload below — they used to
+                                    be buried in two different design cards. */}
+                                <div className="space-y-1.5">
+                                    <FieldLabel>Logo Placement</FieldLabel>
+                                    <select value={layout.logoPlacement} onChange={e => updateSection('layout', { logoPlacement: e.target.value })} className={inputClass}>
+                                        <option value="left">Left</option>
+                                        <option value="right">Right</option>
+                                        <option value="badge">Badge</option>
+                                        <option value="hidden">Hidden</option>
+                                    </select>
+                                </div>
+                                <div className="space-y-1.5">
+                                    <FieldLabel>Logo Size</FieldLabel>
+                                    <input type="number" min="60" max="260" value={layout.logoSize} onChange={e => updateSection('layout', { logoSize: Number(e.target.value) })} className={inputClass} />
+                                </div>
+                            </div>
+
+                            <div className="space-y-1.5">
+                                <FieldLabel>Logo Image</FieldLabel>
+                                <div className="flex items-center gap-2">
+                                    <input type="file" accept="image/*" onChange={handleFile}
+                                        className="min-w-0 flex-1 text-xs text-slate-600 dark:text-slate-400 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-bold file:bg-blue-600 file:text-white hover:file:bg-blue-700" />
+                                    {content.logo && (
+                                        <button onClick={() => updateSection('content', { logo: null })} className="px-3 py-2 rounded-lg text-[10px] font-bold bg-red-600/10 text-red-600 border border-red-600/20">
+                                            REMOVE
+                                        </button>
+                                    )}
                                 </div>
                             </div>
 
@@ -534,36 +561,32 @@ export default function LowerThirdsPanel({ socket }) {
                 {cueQueuePanel}
             </div>
 
-            <div className="surface rounded-lg p-3 space-y-3">
-                <SectionHeader
-                    icon={Sparkles}
-                    title="Design Presets"
-                    detail="Presets change visual styling only. Layout, motion, and content stay as set."
-                    action={(
-                        <div className="flex flex-wrap items-center gap-2">
-                            <input
-                                type="text"
-                                value={templateNameInput}
-                                onChange={e => setTemplateNameInput(e.target.value)}
-                                onKeyDown={e => {
-                                    if (e.key === 'Enter') handleSaveTemplate();
-                                }}
-                                placeholder={content.name.trim() ? `${content.name.trim()} Design` : `Custom Design ${customTemplates.length + 1}`}
-                                className="control-field w-40 px-2 py-1 text-[10px]"
-                            />
-                            <button onClick={handleSaveTemplate}
-                                className={`text-[10px] px-2 py-1 rounded-lg font-bold transition flex items-center gap-1 border ${
-                                    templateSaveState === 'saved'
-                                        ? 'bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-600 dark:text-emerald-300 border-emerald-500/30'
-                                        : 'bg-amber-500/10 hover:bg-amber-500/20 text-amber-600 dark:text-amber-300 border-amber-500/30'
-                                }`}>
-                                <Save className="w-3 h-3" />
-                                {templateSaveState === 'saved' ? 'SAVED' : 'SAVE DESIGN'}
-                            </button>
-                        </div>
-                    )}
-                />
-                <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-7 gap-2">
+            <Section icon={Sparkles} title="Design Presets" storageKey="bc-lt-section-presets">
+                <p className="text-[11px] text-slate-500 dark:text-slate-500">
+                    Presets apply the full design — shape, layout, colours and motion. Content, language and auto clear stay as set.
+                </p>
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <input
+                        type="text"
+                        value={templateNameInput}
+                        onChange={e => setTemplateNameInput(e.target.value)}
+                        onKeyDown={e => {
+                            if (e.key === 'Enter') handleSaveTemplate();
+                        }}
+                        placeholder={content.name.trim() ? `${content.name.trim()} Design` : `Custom Design ${customTemplates.length + 1}`}
+                        className="control-field w-48 px-2 py-1 text-[10px]"
+                    />
+                    <button onClick={handleSaveTemplate}
+                        className={`text-[10px] px-2 py-1 rounded-lg font-bold transition flex items-center gap-1 border ${
+                            templateSaveState === 'saved'
+                                ? 'bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-600 dark:text-emerald-300 border-emerald-500/30'
+                                : 'bg-amber-500/10 hover:bg-amber-500/20 text-amber-600 dark:text-amber-300 border-amber-500/30'
+                        }`}>
+                        <Save className="w-3 h-3" />
+                        {templateSaveState === 'saved' ? 'SAVED' : 'SAVE DESIGN'}
+                    </button>
+                </div>
+                <div className="mt-3 grid grid-cols-2 md:grid-cols-4 xl:grid-cols-7 gap-2">
                     {allTemplates.map(template => {
                         const isCustom = template.id?.startsWith('custom-');
                         const patch = templateToDraftPatch(template);
@@ -604,16 +627,16 @@ export default function LowerThirdsPanel({ socket }) {
                         );
                     })}
                 </div>
-            </div>
+            </Section>
 
-            <div className="grid grid-cols-1 xl:grid-cols-[1fr_1fr_0.8fr] gap-3">
-                <div className="surface rounded-lg p-3 space-y-3">
-                    <SectionHeader
-                        icon={Sparkles}
-                        title="Shape And Layout"
-                        action={<button onClick={() => dispatch({ type: 'reset_design' })} className="text-[10px] font-bold text-slate-500 hover:text-slate-800 dark:hover:text-white uppercase tracking-widest transition">Reset</button>}
-                    />
-                    <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
+            <Section
+                icon={LayoutTemplate}
+                title="Shape & Position"
+                storageKey="bc-lt-section-layout"
+                action={<button onClick={() => dispatch({ type: 'reset_design' })} className="text-[10px] font-bold text-slate-500 hover:text-slate-800 dark:hover:text-white uppercase tracking-widest transition">Reset</button>}
+            >
+                <div className="space-y-3">
+                    <div className="grid grid-cols-2 md:grid-cols-5 xl:grid-cols-8 gap-2">
                         {SHAPE_PRESETS.map(shape => (
                             <button key={shape.id} onClick={() => updateSection('appearance', { shapeStyle: shape.id })}
                                 className={`px-2 py-1.5 rounded-lg text-[10px] font-bold border transition ${appearance.shapeStyle === shape.id ? 'bg-amber-600 text-white border-amber-600' : 'control-button-muted hover:text-slate-800 dark:hover:text-white'}`}>
@@ -621,7 +644,7 @@ export default function LowerThirdsPanel({ socket }) {
                             </button>
                         ))}
                     </div>
-                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                    <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
                         <div className="space-y-1">
                             <FieldLabel>Background</FieldLabel>
                             <select value={appearance.bgStyle} onChange={e => updateSection('appearance', { bgStyle: e.target.value })} className={compactInputClass}>
@@ -640,53 +663,18 @@ export default function LowerThirdsPanel({ socket }) {
                                 <option value="right">Right</option>
                             </select>
                         </div>
-                        <div className="space-y-1">
-                            <FieldLabel>Logo Placement</FieldLabel>
-                            <select value={layout.logoPlacement} onChange={e => updateSection('layout', { logoPlacement: e.target.value })} className={compactInputClass}>
-                                <option value="left">Left</option>
-                                <option value="right">Right</option>
-                                <option value="badge">Badge</option>
-                                <option value="hidden">Hidden</option>
-                            </select>
-                        </div>
-                    </div>
-                    <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
-                        {[
-                            ['Horizontal', layout.posX, value => updateSection('layout', { posX: value }), 0, 100, '%'],
-                            ['Vertical', layout.posY, value => updateSection('layout', { posY: value }), 0, 100, '%'],
-                            ['Opacity', appearance.panelOpacity, value => updateSection('appearance', { panelOpacity: value }), 0, 100, '%'],
-                            ['Shadow', appearance.shadowIntensity, value => updateSection('appearance', { shadowIntensity: value }), 0, 100, '%']
-                        ].map(([label, value, setter, min, max, suffix]) => (
-                            <div key={label} className="space-y-1">
-                                <div className="flex items-center justify-between">
-                                    <FieldLabel>{label}</FieldLabel>
-                                    <span className="text-[10px] font-bold text-amber-500">{value}{suffix}</span>
-                                </div>
-                                <input type="range" min={min} max={max} value={value} onChange={e => setter(Number(e.target.value))}
-                                    className="w-full h-1.5 bg-slate-200 dark:bg-slate-700 rounded-lg appearance-none cursor-pointer accent-amber-500" />
-                            </div>
-                        ))}
+                        <SliderField label="Horizontal" value={layout.posX} onChange={value => updateSection('layout', { posX: value })} />
+                        <SliderField label="Vertical" value={layout.posY} onChange={value => updateSection('layout', { posY: value })} />
                     </div>
                 </div>
+            </Section>
 
-                <div className="surface rounded-lg p-3 space-y-3">
-                    <SectionHeader icon={Layers} title="Look And Motion" />
-                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <Section icon={Layers} title="Style & Motion" storageKey="bc-lt-section-style">
+                <div className="space-y-3">
+                    <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-8 gap-3">
                         <div className="space-y-1">
                             <FieldLabel>Accent</FieldLabel>
                             <input type="color" value={appearance.accentColor} onChange={e => updateSection('appearance', { accentColor: e.target.value })} className="control-field h-8 px-1 py-1 cursor-pointer" />
-                        </div>
-                        <div className="space-y-1">
-                            <FieldLabel>Border Width</FieldLabel>
-                            <input type="number" min="0" max="12" value={appearance.borderWidth} onChange={e => updateSection('appearance', { borderWidth: Number(e.target.value) })} className={compactInputClass} />
-                        </div>
-                        <div className="space-y-1">
-                            <FieldLabel>Border Color</FieldLabel>
-                            <input type="color" value={appearance.borderColor} onChange={e => updateSection('appearance', { borderColor: e.target.value })} className="control-field h-8 px-1 py-1 cursor-pointer" />
-                        </div>
-                        <div className="space-y-1">
-                            <FieldLabel>Logo Size</FieldLabel>
-                            <input type="number" min="60" max="260" value={layout.logoSize} onChange={e => updateSection('layout', { logoSize: Number(e.target.value) })} className={compactInputClass} />
                         </div>
                         <div className="space-y-1">
                             <FieldLabel>Accent 2</FieldLabel>
@@ -700,15 +688,21 @@ export default function LowerThirdsPanel({ socket }) {
                             </button>
                         </div>
                         <div className="space-y-1">
+                            <FieldLabel>Border Width</FieldLabel>
+                            <input type="number" min="0" max="12" value={appearance.borderWidth} onChange={e => updateSection('appearance', { borderWidth: Number(e.target.value) })} className={compactInputClass} />
+                        </div>
+                        <div className="space-y-1">
+                            <FieldLabel>Border Color</FieldLabel>
+                            <input type="color" value={appearance.borderColor} onChange={e => updateSection('appearance', { borderColor: e.target.value })} className="control-field h-8 px-1 py-1 cursor-pointer" />
+                        </div>
+                        <div className="space-y-1">
                             <FieldLabel>Corner Radius</FieldLabel>
                             <input type="number" min="-1" max="120" value={appearance.cornerRadius}
                                 title="-1 keeps each shape's own radius"
                                 onChange={e => updateSection('appearance', { cornerRadius: Number(e.target.value) })} className={compactInputClass} />
                         </div>
-                        <div className="space-y-1">
-                            <FieldLabel>Text Glow</FieldLabel>
-                            <input type="number" min="0" max="100" value={typography.textGlow} onChange={e => updateSection('typography', { textGlow: Number(e.target.value) })} className={compactInputClass} />
-                        </div>
+                        <SliderField label="Opacity" value={appearance.panelOpacity} onChange={value => updateSection('appearance', { panelOpacity: value })} />
+                        <SliderField label="Shadow" value={appearance.shadowIntensity} onChange={value => updateSection('appearance', { shadowIntensity: value })} />
                     </div>
                     <div className="space-y-2">
                         <div className="flex items-center justify-between">
@@ -734,85 +728,95 @@ export default function LowerThirdsPanel({ socket }) {
                             className="w-full h-1.5 bg-slate-200 dark:bg-slate-700 rounded-lg appearance-none cursor-pointer accent-indigo-500" />
                     </div>
                 </div>
+            </Section>
 
-                <div className="surface rounded-lg p-3 space-y-3">
-                    <SectionHeader icon={Layers} title="Typography" />
-                    <div className="grid grid-cols-2 gap-3">
-                        <div className="space-y-1.5 col-span-2">
-                            <FieldLabel>Font Family</FieldLabel>
-                            <select value={typography.fontFamily} onChange={e => updateSection('typography', { fontFamily: e.target.value })} className={compactInputClass}>
-                                <option value="'Outfit', sans-serif">Outfit</option>
-                                <option value="'Inter', sans-serif">Inter</option>
-                                <option value="'Poppins', sans-serif">Poppins</option>
-                                <option value="'Montserrat', sans-serif">Montserrat</option>
-                                <option value="'Roboto', sans-serif">Roboto</option>
-                                <option value="'Playfair Display', serif">Playfair Display</option>
-                                <option value="'Lora', serif">Lora</option>
-                                <option value="'Bebas Neue', cursive">Bebas Neue</option>
-                                <option value="'Oswald', sans-serif">Oswald</option>
-                                <option value="'Open Sans', sans-serif">Open Sans</option>
-                            </select>
-                        </div>
-                        <div className="space-y-1.5 col-span-2">
-                            <FieldLabel>Gujarati Title Font</FieldLabel>
-                            <select value={typography.gujFontFamily} onChange={e => updateSection('typography', { gujFontFamily: e.target.value })} className={compactInputClass}>
-                                {GUJ_FONT_OPTIONS.map(font => (
-                                    <option key={font.value} value={font.value}>{font.label}</option>
-                                ))}
-                            </select>
-                        </div>
-                        <div className="space-y-1.5">
-                            <FieldLabel>Weight</FieldLabel>
-                            <select value={typography.fontWeight} onChange={e => updateSection('typography', { fontWeight: e.target.value })} className={compactInputClass}>
-                                <option value="300">Light</option>
-                                <option value="400">Regular</option>
-                                <option value="600">Semi-Bold</option>
-                                <option value="700">Bold</option>
-                                <option value="800">Extra-Bold</option>
-                            </select>
-                        </div>
-                        <div className="space-y-1.5">
-                            <FieldLabel>Color (all lines)</FieldLabel>
-                            <input type="color" value={typography.color} onChange={e => updateSection('typography', { color: e.target.value })} className="control-field h-8 px-1 py-1 cursor-pointer" />
-                        </div>
-                        {/* Per-line overrides. Blank inherits the colour above, which is what
-                            keeps templates saved before this existed looking identical. */}
-                        {[
-                            ['nameColor', 'Name'],
-                            ['titleColor', 'Title'],
-                            ['subtitleColor', 'Subtitle']
-                        ].map(([key, label]) => (
-                            <div key={key} className="space-y-1.5">
-                                <FieldLabel>{label} Colour</FieldLabel>
-                                <div className="flex gap-1">
-                                    <input type="color" value={typography[key] || typography.color}
-                                        onChange={e => updateSection('typography', { [key]: e.target.value })}
-                                        className="control-field h-8 flex-1 px-1 py-1 cursor-pointer" />
-                                    <button onClick={() => updateSection('typography', { [key]: '' })}
-                                        title="Inherit the colour above"
-                                        className={`rounded px-2 text-[9px] font-bold transition ${typography[key] ? 'control-button-muted' : 'bg-indigo-600 text-white'}`}>
-                                        AUTO
-                                    </button>
-                                </div>
+            <Section icon={Type} title="Typography" storageKey="bc-lt-section-typography">
+                <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-6 gap-3">
+                    <div className="space-y-1.5 col-span-2">
+                        <FieldLabel>Font Family</FieldLabel>
+                        <select value={typography.fontFamily} onChange={e => updateSection('typography', { fontFamily: e.target.value })} className={compactInputClass}>
+                            <option value="'Outfit', sans-serif">Outfit</option>
+                            <option value="'Inter', sans-serif">Inter</option>
+                            <option value="'Poppins', sans-serif">Poppins</option>
+                            <option value="'Montserrat', sans-serif">Montserrat</option>
+                            <option value="'Roboto', sans-serif">Roboto</option>
+                            <option value="'Playfair Display', serif">Playfair Display</option>
+                            <option value="'Lora', serif">Lora</option>
+                            <option value="'Bebas Neue', cursive">Bebas Neue</option>
+                            <option value="'Oswald', sans-serif">Oswald</option>
+                            <option value="'Open Sans', sans-serif">Open Sans</option>
+                        </select>
+                    </div>
+                    <div className="space-y-1.5 col-span-2">
+                        <FieldLabel>Gujarati Title Font</FieldLabel>
+                        <select value={typography.gujFontFamily} onChange={e => updateSection('typography', { gujFontFamily: e.target.value })} className={compactInputClass}>
+                            {GUJ_FONT_OPTIONS.map(font => (
+                                <option key={font.value} value={font.value}>{font.label}</option>
+                            ))}
+                        </select>
+                    </div>
+                    <div className="space-y-1.5">
+                        <FieldLabel>Weight</FieldLabel>
+                        <select value={typography.fontWeight} onChange={e => updateSection('typography', { fontWeight: e.target.value })} className={compactInputClass}>
+                            <option value="300">Light</option>
+                            <option value="400">Regular</option>
+                            <option value="600">Semi-Bold</option>
+                            <option value="700">Bold</option>
+                            <option value="800">Extra-Bold</option>
+                        </select>
+                    </div>
+                    <div className="space-y-1.5">
+                        <FieldLabel>Color (all lines)</FieldLabel>
+                        <input type="color" value={typography.color} onChange={e => updateSection('typography', { color: e.target.value })} className="control-field h-8 px-1 py-1 cursor-pointer" />
+                    </div>
+                    {/* Per-line overrides. Blank inherits the colour above, which is what
+                        keeps templates saved before this existed looking identical. */}
+                    {[
+                        ['nameColor', 'Name'],
+                        ['titleColor', 'Title'],
+                        ['subtitleColor', 'Subtitle']
+                    ].map(([key, label]) => (
+                        <div key={key} className="space-y-1.5">
+                            <FieldLabel>{label} Colour</FieldLabel>
+                            <div className="flex gap-1">
+                                <input type="color" value={typography[key] || typography.color}
+                                    onChange={e => updateSection('typography', { [key]: e.target.value })}
+                                    className="control-field h-8 flex-1 px-1 py-1 cursor-pointer" />
+                                <button onClick={() => updateSection('typography', { [key]: '' })}
+                                    title="Inherit the colour above"
+                                    className={`rounded px-2 text-[9px] font-bold transition ${typography[key] ? 'control-button-muted' : 'bg-indigo-600 text-white'}`}>
+                                    AUTO
+                                </button>
                             </div>
-                        ))}
-                        <div className="space-y-1.5">
-                            <FieldLabel>Size</FieldLabel>
-                            <input type="number" value={typography.fontSizeFactor} onChange={e => updateSection('typography', { fontSizeFactor: e.target.value })} className={compactInputClass} />
                         </div>
-                        <div className="space-y-1.5">
-                            <FieldLabel>Spacing</FieldLabel>
-                            <input type="number" value={typography.letterSpacing} onChange={e => updateSection('typography', { letterSpacing: e.target.value })} step="0.5" className={compactInputClass} />
-                        </div>
-                        <div className="col-span-2 flex gap-1">
-                            <button onClick={() => updateSection('typography', { bold: !typography.bold })} className={`flex-1 rounded p-1.5 text-xs font-bold transition ${typography.bold ? 'bg-indigo-600 text-white' : 'control-button-muted text-slate-600 dark:text-slate-400'}`}>B</button>
-                            <button onClick={() => updateSection('typography', { italic: !typography.italic })} className={`flex-1 rounded p-1.5 text-xs italic transition ${typography.italic ? 'bg-indigo-600 text-white' : 'control-button-muted text-slate-600 dark:text-slate-400'}`}>I</button>
-                            <button onClick={() => updateSection('typography', { underline: !typography.underline })} className={`flex-1 rounded p-1.5 text-xs underline transition ${typography.underline ? 'bg-indigo-600 text-white' : 'control-button-muted text-slate-600 dark:text-slate-400'}`}>U</button>
-                        </div>
+                    ))}
+                    <div className="space-y-1.5">
+                        <FieldLabel>English Size %</FieldLabel>
+                        <input type="number" min="10" max="400" value={typography.fontSizeFactor}
+                            title="Scales the English name and subtitle"
+                            onChange={e => updateSection('typography', { fontSizeFactor: e.target.value })} className={compactInputClass} />
+                    </div>
+                    <div className="space-y-1.5">
+                        <FieldLabel>Gujarati Size %</FieldLabel>
+                        <input type="number" min="10" max="400" value={typography.gujFontSizeFactor}
+                            title="Scales the Gujarati title independently — raise it if the Gujarati looks small next to the English"
+                            onChange={e => updateSection('typography', { gujFontSizeFactor: e.target.value })} className={compactInputClass} />
+                    </div>
+                    <div className="space-y-1.5">
+                        <FieldLabel>Spacing</FieldLabel>
+                        <input type="number" value={typography.letterSpacing} onChange={e => updateSection('typography', { letterSpacing: e.target.value })} step="0.5" className={compactInputClass} />
+                    </div>
+                    <div className="space-y-1.5">
+                        <FieldLabel>Text Glow</FieldLabel>
+                        <input type="number" min="0" max="100" value={typography.textGlow} onChange={e => updateSection('typography', { textGlow: Number(e.target.value) })} className={compactInputClass} />
+                    </div>
+                    <div className="col-span-2 flex gap-1">
+                        <button onClick={() => updateSection('typography', { bold: !typography.bold })} className={`flex-1 rounded p-1.5 text-xs font-bold transition ${typography.bold ? 'bg-indigo-600 text-white' : 'control-button-muted text-slate-600 dark:text-slate-400'}`}>B</button>
+                        <button onClick={() => updateSection('typography', { italic: !typography.italic })} className={`flex-1 rounded p-1.5 text-xs italic transition ${typography.italic ? 'bg-indigo-600 text-white' : 'control-button-muted text-slate-600 dark:text-slate-400'}`}>I</button>
+                        <button onClick={() => updateSection('typography', { underline: !typography.underline })} className={`flex-1 rounded p-1.5 text-xs underline transition ${typography.underline ? 'bg-indigo-600 text-white' : 'control-button-muted text-slate-600 dark:text-slate-400'}`}>U</button>
                     </div>
                 </div>
-            </div>
-
+            </Section>
         </div>
     );
 }
