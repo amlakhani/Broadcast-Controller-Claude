@@ -43,13 +43,21 @@ jobs:
       - name: Install frontend dependencies
         run: npm --prefix frontend ci
 
+      # Must run before the tests: a handful (the /remote, /slides, /pad route checks) serve
+      # the real built HTML out of public_react/, which doesn't exist on a clean checkout.
+      # Without this they 500 rather than exercising the thing they're actually testing.
+      - name: Build frontend
+        run: npm run build:frontend
+
       # Gate packaging on the suite. Without this a tagged push could publish a Release built
       # from a broken commit, since nothing else on this path runs the tests.
       - name: Run tests
         run: npm test
 
-      # build:mac runs prebuild:mac (frontend build + NDI check/rebuild/verify),
-      # then packages arm64 and x64 DMGs into "application packages/".
+      # build:mac runs prebuild:mac (frontend build + NDI check/rebuild/verify) — the frontend
+      # rebuild here is redundant with the step above but harmless, and keeping build:mac's own
+      # script chain intact is simpler than trying to split it.
+      # Then packages arm64 and x64 DMGs into "application packages/".
       # Signing is disabled: no Apple Developer cert in CI, so the DMGs are
       # unsigned (first launch needs right-click -> Open).
       - name: Build macOS DMGs

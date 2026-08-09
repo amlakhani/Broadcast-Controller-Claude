@@ -49,8 +49,11 @@ jobs:
       - name: Lint frontend
         run: npm --prefix frontend run lint
 
-      - name: Run tests
-        run: npm test
-
+      # Must run before the tests: a handful (the /remote, /slides, /pad route checks) serve
+      # the real built HTML out of public_react/, which doesn't exist on a clean checkout.
+      # Without this they 500 rather than exercising the thing they're actually testing.
       - name: Build frontend
         run: npm run build:frontend
+
+      - name: Run tests
+        run: npm test
