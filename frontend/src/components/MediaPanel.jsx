@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { Video, Play, Film, Trash2, GripVertical, Image as ImageIcon, Layout, Monitor, Trash, Grid, List, Globe, Folder, Upload, Type, X, Clock } from 'lucide-react';
 import { authUrl } from '../auth';
 import { ensureMediaIds, registerLocalMedia } from '../utils/localMedia';
+import { isCanvaUrl, normalizeCanvaUrl, resolveDeckUrl } from '../utils/presentation';
 import { deferUntilIdle, readLocalStorageArraySafe, useDebouncedLocalStorageEffect, useThrottledCallback } from '../utils/performance';
 import { scheduleTick, localDateKey, formatCountdown, formatClock12, formatDays } from '../utils/schedule';
 
@@ -13,6 +14,12 @@ const SCHEDULED_PLAYS_KEY = 'bc_scheduled_plays_v1';
 const VIEW_MODE_KEY = 'bc_media_view_mode';
 const MEDIA_FOLDERS_KEY = 'bc_media_folders_v1';
 const ACTIVE_FOLDER_KEY = 'bc_media_active_folder_v1';
+// The photo library keeps its own folders rather than sharing the video ones: the
+// two libraries are filtered independently on screen, so a shared folder set would
+// mean picking a folder for photos silently re-filters the videos above it.
+const PHOTO_VIEW_MODE_KEY = 'bc_photo_view_mode';
+const PHOTO_FOLDERS_KEY = 'bc_photo_folders_v1';
+const ACTIVE_PHOTO_FOLDER_KEY = 'bc_photo_active_folder_v1';
 const DEFAULT_FOLDER_ID = 'default';
 const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'webm', 'mkv']);
 const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp']);
@@ -91,6 +98,14 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
         return localStorage.getItem(ACTIVE_FOLDER_KEY) || 'all';
     });
     const [newFolderName, setNewFolderName] = useState('');
+    const [photoViewMode, setPhotoViewMode] = useState(() => {
+        return localStorage.getItem(PHOTO_VIEW_MODE_KEY) || 'grid';
+    });
+    const [photoFolders, setPhotoFolders] = useState(DEFAULT_FOLDERS);
+    const [activePhotoFolderId, setActivePhotoFolderId] = useState(() => {
+        return localStorage.getItem(ACTIVE_PHOTO_FOLDER_KEY) || 'all';
+    });
+    const [newPhotoFolderName, setNewPhotoFolderName] = useState('');
     const [isDropActive, setIsDropActive] = useState(false);
     const [isImportingDrop, setIsImportingDrop] = useState(false);
     const seekTrackRef = useRef(null);
@@ -109,6 +124,7 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
         setPlaylist(savedPlaylist);
         setPhotoPlaylist(savedPhotos);
         setMediaFolders(readLocalStorageArraySafe(MEDIA_FOLDERS_KEY, DEFAULT_FOLDERS));
+        setPhotoFolders(readLocalStorageArraySafe(PHOTO_FOLDERS_KEY, DEFAULT_FOLDERS));
         setScheduledPlays(readLocalStorageArraySafe(SCHEDULED_PLAYS_KEY));
 
         ensureMediaIds(savedPlaylist)
@@ -153,15 +169,29 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
     }, [videoViewMode]);
 
     useDebouncedLocalStorageEffect(MEDIA_FOLDERS_KEY, mediaFolders);
+    useDebouncedLocalStorageEffect(PHOTO_FOLDERS_KEY, photoFolders);
 
     useEffect(() => {
         localStorage.setItem(ACTIVE_FOLDER_KEY, activeFolderId);
     }, [activeFolderId]);
 
+    useEffect(() => {
+        localStorage.setItem(PHOTO_VIEW_MODE_KEY, photoViewMode);
+    }, [photoViewMode]);
+
+    useEffect(() => {
+        localStorage.setItem(ACTIVE_PHOTO_FOLDER_KEY, activePhotoFolderId);
+    }, [activePhotoFolderId]);
+
     const activeFolderExists = activeFolderId === 'all' || mediaFolders.some(folder => folder.id === activeFolderId);
     useEffect(() => {
         if (!activeFolderExists) setActiveFolderId('all');
     }, [activeFolderExists]);
+
+    const activePhotoFolderExists = activePhotoFolderId === 'all' || photoFolders.some(folder => folder.id === activePhotoFolderId);
+    useEffect(() => {
+        if (!activePhotoFolderExists) setActivePhotoFolderId('all');
+    }, [activePhotoFolderExists]);
 
     // Socket events for progress
     useEffect(() => {
@@ -278,6 +308,14 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
         .map((item, index) => ({ item, index }))
         .filter(({ item }) => activeFolderId === 'all' || (item.folderId || DEFAULT_FOLDER_ID) === activeFolderId);
 
+    // Carries the real playlist index alongside each visible row, so removing,
+    // reordering, playing and re-foldering all still address the right item while a
+    // folder filter is on. Items saved before folders existed have no folderId and
+    // fall into Unsorted.
+    const visiblePhotoEntries = photoPlaylist
+        .map((item, index) => ({ item, index }))
+        .filter(({ item }) => activePhotoFolderId === 'all' || (item.folderId || DEFAULT_FOLDER_ID) === activePhotoFolderId);
+
     const createVideoThumbnail = (video) => {
         const canvas = document.createElement('canvas');
         const sourceWidth = video.videoWidth || 320;
@@ -345,6 +383,19 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
         setMediaFolders(prev => [...prev, { id, name }]);
         setActiveFolderId(id);
         setNewFolderName('');
+    };
+
+    const addPhotoFolder = () => {
+        const name = newPhotoFolderName.trim();
+        if (!name) return;
+        const id = `photo-folder-${Date.now()}`;
+        setPhotoFolders(prev => [...prev, { id, name }]);
+        setActivePhotoFolderId(id);
+        setNewPhotoFolderName('');
+    };
+
+    const updatePhotoItem = (index, patch) => {
+        setPhotoPlaylist(prev => prev.map((item, idx) => idx === index ? { ...item, ...patch } : item));
     };
 
     const handleAddYoutubePlaylist = async () => {
@@ -636,7 +687,7 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
                 videoItems.push(await createLocalVideoItem(filePath, folderId));
             } else if (isImagePath(filePath)) {
                 const registered = await registerLocalMedia(filePath, 'photo');
-                photoItems.push({ type: 'photo', path: registered.path, mediaId: registered.mediaId, name: registered.name || getFileName(filePath) });
+                photoItems.push({ type: 'photo', path: registered.path, mediaId: registered.mediaId, name: registered.name || getFileName(filePath), folderId: getFolderIdForNewItem(activePhotoFolderId) });
             } else {
                 skippedFiles.push(file.name || getFileName(filePath));
             }
@@ -671,12 +722,13 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
     const handleAddPhoto = async () => {
         if (!selectedPhotoPath || selectedPhotoPath.length === 0) return;
         
+        const folderId = getFolderIdForNewItem(activePhotoFolderId);
         const newItems = Array.isArray(selectedPhotoPath)
             ? await Promise.all(selectedPhotoPath.map(async p => {
                 const registered = await registerLocalMedia(p, 'photo');
-                return { type: 'photo', path: registered.path, mediaId: registered.mediaId, name: registered.name || p.split(/[/\\]/).pop() };
+                return { type: 'photo', path: registered.path, mediaId: registered.mediaId, name: registered.name || p.split(/[/\\]/).pop(), folderId };
             }))
-            : [await registerLocalMedia(selectedPhotoPath, 'photo').then(registered => ({ type: 'photo', path: registered.path, mediaId: registered.mediaId, name: registered.name || photoFileName }))];
+            : [await registerLocalMedia(selectedPhotoPath, 'photo').then(registered => ({ type: 'photo', path: registered.path, mediaId: registered.mediaId, name: registered.name || photoFileName, folderId }))];
         
         const newPlaylist = [...photoPlaylist, ...newItems];
         setPhotoPlaylist(newPlaylist);
@@ -684,7 +736,7 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
         setPhotoFileName('No photos selected');
     };
 
-    const handleAddCanva = () => {
+    const handleAddCanva = async () => {
         if (!canvaUrl) return;
         let url = canvaUrl.trim();
 
@@ -698,23 +750,18 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
             url = 'https://' + url;
         }
 
-        // Normalize Canva URL to embed format
-        if (url.includes('canva.com')) {
-            try {
-                const urlObj = new URL(url);
-                let path = urlObj.pathname;
-                path = path.replace(/\/$/, '');
-                if (!path.endsWith('/view') && !path.endsWith('/watch')) {
-                    path = path.replace(/\/edit$/, '');
-                    if (!path.endsWith('/view')) path += '/view';
-                }
-                url = `https://www.canva.com${path}?embed`;
-            } catch (e) {
-                console.error("Canva normalization error", e);
-            }
+        // Same handling as the Slides tab: expand a canva.link short link, then fold
+        // whichever share form was pasted into the one embeddable viewer URL. This
+        // used to be a private copy of the old normalizer here, which meant a short
+        // link saved into this library was silently turned into a dead URL.
+        const resolved = await resolveDeckUrl(url);
+        if (resolved.error) {
+            alert(resolved.error);
+            return;
         }
+        url = normalizeCanvaUrl(resolved.url);
 
-        const newItem = { type: 'canva', path: url, name: canvaName || 'Canva Presentation' };
+        const newItem = { type: 'canva', path: url, name: canvaName || 'Canva Presentation', folderId: getFolderIdForNewItem(activePhotoFolderId) };
         const newPlaylist = [...photoPlaylist, newItem];
         setPhotoPlaylist(newPlaylist);
         setCanvaUrl('');
@@ -746,18 +793,11 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
         setCurrentPhotoIdx(index);
         let item = { ...photoPlaylist[index] };
         
-        // Self-healing for old/incorrect Canva links
-        if (item.type === 'canva' && item.path.includes('canva.com') && !item.path.includes('?embed')) {
-            try {
-                const urlObj = new URL(item.path);
-                let path = urlObj.pathname;
-                path = path.replace(/\/$/, '');
-                if (!path.endsWith('/view') && !path.endsWith('/watch')) {
-                    path = path.replace(/\/edit$/, '');
-                    if (!path.endsWith('/view')) path += '/view';
-                }
-                item.path = `https://www.canva.com${path}?embed`;
-            } catch (e) {}
+        // Self-healing for links saved before normalization existed. A plain share URL
+        // answers with X-Frame-Options: deny, so without the ?embed form the output
+        // window shows nothing at all.
+        if (item.type === 'canva' && isCanvaUrl(item.path) && !item.path.includes('?embed')) {
+            item.path = normalizeCanvaUrl(item.path);
         }
 
         socket?.emit('photo_play', { ...item, ts: Date.now() });
@@ -1265,6 +1305,10 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
                             <Trash className="w-3 h-3" />
                             Clear
                         </button>
+                        <div className="surface-muted flex items-center rounded-lg p-0.5">
+                            <button onClick={() => setPhotoViewMode('grid')} className={`rounded-md p-1 transition ${photoViewMode === 'grid' ? 'bg-emerald-600 text-white' : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}`} title="Grid View"><Grid className="w-3.5 h-3.5" /></button>
+                            <button onClick={() => setPhotoViewMode('list')} className={`rounded-md p-1 transition ${photoViewMode === 'list' ? 'bg-emerald-600 text-white' : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}`} title="List View"><List className="w-3.5 h-3.5" /></button>
+                        </div>
                         <button onClick={() => setPhotoLoop(!photoLoop)} className={`rounded px-2 py-1 text-[10px] font-bold transition ${photoLoop ? 'bg-emerald-600 text-white' : 'control-button-muted text-slate-500'}`}>
                             LOOP: {photoLoop ? 'ON' : 'OFF'}
                         </button>
@@ -1274,53 +1318,98 @@ export default function MediaPanel({ socket, showParticleOverlayControls = false
                     </div>
                 </div>
 
-                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3 max-h-[240px] overflow-y-auto pr-2 custom-scrollbar">
-                    {photoPlaylist.length === 0 ? (
-                        <div className="text-xs text-slate-500 italic col-span-full text-center py-6">No photos or Canva slides saved yet.</div>
+                <div className="space-y-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                        <button onClick={() => setActivePhotoFolderId('all')} className={`rounded-lg border px-2.5 py-1 text-[10px] font-bold transition ${activePhotoFolderId === 'all' ? 'border-emerald-600 bg-emerald-600 text-white' : 'control-button-muted text-slate-500'}`}>
+                            All
+                        </button>
+                        {photoFolders.map(folder => (
+                            <button key={folder.id} onClick={() => setActivePhotoFolderId(folder.id)} className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 text-[10px] font-bold transition ${activePhotoFolderId === folder.id ? 'border-emerald-600 bg-emerald-600 text-white' : 'control-button-muted text-slate-500'}`}>
+                                <Folder className="w-3 h-3" />
+                                {folder.name}
+                            </button>
+                        ))}
+                    </div>
+                    <div className="flex items-center gap-2">
+                        <input type="text" value={newPhotoFolderName} onChange={e => setNewPhotoFolderName(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') addPhotoFolder(); }} placeholder="New folder..."
+                            className="control-field w-40 px-2 py-1 text-[10px]" />
+                        <button onClick={addPhotoFolder} className="control-button-muted px-2.5 py-1 text-[10px] font-bold">
+                            + Folder
+                        </button>
+                    </div>
+                </div>
+
+                <div className={photoViewMode === 'grid'
+                    ? "grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3 max-h-[240px] overflow-y-auto pr-2 custom-scrollbar"
+                    : "flex flex-col gap-2 max-h-[240px] overflow-y-auto pr-2 custom-scrollbar"}>
+                    {visiblePhotoEntries.length === 0 ? (
+                        <div className="text-xs text-slate-500 italic col-span-full text-center py-6">
+                            {photoPlaylist.length === 0 ? 'No photos or Canva slides saved yet.' : 'This folder is empty.'}
+                        </div>
                     ) : (
-                        photoPlaylist.map((item, idx) => (
-                            <div 
-                                key={idx} 
+                        visiblePhotoEntries.map(({ item, index: idx }, visibleIdx) => (
+                            <div
+                                key={`${item.type}-${item.mediaId || item.path}-${idx}`}
                                 draggable
                                 onDragStart={(e) => onPhotoDragStart(e, idx)}
                                 onDragOver={(e) => onPhotoDragOver(e, idx)}
                                 onDragEnd={onPhotoDragEnd}
                                 onClick={() => { setIsPhotoLive(true); playPhotoAtIndex(idx); }}
-                                className={`surface-muted group relative flex aspect-video cursor-grab flex-col overflow-hidden rounded-lg transition active:cursor-grabbing ${currentPhotoIdx === idx && isPhotoLive ? 'border-emerald-500 ring-2 ring-emerald-500/30' : 'hover:border-emerald-500/50'} ${draggedPhotoIdx === idx ? 'opacity-50 ring-2 ring-emerald-500/20' : ''}`}
+                                className={`surface-muted group relative flex cursor-grab overflow-hidden rounded-lg transition active:cursor-grabbing ${currentPhotoIdx === idx && isPhotoLive ? 'border-emerald-500 ring-2 ring-emerald-500/30' : 'hover:border-emerald-500/50'} ${draggedPhotoIdx === idx ? 'opacity-50 ring-2 ring-emerald-500/20' : ''} ${photoViewMode === 'grid' ? 'aspect-video flex-col' : 'h-16 shrink-0 flex-row items-center'}`}
                             >
                                 {/* Thumbnail */}
-                                {item.type === 'photo' ? (
-                                    <img 
-                                        src={item.mediaId ? authUrl('/local-image', { mediaId: item.mediaId }) : undefined}
-                                        alt={item.name}
-                                        className="w-full h-full object-cover"
-                                    />
+                                <div className={photoViewMode === 'grid' ? "w-full h-full relative" : "w-28 h-full relative flex-shrink-0 bg-black"}>
+                                    {item.type === 'photo' ? (
+                                        <img
+                                            src={item.mediaId ? authUrl('/local-image', { mediaId: item.mediaId }) : undefined}
+                                            alt={item.name}
+                                            className="w-full h-full object-cover"
+                                        />
+                                    ) : (
+                                        <div className="w-full h-full bg-purple-600/10 flex flex-col items-center justify-center p-2 text-center">
+                                            <Layout className="w-8 h-8 text-purple-500 mb-1" />
+                                            <span className="text-[8px] font-bold text-purple-400 uppercase tracking-tighter">Canva Slide</span>
+                                        </div>
+                                    )}
+
+                                    {/* Index Badge */}
+                                    <div className="absolute top-1 left-1 bg-black/60 backdrop-blur-md text-white text-[8px] font-mono px-1.5 py-0.5 rounded border border-white/20">
+                                        {visibleIdx + 1}
+                                    </div>
+                                </div>
+
+                                {/* Overlay Title (Grid) or Content (List) */}
+                                {photoViewMode === 'grid' ? (
+                                    <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 via-black/40 to-transparent p-2">
+                                        <p className="text-[9px] text-white font-medium truncate">{item.name}</p>
+                                    </div>
                                 ) : (
-                                    <div className="w-full h-full bg-purple-600/10 flex flex-col items-center justify-center p-2 text-center">
-                                        <Layout className="w-8 h-8 text-purple-500 mb-1" />
-                                        <span className="text-[8px] font-bold text-purple-400 uppercase tracking-tighter">Canva Slide</span>
+                                    <div className="flex-1 px-3 py-2 flex flex-col justify-center min-w-0 pr-20">
+                                        <p className="text-xs font-semibold text-slate-800 dark:text-slate-200 truncate" title={item.name}>{item.name}</p>
+                                        <p className="text-[9px] font-bold text-slate-500 uppercase tracking-wider mt-0.5">{item.type === 'canva' ? 'Canva' : 'Photo'}</p>
+                                        <select value={item.folderId || DEFAULT_FOLDER_ID} onClick={e => e.stopPropagation()} onChange={e => updatePhotoItem(idx, { folderId: e.target.value })}
+                                            className="control-field mt-1 w-32 rounded px-1 py-0.5 text-[9px]">
+                                            {photoFolders.map(folder => <option key={folder.id} value={folder.id}>{folder.name}</option>)}
+                                        </select>
                                     </div>
                                 )}
 
-                                {/* Overlay Title */}
-                                <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 via-black/40 to-transparent p-2">
-                                    <p className="text-[9px] text-white font-medium truncate">{item.name}</p>
-                                </div>
-
-                                {/* Index Badge */}
-                                <div className="absolute top-1 left-1 bg-black/60 backdrop-blur-md text-white text-[8px] font-mono px-1.5 py-0.5 rounded border border-white/20">
-                                    {idx + 1}
-                                </div>
+                                {photoViewMode === 'grid' && (
+                                    <select value={item.folderId || DEFAULT_FOLDER_ID} onClick={e => e.stopPropagation()} onChange={e => updatePhotoItem(idx, { folderId: e.target.value })}
+                                        className="absolute bottom-7 left-2 max-w-[calc(100%-1rem)] bg-black/60 text-white border border-white/20 rounded px-1 py-0.5 text-[8px] outline-none opacity-0 group-hover:opacity-100 transition-opacity">
+                                        {photoFolders.map(folder => <option key={folder.id} value={folder.id}>{folder.name}</option>)}
+                                    </select>
+                                )}
 
                                 {/* Drag Handle */}
-                                <div className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                                    <GripVertical className="w-3 h-3 text-white/50" />
+                                <div className={`absolute ${photoViewMode === 'grid' ? 'top-1 right-1' : 'inset-y-0 right-10 flex items-center'} opacity-0 group-hover:opacity-100 transition-opacity`}>
+                                    <GripVertical className={`w-3 h-3 ${photoViewMode === 'grid' ? 'text-white/50' : 'text-slate-400 dark:text-slate-500'}`} />
                                 </div>
 
                                 {/* Delete Button */}
-                                <button 
-                                    onClick={(e) => removePhotoItem(idx, e)} 
-                                    className="absolute top-1 right-6 p-1 bg-red-600 text-white rounded shadow-lg opacity-0 group-hover:opacity-100 transition-opacity transform hover:scale-110 active:scale-95"
+                                <button
+                                    onClick={(e) => removePhotoItem(idx, e)}
+                                    className={`absolute ${photoViewMode === 'grid' ? 'top-1 right-6' : 'inset-y-0 right-2 flex items-center h-fit my-auto'} p-1 bg-red-600 text-white rounded shadow-lg opacity-0 group-hover:opacity-100 transition-opacity transform hover:scale-110 active:scale-95`}
                                 >
                                     <Trash className="w-2.5 h-2.5" />
                                 </button>

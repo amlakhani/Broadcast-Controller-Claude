@@ -1139,6 +1139,68 @@ test('pres_nav moves the deck server-side, same as pres_goto, and clamps silentl
     assert.equal(otherBroadcasts, 0, 'pres_nav past the end should not broadcast pres_update');
 });
 
+// Canva has no slide index — paging it is a keystroke relayed to the output windows,
+// so these assert the relay fires without the deck state moving underneath it.
+async function loadLiveCanvaDeck(client) {
+    client.emit('pres_update', {
+        mode: 'url', baseUrl: 'https://www.canva.com/design/DAG/tok/view?embed', slideId: '',
+        currentIdx: 0, totalSlides: 1, images: [], isCanva: true, showing: true
+    });
+    await waitFor(client, 'pres_update');
+}
+
+test('pres_canva_nav relays a keystroke to local windows without changing deck state', async () => {
+    const operator = await connectClient();
+    const output = await connectClient();
+    await loadLiveCanvaDeck(operator);
+
+    // Let the deck-load broadcast land on the other socket first, or it gets counted
+    // as though paging had rebroadcast state.
+    await new Promise(resolve => setTimeout(resolve, 60));
+    let stateBroadcasts = 0;
+    output.on('pres_update', () => { stateBroadcasts += 1; });
+
+    const relayed = waitFor(output, 'pres_canva_nav');
+    operator.emit('pres_canva_nav', 'next');
+    assert.equal(await relayed, 'next');
+
+    await new Promise(resolve => setTimeout(resolve, 80));
+    assert.equal(stateBroadcasts, 0, 'paging Canva must not rebroadcast deck state');
+});
+
+test('a clicker press (pres_nav) on a Canva deck becomes a keystroke relay, not a clamped no-op', async () => {
+    const operator = await connectClient();
+    const output = await connectClient();
+    await loadLiveCanvaDeck(operator);
+
+    const relayed = waitFor(output, 'pres_canva_nav');
+    operator.emit('pres_nav', 'prev');
+    assert.equal(await relayed, 'prev');
+});
+
+test('pres_canva_nav is ignored for a non-Canva deck, a hidden deck, or a bogus direction', async () => {
+    const operator = await connectClient();
+    const output = await connectClient();
+    let relays = 0;
+    output.on('pres_canva_nav', () => { relays += 1; });
+
+    operator.emit('pres_update', {
+        mode: 'images', baseUrl: '', slideId: '', currentIdx: 0,
+        totalSlides: 2, images: ['a', 'b'], isCanva: false, showing: true
+    });
+    await waitFor(operator, 'pres_update');
+    operator.emit('pres_canva_nav', 'next');
+
+    await loadLiveCanvaDeck(operator);
+    operator.emit('pres_canva_nav', 'sideways');
+    operator.emit('pres_set_showing', false);
+    await waitFor(operator, 'pres_update');
+    operator.emit('pres_canva_nav', 'next');
+
+    await new Promise(resolve => setTimeout(resolve, 120));
+    assert.equal(relays, 0);
+});
+
 test('request_pres_state replies directly to the requesting socket, not the whole room', async () => {
     const operator = await connectClient();
     const other = await connectClient();

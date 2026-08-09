@@ -7,6 +7,7 @@ import {
     ChevronRight,
     ChevronsLeft,
     ChevronsRight,
+    Grid3x3,
     GripVertical,
     Pencil,
     Play,
@@ -17,8 +18,9 @@ import {
     X
 } from 'lucide-react';
 import { deferUntilIdle, readLocalStorageArraySafe, useDebouncedLocalStorageEffect } from '../utils/performance';
-import { EMPTY_PRESENTATION, getDeckType, normalizeCanvaUrl, parseSourceUrl, slideImageUrl } from '../utils/presentation';
+import { EMPTY_PRESENTATION, getDeckType, isCanvaUrl, normalizeCanvaUrl, parseSourceUrl, resolveDeckUrl, slideImageUrl } from '../utils/presentation';
 import { deleteDeckImages, getDeckImages, putDeckImages } from '../utils/deckStore';
+import LazyMount from './LazyMount';
 
 const LIBRARY_KEY = 'bc_pres_library_v1';
 
@@ -40,8 +42,10 @@ export default function PresentationPanel({ socket, isActive }) {
     const [renameValue, setRenameValue] = useState('');
     const [jumpInput, setJumpInput] = useState('');
     const [presState, setPresState] = useState(EMPTY_PRESENTATION);
+    const [showAllSlides, setShowAllSlides] = useState(false);
 
     const fileInputRef = useRef(null);
+    const activeTileRef = useRef(null);
 
     // Slide images live in IndexedDB (see utils/deckStore); localStorage holds metadata only.
     // Any library saved by an older build still has its images inline, so move them across on
@@ -103,8 +107,16 @@ export default function PresentationPanel({ socket, isActive }) {
         socket.emit('pres_update', newState);
     }, [socket]);
 
-    const handleLoadUrlWithData = useCallback((url, total) => {
-        const parsed = parseSourceUrl(url, total);
+    const handleLoadUrlWithData = useCallback(async (url, total) => {
+        // canva.link short links only become a real design URL after a server-side
+        // redirect hop; every other link comes back unchanged.
+        const resolved = await resolveDeckUrl(url);
+        if (resolved.error) {
+            setStatus(resolved.error);
+            alert(resolved.error);
+            return;
+        }
+        const parsed = parseSourceUrl(resolved.url, total);
         if (!parsed) return;
         if (parsed.error) {
             setStatus(parsed.error);
@@ -191,7 +203,14 @@ export default function PresentationPanel({ socket, isActive }) {
         const url = urlInput.trim();
         if (!url) return;
 
-        const normalizedUrl = url.includes('canva.com') ? normalizeCanvaUrl(url) : url;
+        // Expand a short link before it goes into the library, so loading that deck
+        // later is a local operation instead of another round trip to Canva.
+        const resolved = await resolveDeckUrl(url);
+        if (resolved.error) {
+            setSaveWarning(resolved.error);
+            return;
+        }
+        const normalizedUrl = isCanvaUrl(resolved.url) ? normalizeCanvaUrl(resolved.url) : resolved.url;
         const duplicate = library.find(item => (
             item.name?.trim().toLowerCase() === name.toLowerCase() ||
             item.url?.trim() === normalizedUrl ||
@@ -289,10 +308,10 @@ export default function PresentationPanel({ socket, isActive }) {
             return;
         }
 
-        const url = item.url?.includes('canva.com') ? normalizeCanvaUrl(item.url) : item.url;
+        const url = isCanvaUrl(item.url) ? normalizeCanvaUrl(item.url) : item.url;
         setUrlInput(url || '');
         setTotalInput(String(item.totalSlides || '20'));
-        handleLoadUrlWithData(url || '', item.totalSlides);
+        await handleLoadUrlWithData(url || '', item.totalSlides);
     };
 
     const filteredLibrary = useMemo(() => {
@@ -544,6 +563,15 @@ export default function PresentationPanel({ socket, isActive }) {
     // The local setPresState here is purely optimistic, for zero-latency button feel.
     const navigate = useCallback((direction) => {
         if (!socket) return;
+
+        // Canva owns its own slide position — the app has no index to move and no way
+        // to read one back. next/prev become a keystroke posted into the embed on the
+        // output window; first/last and jump have no equivalent and stay disabled.
+        if (presState.isCanva) {
+            if (direction === 'next' || direction === 'prev') socket.emit('pres_canva_nav', direction);
+            return;
+        }
+
         setPresState(prev => {
             if (prev.totalSlides === 0) return prev;
             let newIdx = prev.currentIdx;
@@ -561,16 +589,24 @@ export default function PresentationPanel({ socket, isActive }) {
             setJumpInput(String(newIdx + 1));
             return { ...prev, currentIdx: newIdx };
         });
-    }, [socket]);
+    }, [socket, presState.isCanva]);
 
-    const jumpToSlide = () => {
-        if (!socket) return;
-        const target = parseInt(jumpInput, 10);
-        if (!Number.isFinite(target) || !presState.totalSlides) return;
-        const targetIdx = Math.max(0, Math.min(target - 1, presState.totalSlides - 1));
+    // Absolute jump, shared by the Jump box and the All Slides grid. Same
+    // server-authoritative contract as `navigate`: emit the index, let the
+    // pres_update echo reconcile, and keep the local write purely optimistic.
+    // Canva has no index to jump to, so it is excluded here as it is there.
+    const goToIndex = useCallback((rawIndex) => {
+        if (!socket || !presState.totalSlides || presState.isCanva) return;
+        const targetIdx = Math.max(0, Math.min(rawIndex, presState.totalSlides - 1));
         setPresState(prev => ({ ...prev, currentIdx: targetIdx }));
         socket.emit('pres_goto', { index: targetIdx });
         setJumpInput(String(targetIdx + 1));
+    }, [socket, presState.totalSlides, presState.isCanva]);
+
+    const jumpToSlide = () => {
+        const target = parseInt(jumpInput, 10);
+        if (!Number.isFinite(target)) return;
+        goToIndex(target - 1);
     };
 
     // pres_nav (from the graphics window's own keyboard handler) is now applied
@@ -644,13 +680,32 @@ export default function PresentationPanel({ socket, isActive }) {
     const hasSlides = presState.mode !== 'none' && presState.totalSlides > 0;
     const isLive = hasSlides && presState.showing;
     const deckType = presState.mode === 'images' ? 'Image Deck' : presState.isCanva ? 'Canva' : presState.mode === 'url' ? 'Google Slides' : 'None';
+    // Canva owns its own slide position, so there is no index to grid up or jump
+    // to — the same reason the Jump box and first/last are unavailable for it.
+    const canPickSlide = hasSlides && !presState.isCanva;
+
+    const slideIndexes = useMemo(
+        () => (canPickSlide ? Array.from({ length: presState.totalSlides }, (_, i) => i) : []),
+        [canPickSlide, presState.totalSlides]
+    );
+
+    // Keep the live slide's tile in view — opening the grid on slide 60 of an 80
+    // slide deck should not land the operator at slide 1 with a scroll to do.
+    useEffect(() => {
+        if (!showAllSlides) return;
+        activeTileRef.current?.scrollIntoView({ block: 'nearest' });
+    }, [showAllSlides, presState.currentIdx, presState.deckId]);
+
+    const getIframeSrcForIndex = (index) => {
+        if (presState.mode !== 'url' || !hasSlides || presState.isCanva) return '';
+        if (index < 0 || index >= presState.totalSlides) return '';
+        return presState.baseUrl + (index + 1);
+    };
 
     const getIframeSrc = (offset) => {
         if (presState.mode !== 'url' || !hasSlides) return '';
         if (presState.isCanva) return offset === 0 ? presState.baseUrl : '';
-        const targetIdx = presState.currentIdx + offset;
-        if (targetIdx < 0 || targetIdx >= presState.totalSlides) return '';
-        return presState.baseUrl + (targetIdx + 1);
+        return getIframeSrcForIndex(presState.currentIdx + offset);
     };
 
     // Prefers the cacheable HTTP endpoint over the inline images array. This is
@@ -658,13 +713,20 @@ export default function PresentationPanel({ socket, isActive }) {
     // server now sends a stripped `images: []` (see the room split in server.js),
     // so falling back to `presState.images` there would leave every preview
     // blank. On the desktop it's a bonus — one fewer multi-MB base64 decode.
-    const getImageSrc = (offset) => {
+    // `opts.w` asks for the ~320px grid thumbnail instead of the full slide; only
+    // the All Slides tiles set it, since those are the only ones small enough that
+    // the difference matters and not the ones that go on air.
+    const getImageSrcForIndex = (index, opts = {}) => {
         if (presState.mode !== 'images' || !hasSlides) return '';
-        const targetIdx = presState.currentIdx + offset;
-        if (targetIdx < 0 || targetIdx >= presState.totalSlides) return '';
-        if (presState.deckId) return slideImageUrl(targetIdx, presState.deckId);
-        return presState.images[targetIdx] || '';
+        if (index < 0 || index >= presState.totalSlides) return '';
+        if (presState.deckId) return slideImageUrl(index, presState.deckId, opts);
+        // No deck id yet — a locally committed deck in the gap before the server
+        // echoes pres_update back. The inline copies are still in hand here.
+        if (opts.w && presState.thumbs?.[index]) return presState.thumbs[index];
+        return presState.images[index] || '';
     };
+
+    const getImageSrc = (offset) => getImageSrcForIndex(presState.currentIdx + offset);
 
     const renderPreview = (offset, label, isPrimary = false) => {
         const imageSrc = getImageSrc(offset);
@@ -696,14 +758,14 @@ export default function PresentationPanel({ socket, isActive }) {
                         <div className="space-y-1.5">
                             <div className="flex justify-between items-end gap-3">
                                 <label className="block text-sm font-medium text-slate-700 dark:text-slate-300">Google Slides / Canva URL</label>
-                                <span className="text-[10px] text-slate-400 italic text-right">Canva links must be viewable by anyone with the link</span>
+                                <span className="text-[10px] text-slate-400 italic text-right">Canva: paste the public share link (Share → Copy link), set to "Anyone with the link"</span>
                             </div>
                             <div className="flex flex-col sm:flex-row gap-2">
                                 <input
                                     type="text"
                                     value={urlInput}
                                     onChange={e => setUrlInput(e.target.value)}
-                                    placeholder="Paste URL or iframe code..."
+                                    placeholder="Paste a Google Slides or Canva link..."
                                     className="control-field flex-1 px-4 py-2"
                                 />
                                 <button onClick={handleLoadUrl} disabled={isProcessing} className="bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-lg font-medium transition active:scale-95 disabled:opacity-40">
@@ -841,10 +903,20 @@ export default function PresentationPanel({ socket, isActive }) {
                 </section>
 
                 <section className="space-y-4">
-                    <div className="flex items-center justify-between">
+                    <div className="flex items-center justify-between gap-2">
                         <h4 className="text-md font-medium text-slate-800 dark:text-slate-200">Preview</h4>
-                        <div className={`px-2 py-1 rounded-md text-[10px] font-bold uppercase tracking-widest ${isLive ? 'bg-emerald-500/15 text-emerald-500' : hasSlides ? 'bg-amber-500/15 text-amber-500' : 'bg-slate-500/15 text-slate-500'}`}>
-                            {isLive ? 'On Air' : hasSlides ? 'Loaded' : 'Empty'}
+                        <div className="flex items-center gap-2">
+                            <button
+                                onClick={() => setShowAllSlides(v => !v)}
+                                disabled={!canPickSlide}
+                                title={presState.isCanva ? 'Canva decks have no slide index — export to PDF for slide picking' : 'Show every slide in this deck and click one to cut to it'}
+                                className={`flex items-center gap-1.5 rounded-md px-2 py-1 text-[10px] font-bold uppercase tracking-widest transition active:scale-95 disabled:opacity-30 ${showAllSlides ? 'bg-indigo-600 text-white' : 'control-button-muted'}`}
+                            >
+                                <Grid3x3 size={12} /> All Slides
+                            </button>
+                            <div className={`px-2 py-1 rounded-md text-[10px] font-bold uppercase tracking-widest ${isLive ? 'bg-emerald-500/15 text-emerald-500' : hasSlides ? 'bg-amber-500/15 text-amber-500' : 'bg-slate-500/15 text-slate-500'}`}>
+                                {isLive ? 'On Air' : hasSlides ? 'Loaded' : 'Empty'}
+                            </div>
                         </div>
                     </div>
                     <div className="surface space-y-3 rounded-lg p-3">
@@ -897,10 +969,10 @@ export default function PresentationPanel({ socket, isActive }) {
                             <button onClick={() => navigate('first')} disabled={!hasSlides || presState.currentIdx === 0} className="control-button-muted p-3 active:scale-95 disabled:opacity-30" title="First slide">
                                 <ChevronsLeft size={18} className="mx-auto" />
                             </button>
-                            <button onClick={() => navigate('prev')} disabled={!hasSlides || presState.currentIdx === 0} className="control-button-muted p-3 active:scale-95 disabled:opacity-30" title="Previous slide">
+                            <button onClick={() => navigate('prev')} disabled={!hasSlides || (!presState.isCanva && presState.currentIdx === 0)} className="control-button-muted p-3 active:scale-95 disabled:opacity-30" title="Previous slide">
                                 <ChevronLeft size={18} className="mx-auto" />
                             </button>
-                            <button onClick={() => navigate('next')} disabled={!hasSlides || presState.currentIdx >= presState.totalSlides - 1} className="bg-indigo-600 hover:bg-indigo-500 text-white p-3 rounded-lg transition disabled:opacity-30 shadow-lg shadow-indigo-600/20 active:scale-95" title="Next slide">
+                            <button onClick={() => navigate('next')} disabled={!hasSlides || (!presState.isCanva && presState.currentIdx >= presState.totalSlides - 1)} className="bg-indigo-600 hover:bg-indigo-500 text-white p-3 rounded-lg transition disabled:opacity-30 shadow-lg shadow-indigo-600/20 active:scale-95" title="Next slide">
                                 <ChevronRight size={18} className="mx-auto" />
                             </button>
                             <button onClick={() => navigate('last')} disabled={!hasSlides || presState.currentIdx >= presState.totalSlides - 1} className="control-button-muted p-3 active:scale-95 disabled:opacity-30" title="Last slide">
@@ -911,7 +983,7 @@ export default function PresentationPanel({ socket, isActive }) {
                         {presState.isCanva && (
                             <div className="p-3 bg-purple-500/10 border border-purple-500/20 rounded-lg">
                                 <p className="text-[10px] text-purple-400 font-medium leading-relaxed">
-                                    Canva is embedded as a single external viewer. For controller-driven slide navigation, export the Canva deck as images and upload them here.
+                                    Canva runs as its own viewer, so next/prev send a keypress into the embed — the clicker and arrow keys work, but the app can't know which slide is up, so there are no prev/next previews and no jump-to-slide. Export the deck as a PDF and upload it here for full control.
                                 </p>
                             </div>
                         )}
@@ -922,6 +994,76 @@ export default function PresentationPanel({ socket, isActive }) {
                     </div>
                 </section>
             </div>
+
+            {/* Every slide in the loaded deck, full width so the tiles stay big enough
+                to recognise. Clicking one is an absolute pres_goto — identical to the
+                Jump box, so if the deck is already live the click cuts straight to that
+                slide on the output. Full width and below the three columns rather than
+                inside the Preview column: a 40-slide deck needs the room, and the
+                prev/next/Go Live controls must not move when it opens. */}
+            {showAllSlides && canPickSlide && (
+                <section className="space-y-2 border-t section-rule pt-4">
+                    <div className="flex flex-wrap items-end justify-between gap-2">
+                        <div>
+                            <h4 className="text-md font-medium text-slate-800 dark:text-slate-200">All Slides</h4>
+                            <p className="text-xs text-slate-500">
+                                {isLive
+                                    ? 'Deck is live — clicking a slide puts it on air immediately.'
+                                    : 'Click a slide to select it. It goes on air when you hit Go Live.'}
+                            </p>
+                        </div>
+                        <button onClick={() => setShowAllSlides(false)} className="control-button-muted px-3 py-1.5 text-xs font-medium active:scale-95">
+                            Hide
+                        </button>
+                    </div>
+                    <div className="surface grid max-h-[26rem] grid-cols-2 gap-3 overflow-y-auto rounded-lg p-3 sm:grid-cols-3 lg:grid-cols-5 2xl:grid-cols-8">
+                        {slideIndexes.map(i => {
+                            const isCurrent = i === presState.currentIdx;
+                            return (
+                                <button
+                                    key={`${presState.deckId || 'local'}-${i}`}
+                                    ref={isCurrent ? activeTileRef : null}
+                                    onClick={() => goToIndex(i)}
+                                    title={`Go to slide ${i + 1}`}
+                                    className={`relative aspect-video overflow-hidden rounded-lg bg-black transition active:scale-95 ${isCurrent
+                                        ? (isLive ? 'border-2 border-red-500' : 'border-2 border-emerald-500')
+                                        : 'border border-slate-300 hover:border-indigo-500 dark:border-slate-700'}`}
+                                >
+                                    {/* Image tiles defer natively via loading="lazy" — one
+                                        ~320px thumbnail each, and the browser handles it
+                                        better than an observer per tile would. Slide embeds
+                                        have no such attribute, so those still wait on
+                                        LazyMount rather than opening 40 iframes at once. */}
+                                    {presState.mode === 'images' ? (
+                                        <img
+                                            src={getImageSrcForIndex(i, { w: 320 })}
+                                            alt={`Slide ${i + 1}`}
+                                            loading="lazy"
+                                            decoding="async"
+                                            className="absolute inset-0 h-full w-full object-contain"
+                                        />
+                                    ) : (
+                                        <LazyMount className="absolute inset-0">
+                                            <iframe
+                                                src={getIframeSrcForIndex(i)}
+                                                title={`Slide ${i + 1}`}
+                                                className="absolute left-0 top-0 h-[1000%] w-[1000%] origin-top-left scale-[0.1] border-none"
+                                                style={{ pointerEvents: 'none' }}
+                                            />
+                                        </LazyMount>
+                                    )}
+                                    <span className="absolute bottom-0 right-0 bg-black/70 px-1.5 py-0.5 text-[10px] font-bold text-white">{i + 1}</span>
+                                    {isCurrent && (
+                                        <span className={`absolute left-0 top-0 px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wider text-white ${isLive ? 'bg-red-600' : 'bg-emerald-600'}`}>
+                                            {isLive ? 'On Air' : 'Current'}
+                                        </span>
+                                    )}
+                                </button>
+                            );
+                        })}
+                    </div>
+                </section>
+            )}
 
             {isStaging && (
                 <section className="space-y-3 border-t section-rule pt-4">

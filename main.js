@@ -103,6 +103,98 @@ function releaseClickerShortcuts() {
     console.log('[clicker] global shortcuts released');
 }
 
+// Canva slide advance.
+//
+// Every other deck type is driven by changing what the app renders: an image index,
+// or Google's ?slide=N. A Canva embed offers neither — no per-slide URL, and the
+// iframe is cross-origin, so nothing in the renderer can reach inside it. The only
+// thing that moves a Canva deck is a real key event landing on the embed's own
+// document, and a synthetic KeyboardEvent from JavaScript is untrusted and never
+// crosses the origin boundary. So the keystroke has to be injected from here.
+//
+// Two mechanisms, because one of them may not apply:
+//   * CDP (Input.dispatchKeyEvent on the auto-attached subframe session) is the one
+//     that definitively reaches an out-of-process iframe, which a cross-origin
+//     canva.com frame normally is under site isolation.
+//   * webContents.sendInputEvent forwards to the host frame's widget, which is
+//     enough only when the embed did not get its own process.
+// Try the first, fall back to the second.
+const CANVA_KEYS = {
+    next: { key: 'ArrowRight', code: 'ArrowRight', keyCode: 39 },
+    prev: { key: 'ArrowLeft', code: 'ArrowLeft', keyCode: 37 }
+};
+
+// webContents id -> Map(frame url -> CDP sessionId), filled by Target.attachedToTarget.
+const canvaFrameSessions = new WeakMap();
+
+function ensureCanvaDebugger(contents) {
+    if (contents.debugger.isAttached()) return canvaFrameSessions.get(contents) || null;
+    try {
+        contents.debugger.attach('1.3');
+    } catch (err) {
+        // Most likely DevTools is already open on this window. Not fatal — the
+        // sendInputEvent path below still covers the non-isolated case.
+        console.warn('[canva] could not attach debugger for slide advance:', err.message);
+        return null;
+    }
+
+    const sessions = new Map();
+    canvaFrameSessions.set(contents, sessions);
+    contents.debugger.on('message', (event, method, params, sessionId) => {
+        if (method === 'Target.attachedToTarget') {
+            sessions.set(params.targetInfo.url || '', params.sessionId);
+        } else if (method === 'Target.detachedFromTarget') {
+            for (const [url, id] of sessions) if (id === params.sessionId) sessions.delete(url);
+        }
+    });
+    contents.debugger.on('detach', () => canvaFrameSessions.delete(contents));
+    // flatten + autoAttach is what surfaces the cross-origin subframe as its own
+    // session; without it there is nothing to address the keystroke to.
+    contents.debugger.sendCommand('Target.setAutoAttach', {
+        autoAttach: true,
+        waitForDebuggerOnStart: false,
+        flatten: true
+    }).catch(err => console.warn('[canva] setAutoAttach failed:', err.message));
+    return sessions;
+}
+
+async function sendCanvaNavKey(contents, direction) {
+    const stroke = CANVA_KEYS[direction];
+    if (!contents || contents.isDestroyed() || !stroke) return false;
+
+    let sessions = ensureCanvaDebugger(contents);
+    // setAutoAttach reports the existing subframes asynchronously, so on the very
+    // first press the map is usually still empty. Give it a moment rather than
+    // spending that press on the fallback path.
+    if (sessions && sessions.size === 0) {
+        await new Promise(resolve => setTimeout(resolve, 150));
+        sessions = canvaFrameSessions.get(contents) || sessions;
+    }
+    const canvaSession = sessions && [...sessions].find(([url]) => url.includes('canva.'))?.[1];
+
+    if (canvaSession) {
+        const base = {
+            key: stroke.key,
+            code: stroke.code,
+            windowsVirtualKeyCode: stroke.keyCode,
+            nativeVirtualKeyCode: stroke.keyCode
+        };
+        try {
+            await contents.debugger.sendCommand('Input.dispatchKeyEvent', { ...base, type: 'rawKeyDown' }, canvaSession);
+            await contents.debugger.sendCommand('Input.dispatchKeyEvent', { ...base, type: 'keyUp' }, canvaSession);
+            console.log(`[canva] ${direction}: ${stroke.key} dispatched into the embed frame`);
+            return true;
+        } catch (err) {
+            console.warn('[canva] CDP key dispatch failed, falling back:', err.message);
+        }
+    }
+
+    console.log(`[canva] ${direction}: no embed frame session, sending ${stroke.key} to the window instead`);
+    contents.sendInputEvent({ type: 'keyDown', keyCode: stroke.key });
+    contents.sendInputEvent({ type: 'keyUp', keyCode: stroke.key });
+    return false;
+}
+
 function localAppUrl(pathname = '/', params = {}) {
     const url = new URL(`http://127.0.0.1:${serverPort}${pathname}`);
     url.searchParams.set('auth', getAuthToken());
@@ -807,6 +899,12 @@ app.whenReady().then(() => {
         });
 
     });
+
+    // Sent by whichever output window is showing the Canva embed, once per nav
+    // intent (panel button, clicker, arrow key, or phone remote — they all arrive
+    // as the server's pres_canva_nav relay). event.sender is that window, so the
+    // keystroke goes into the embed the operator is actually watching.
+    ipcMain.handle('canva-embed-nav', (event, direction) => sendCanvaNavKey(event.sender, direction));
 
     ipcMain.handle('select-local-video', async () => {
         const result = await dialog.showOpenDialog(controlWindow, {

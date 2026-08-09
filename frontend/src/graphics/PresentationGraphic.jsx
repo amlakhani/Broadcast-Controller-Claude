@@ -91,6 +91,8 @@ export default function PresentationGraphic({ socket, windowMode, isStageDisplay
             const state = stateRef.current;
             if (!state || state.mode === 'none' || !state.showing) return;
 
+            // Canva decks need no branch here: the server turns a next/prev pres_nav
+            // into a pres_canva_nav keystroke relay (see applyPresGoto).
             if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') socket.emit('pres_nav', 'next');
             if (e.key === 'ArrowLeft' || e.key === 'PageUp') socket.emit('pres_nav', 'prev');
             if (e.key === 'Home') socket.emit('pres_nav', 'first');
@@ -100,6 +102,33 @@ export default function PresentationGraphic({ socket, windowMode, isStageDisplay
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
     }, [socket, windowMode]);
+
+    // Canva slide advance. The relay carries only a direction: this window focuses
+    // the embed (a cross-origin frame still accepts focus, which is all the browser
+    // lets us do to it) and main.js injects a real arrow key into that frame. The
+    // preview instances stay out of it — only the window actually on air should
+    // consume the keystroke, or one nav would advance the deck several times.
+    useEffect(() => {
+        if (!socket || isPreview || windowMode === 'stage') return;
+
+        const handleCanvaNav = async (direction) => {
+            const state = stateRef.current;
+            if (!state?.isCanva || !state.showing) return;
+            // Same pool slot the render below puts the live deck in.
+            const frame = document.getElementById(`pres-ifr-${(state.currentIdx || 0) % 8}`);
+            // Focus first: the injected key lands on whatever frame is focused, and
+            // the iframes are pointer-events:none so a click never focuses them.
+            try {
+                frame?.contentWindow?.focus();
+            } catch (err) {
+                // Cross-origin focus() is permitted, but never let it break the nav.
+            }
+            await window.broadcastAPI?.canvaEmbedNav?.(direction);
+        };
+
+        socket.on('pres_canva_nav', handleCanvaNav);
+        return () => socket.off('pres_canva_nav', handleCanvaNav);
+    }, [socket, isPreview, windowMode]);
 
     // Keep the neighbouring slide warm on the output side too. Only ±1 -- unlike
     // the phone remote, the operator can only ever advance one slide at a time

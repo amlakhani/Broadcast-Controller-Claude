@@ -1589,6 +1589,51 @@ app.get('/stream-video', requireAuth, (req, res) => {
     streamLocalFile(req, res, resolveMediaRequest(req, STREAM_EXTENSIONS), 'Media not found');
 });
 
+// Canva's share sheet hands out canva.link short links, and the design id they
+// stand for only shows up in the redirect. A browser cannot read a cross-origin
+// redirect target, and the URL the link lands on refuses framing (X-Frame-Options:
+// deny) until it is rewritten to the ?embed form — so the hop has to be followed
+// here, server-side, before the output window ever sees the deck URL.
+const CANVA_LINK_HOSTS = ['canva.link', 'canva.com', 'canva.site'];
+
+async function resolveCanvaShortLink(url, redirectsLeft = 5) {
+    // Re-checked on every hop: a shortener that redirects off Canva must not turn
+    // this into a general-purpose fetcher for the venue's LAN.
+    if (!isAllowedHostname(url, CANVA_LINK_HOSTS)) {
+        throw new Error('That link redirected somewhere other than Canva.');
+    }
+    const response = await fetch(url, {
+        headers: { 'User-Agent': 'Broadcast Controller/1.0', 'Accept': 'text/html,*/*' },
+        redirect: 'manual',
+        signal: AbortSignal.timeout(10000)
+    });
+    // Only where it landed matters, never the page itself.
+    response.body?.cancel?.().catch(() => {});
+
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+        if (redirectsLeft <= 0) throw new Error('That Canva link redirects too many times.');
+        const location = response.headers.get('location');
+        if (!location) throw new Error('That Canva link redirected without a target.');
+        return resolveCanvaShortLink(new URL(location, url).toString(), redirectsLeft - 1);
+    }
+    return url;
+}
+
+app.get('/api/presentation/resolve-link', requireAuth, async (req, res) => {
+    const rawUrl = String(req.query.url || '').trim();
+    if (!isAllowedHostname(rawUrl, CANVA_LINK_HOSTS)) {
+        return res.status(400).json({ error: 'Only Canva links can be resolved.' });
+    }
+    try {
+        const url = await resolveCanvaShortLink(rawUrl);
+        res.set('Cache-Control', 'no-store');
+        return res.json({ url });
+    } catch (err) {
+        console.error('Failed to resolve Canva link:', err);
+        return res.status(502).json({ error: err.message || 'Could not resolve that Canva link.' });
+    }
+});
+
 // Single slide image for image/PDF decks. Lets the slides remote (and, since the
 // pres_update payload split, every output window too) render slides without ever
 // receiving the whole `images` array over the socket.
@@ -2241,6 +2286,19 @@ function sendPresStateTo(socket) {
     socket.emit('pres_update', isLocalSocket(socket) ? currentPresState : getPresStateLite());
 }
 
+// Canva is the one deck type with no index to be authoritative about: its embed
+// exposes no per-slide URL and the iframe is cross-origin, so the app can neither
+// read nor set which slide is up. Navigation is therefore not a state change but a
+// keystroke posted into the embed on each output window — this relay carries that
+// intent and deliberately leaves currentPresState alone. Only local windows
+// (graphics, stage, NDI) can act on it; a phone has no embed to type into, so
+// remotes send this but never receive it.
+function relayCanvaNav(direction) {
+    if (direction !== 'next' && direction !== 'prev') return;
+    if (!currentPresState?.isCanva || !currentPresState.showing) return;
+    io.to('local').emit('pres_canva_nav', direction);
+}
+
 // Server-authoritative navigation, shared by pres_goto (remotes/desktop moving the
 // deck via absolute index) and pres_nav (the graphics window's own keyboard
 // shortcuts, previously a blind client-side relay). Routing both through one
@@ -2250,6 +2308,16 @@ function applyPresGoto(payload, originSocket) {
     if (!currentPresState || currentPresState.mode === 'none') return;
     const total = currentPresState.totalSlides || 0;
     if (total <= 0) return;
+
+    // A Canva deck has no index to be authoritative about (see the pres_canva_nav
+    // handler), so a next/prev arriving here — the clicker and the graphics window's
+    // own keys both land on pres_nav — is turned into a keystroke for the embed
+    // rather than a slide index that would clamp to a no-op.
+    if (currentPresState.isCanva) {
+        const step = payload?.direction;
+        if (step === 'next' || step === 'prev') relayCanvaNav(step);
+        return;
+    }
 
     const current = currentPresState.currentIdx || 0;
     let next = current;
@@ -3024,6 +3092,9 @@ io.on('connection', (socket) => {
     // Server-authoritative navigation. Lets lightweight clients (the slides
     // remote) move the deck without echoing the whole state object back.
     socket.on('pres_goto', (payload) => applyPresGoto(payload, socket));
+
+    // Canva paging from the desktop panel and the slides remote (see relayCanvaNav).
+    socket.on('pres_canva_nav', (direction) => relayCanvaNav(direction));
 
     socket.on('pres_set_showing', (showing) => {
         if (!currentPresState || currentPresState.mode === 'none') return;

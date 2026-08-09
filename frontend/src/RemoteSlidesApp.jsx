@@ -2,10 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
 import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Grid3x3, Library, Monitor, MonitorOff } from 'lucide-react';
 import { getRemoteToken, socketOptions } from './auth';
+import LazyMount from './components/LazyMount';
 import RemotePairing from './components/RemotePairing';
 import { peekFragmentPairingCode } from './utils/pairing';
 import { useWakeLock } from './utils/useWakeLock';
-import { getDeckType, normalizeSlideCount, parseSourceUrl, slideImageUrl } from './utils/presentation';
+import { getDeckType, normalizeSlideCount, parseSourceUrl, resolveDeckUrl, slideImageUrl } from './utils/presentation';
 
 const EMPTY_META = {
     mode: 'none',
@@ -68,32 +69,6 @@ function SlideTile({ meta, index, label, thumb = false }) {
             style={{ pointerEvents: 'none' }}
         />
     );
-}
-
-// Mounts children only once scrolled into view — keeps a 40-slide grid from
-// spinning up 40 Google Slides iframes at once.
-function LazyMount({ children, className }) {
-    const ref = useRef(null);
-    const [visible, setVisible] = useState(false);
-
-    useEffect(() => {
-        const node = ref.current;
-        if (!node || visible) return;
-        if (typeof IntersectionObserver === 'undefined') {
-            setVisible(true);
-            return;
-        }
-        const observer = new IntersectionObserver((entries) => {
-            if (entries.some(entry => entry.isIntersecting)) {
-                setVisible(true);
-                observer.disconnect();
-            }
-        }, { rootMargin: '200px' });
-        observer.observe(node);
-        return () => observer.disconnect();
-    }, [visible]);
-
-    return <div ref={ref} className={className}>{visible ? children : null}</div>;
 }
 
 export default function RemoteSlidesApp() {
@@ -209,7 +184,10 @@ export default function RemoteSlidesApp() {
     }, [meta.mode, meta.deckId, meta.currentIdx, meta.totalSlides]);
 
     const hasSlides = meta.mode !== 'none' && meta.totalSlides > 0;
+    // Indexed navigation — the scrubber, the slide grid, first/last, swipe-to-index.
+    // Canva supports none of it (no index), but it can still be paged one at a time.
     const canNavigate = hasSlides && !meta.isCanva;
+    const canPage = hasSlides;
     const deckType = meta.mode === 'images' ? 'Image Deck' : meta.isCanva ? 'Canva' : meta.mode === 'url' ? 'Google Slides' : 'No Deck';
 
     // Sends the pending index after a short coalescing window, so a burst of taps
@@ -234,6 +212,13 @@ export default function RemoteSlidesApp() {
 
     const goRelative = useCallback((direction) => {
         if (!hasSlides) return;
+        // Canva has no index to scrub to — next/prev are relayed to the output window
+        // as a keystroke into the embed, so the phone can still page the deck even
+        // though the scrubber, first/last and the grid stay unavailable for it.
+        if (meta.isCanva) {
+            if (direction === 'next' || direction === 'prev') socket?.emit('pres_canva_nav', direction);
+            return;
+        }
         let idx = meta.currentIdx;
         if (direction === 'next') idx += 1;
         else if (direction === 'prev') idx -= 1;
@@ -241,7 +226,7 @@ export default function RemoteSlidesApp() {
         else if (direction === 'last') idx = meta.totalSlides - 1;
         else return;
         gotoIndex(idx);
-    }, [hasSlides, meta.currentIdx, meta.totalSlides, gotoIndex]);
+    }, [socket, hasSlides, meta.isCanva, meta.currentIdx, meta.totalSlides, gotoIndex]);
 
     const setShowing = useCallback((showing) => {
         if (!socket || !hasSlides) return;
@@ -249,9 +234,16 @@ export default function RemoteSlidesApp() {
         socket.emit('pres_set_showing', showing);
     }, [socket, hasSlides]);
 
-    const loadDeck = useCallback((item) => {
+    const loadDeck = useCallback(async (item) => {
         if (!socket) return;
-        const parsed = parseSourceUrl(item.url || '', normalizeSlideCount(item.totalSlides));
+        // Library entries saved before short links were expanded can still hold a
+        // canva.link URL, so the redirect hop has to happen here too.
+        const resolved = await resolveDeckUrl(item.url || '');
+        if (resolved.error) {
+            alert(resolved.error);
+            return;
+        }
+        const parsed = parseSourceUrl(resolved.url, normalizeSlideCount(item.totalSlides));
         if (!parsed?.state) return;
         socket.emit('pres_update', parsed.state);
         setPanel(null);
@@ -267,7 +259,7 @@ export default function RemoteSlidesApp() {
     const onTouchEnd = (e) => {
         const start = touchStartRef.current;
         touchStartRef.current = null;
-        if (!start || !canNavigate) return;
+        if (!start || !canPage) return;
         const end = e.changedTouches[0];
         if (!end) return;
         const dx = end.clientX - start.x;
@@ -348,14 +340,14 @@ export default function RemoteSlidesApp() {
                     <div className="flex gap-2">
                         <button
                             onClick={() => goRelative('prev')}
-                            disabled={!canNavigate || meta.currentIdx <= 0}
+                            disabled={!canPage || (!meta.isCanva && meta.currentIdx <= 0)}
                             className={`${navButton} h-20 flex-1 bg-slate-500/15 text-lg active:bg-slate-500/25`}
                         >
                             <ChevronLeft className="h-8 w-8" />
                         </button>
                         <button
                             onClick={() => goRelative('next')}
-                            disabled={!canNavigate || meta.currentIdx >= meta.totalSlides - 1}
+                            disabled={!canPage || (!meta.isCanva && meta.currentIdx >= meta.totalSlides - 1)}
                             className={`${navButton} h-20 flex-[2] bg-blue-600 text-white active:bg-blue-500`}
                         >
                             <ChevronRight className="h-9 w-9" />

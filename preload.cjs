@@ -19,6 +19,9 @@ contextBridge.exposeInMainWorld('broadcastAPI', {
         ipcRenderer.on('before-reload', listener);
         return () => ipcRenderer.removeListener('before-reload', listener);
     },
+    // Advances a Canva embed by injecting a real arrow key into it — see
+    // sendCanvaNavKey in main.js for why nothing in the renderer can do this.
+    canvaEmbedNav: (direction) => ipcRenderer.invoke('canva-embed-nav', direction),
     onPresentationClickerNav: (callback) => {
         const listener = (event, direction) => callback(direction);
         ipcRenderer.on('presentation-clicker-nav', listener);
